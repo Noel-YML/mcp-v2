@@ -1,0 +1,22 @@
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "excludedTypes": "Request"
+      }
+    }
+  },
+  "extensionBundle": {
+    "id": "Microsoft.Azure.Functions.ExtensionBundle",
+    "version": "[4.*, 5.0.0)"
+  },
+  "extensions": {
+    "mcp": {
+      "instructions": "Remote MCP server for Ask ARIEL - ARIEL product automation metrics.",
+      "serverName": "ariel-mcp-v2",
+      "serverVersion": "2.0.0"
+    }
+  }
+}

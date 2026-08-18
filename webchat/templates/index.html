@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARIEL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;1,400&family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="backdrop"></div>
+
+<div class="shell">
+
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-inner">
+      <button class="nav-item nav-btn" id="newChatBtn" title="New chat">
+        <span class="icon-btn">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 5v14M5 12h14"/></svg>
+        </span>
+        <span class="nav-label">New chat</span>
+      </button>
+
+      <div class="sidebar-history">
+        <div class="sidebar-history-label">History</div>
+        <label class="sidebar-archived-toggle">
+          <input type="checkbox" id="showArchivedToggle">
+          Show archived
+        </label>
+        <div class="history-list" id="historyList"></div>
+      </div>
+
+      <div class="nav-item">
+        <div class="avatar">N</div>
+        <span class="nav-label">Noel Tee</span>
+      </div>
+    </div>
+  </aside>
+
+  <main class="panel">
+
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">A</span>
+        <span class="brand-word">ARIEL</span>
+      </div>
+    </header>
+
+    <div class="chat-area" id="chatArea">
+
+      <div class="empty-state" id="emptyState">
+        <div class="greeting">
+          Hi, I'm <span class="greeting-accent">ARIEL</span>.<br>
+          <span class="greeting-sub">your automation intelligence teammate.</span>
+        </div>
+        <div class="greeting-prompt">What should we work on today?</div>
+      </div>
+
+      <div class="transcript" id="transcript"></div>
+
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer">
+        <textarea id="messageInput" placeholder="Ask ARIEL about automation metrics, trends, or a specific hotel&hellip;" rows="1"></textarea>
+        <button class="send-btn" id="sendBtn" title="Send">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
+      </div>
+      <div class="chips" id="chips">
+        <button class="chip" data-prompt="Which ARIEL products have data for IBIS Brisbane Airport?">Products for a hotel</button>
+        <button class="chip" data-prompt="Get AR Invoices Automation metrics for IBIS Brisbane Airport.">AR Invoices metrics</button>
+        <button class="chip" data-prompt="Show the 6-month automation trend for the Reservation Module, organization-wide.">Reservation trend (6mo)</button>
+        <button class="chip" data-prompt="What's the Audit automation snapshot organization-wide?">Audit snapshot</button>
+        <button class="chip" data-prompt="Echo the message: mcp v2 is live.">Echo test</button>
+      </div>
+      <div class="disclaimer">AI can make mistakes. Please verify important information.</div>
+    </div>
+
+  </main>
+</div>
+
+<template id="tpl-history-item">
+  <div class="history-item">
+    <button class="history-item-main">
+      <div class="history-item-title"></div>
+      <div class="history-item-time"></div>
+    </button>
+    <div class="history-item-actions">
+      <button class="history-action rename-btn" title="Rename">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>
+      </button>
+      <button class="history-action archive-btn" title="Archive">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8M10 13h4"/></svg>
+      </button>
+      <button class="history-action delete-btn" title="Delete">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2m-9 0 1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/></svg>
+      </button>
+    </div>
+  </div>
+</template>
+
+<template id="tpl-user">
+  <div class="msg msg-user"><div class="bubble"></div></div>
+</template>
+
+<template id="tpl-agent">
+  <div class="msg msg-agent">
+    <div class="ai-panel">
+      <div class="ai-badge"><span class="ai-dot"></span><span class="ai-badge-text">ARIEL</span></div>
+      <div class="ai-body"></div>
+    </div>
+  </div>
+</template>
+
+<template id="tpl-loading">
+  <div class="msg msg-agent">
+    <div class="ai-panel">
+      <div class="ai-badge"><span class="ai-dot"></span><span class="ai-badge-text">ARIEL is thinking&hellip;</span></div>
+    </div>
+  </div>
+</template>
+
+<template id="tpl-error">
+  <div class="msg msg-agent">
+    <div class="ai-panel ai-panel-error">
+      <div class="ai-badge"><span class="ai-badge-text">Error</span></div>
+      <div class="ai-body"></div>
+    </div>
+  </div>
+</template>
+
+<template id="tpl-approval">
+  <div class="msg msg-agent">
+    <div class="approval-card">
+      <div class="approval-label">Tool approval requested</div>
+      <div class="approval-name"></div>
+      <div class="approval-args"></div>
+      <div class="approval-actions">
+        <button class="approval-btn approve">Approve</button>
+        <button class="approval-btn deny">Deny</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

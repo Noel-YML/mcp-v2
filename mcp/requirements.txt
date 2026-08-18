@@ -1,0 +1,4 @@
+mcp[cli]>=2.0.0
+azure-functions>=2.2.0
+azure-identity>=1.19.0
+requests>=2.32.0
