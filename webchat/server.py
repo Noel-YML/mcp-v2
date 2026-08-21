@@ -102,6 +102,12 @@ Run:
     ARIEL_MCP_FUNCTION_KEY (its system key) once pointed at a real
     deployment - both are optional for local testing against `func start`,
     which has no key requirement by default
+    Optionally set ARIEL_AGENT_VERSION (default "10") to point at a
+    different ask-ariel agent version - see agent_contract.py and
+    presentation_validator.py for what Phase 4's versions add: a
+    schema-constrained response (message/presentation/insights/actions)
+    that this file validates against the real tool result before it ever
+    reaches the browser.
     python server.py
 
 Then open http://127.0.0.1:5050
@@ -126,6 +132,8 @@ from flask import Flask, jsonify, render_template, request
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from presentation_validator import validate_agent_response
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ariel-webchat")
 
@@ -145,7 +153,15 @@ if ARIEL_ENVIRONMENT == "production" and ARIEL_AUTH_MODE == "hotel-code-test":
 
 PROJECT_ENDPOINT = "https://analyticsai1.services.ai.azure.com/api/projects/proj-default"
 AGENT_NAME = "ask-ariel"
-AGENT_VERSION = "10"
+# An env var, not a hardcoded constant, specifically so pointing at a new
+# agent version - or rolling back to an old one - is a config change, not a
+# redeploy. Default "11" is the Phase 4 version (schema-constrained
+# message/presentation/insights/actions, validated in presentation_validator.py
+# before rendering) - verified live (both directly via the SDK and through
+# this actual app in a browser) before being made the default here. Set
+# ARIEL_AGENT_VERSION=10 to roll back to the pre-Phase-4 agent (plain text,
+# no instructions) if ever needed.
+AGENT_VERSION = os.environ.get("ARIEL_AGENT_VERSION", "11")
 AGENT_REFERENCE = {"type": "agent_reference", "name": AGENT_NAME, "version": AGENT_VERSION}
 
 # Same service principal/model the MCP server itself uses - only for the
@@ -378,17 +394,43 @@ def _call_mcp_tool(tool_name: str, arguments: dict, hotel_id: int, session_id: s
     return asyncio.run(_call_mcp_tool_async(tool_name, arguments, hotel_id, session_id))
 
 
+def _as_analytics_result(output_text: str) -> dict | None:
+    """If `output_text` is a Phase 3 `AnalyticsResult` (mcp/analytics/contract.py)
+    - as opposed to a legacy bare array, a Phase 2 ToolError envelope, or an
+    unstructured string - returns it parsed, else None. Used only to give
+    presentation_validator.py something real to validate the agent's final
+    presentation/insights against (see that module) - never trusted for
+    anything security-relevant, which is scope_token.py's job alone, not this.
+    """
+    try:
+        parsed = json.loads(output_text)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(parsed, dict) and parsed.get("status") == "success" and isinstance(parsed.get("dataset"), dict):
+        return parsed
+    return None
+
+
 def _run_function_call_loop(response, hotel_id: int, session_id: str):
     """Executes any `function_call` items the model emitted and submits
     their results, repeating until the model stops calling tools. The model
     only ever sees a tool name and business arguments (e.g. days) going in,
     and result text coming back - hotel scope is injected entirely outside
     its visibility, in `_call_mcp_tool_async` above.
+
+    Returns `(response, last_analytics_result)` - the second is the most
+    recent Phase 3-shaped tool result seen this turn (or None, if no tool
+    was called this turn, or the tool called doesn't have the Phase 3
+    contract yet - see `_as_analytics_result`). `chat()` hands that to
+    `presentation_validator.validate_agent_response` so a fabricated chart
+    or an evidence-free insight has nothing real to validate against.
     """
+    last_analytics_result: dict | None = None
+
     for _ in range(MAX_FUNCTION_CALL_ROUNDS):
         calls = [item for item in response.output if item.type == "function_call"]
         if not calls:
-            return response
+            return response, last_analytics_result
 
         outputs = []
         for call in calls:
@@ -403,6 +445,9 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str):
             else:
                 try:
                     output_text = _call_mcp_tool(call.name, arguments, hotel_id, session_id)
+                    analytics_result = _as_analytics_result(output_text)
+                    if analytics_result is not None:
+                        last_analytics_result = analytics_result
                 except Exception:
                     logger.exception("MCP tool call failed: %s", call.name)
                     output_text = "That tool call failed - please try again."
@@ -416,7 +461,7 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str):
         )
 
     logger.warning("Exhausted %d function-call rounds with calls still pending", MAX_FUNCTION_CALL_ROUNDS)
-    return response
+    return response, last_analytics_result
 
 
 def _now() -> str:
@@ -435,11 +480,17 @@ def _save_store(store: dict) -> None:
         json.dump(store, f, indent=2)
 
 
-def _summarize_response(response) -> dict:
-    """Flattens a Responses API result into what the UI needs: the assistant's
-    text and any pending OAuth consent requests. Function-tool calls are
-    resolved automatically server-side (see `_run_function_call_loop`) and
-    never reach the UI.
+def _summarize_response(response, last_analytics_result: dict | None) -> dict:
+    """Flattens a Responses API result into what the UI needs. The model's
+    final message is JSON conforming to webchat/agent_contract.py's
+    AgentResponse (once ARIEL_AGENT_VERSION points at a Phase 4 agent
+    version with that structured-output format configured) -
+    `validate_agent_response` parses and validates it against
+    `last_analytics_result` (the real tool result this turn, if any) before
+    any of it reaches the browser; see presentation_validator.py for the
+    full pipeline and every fallback path. Function-tool calls are resolved
+    automatically server-side (see `_run_function_call_loop`) and never
+    reach the UI.
     """
     text_parts = []
     consents = []
@@ -452,9 +503,15 @@ def _summarize_response(response) -> dict:
         elif item.type == "oauth_consent_request":
             consents.append({"consent_link": item.consent_link})
 
+    raw_text = "\n".join(text_parts) or (response.output_text or "")
+    validated = validate_agent_response(raw_text, last_analytics_result)
+
     return {
         "response_id": response.id,
-        "text": "\n".join(text_parts) or (response.output_text or ""),
+        "text": validated["message"],
+        "presentation": validated["presentation"],
+        "insights": validated["insights"],
+        "actions": validated["actions"],
         "consents": consents,
     }
 
@@ -608,16 +665,24 @@ def chat():
             previous_response_id=convo.get("last_response_id"),
             extra_body={"agent_reference": AGENT_REFERENCE},
         )
-        response = _run_function_call_loop(response, hotel_id, session_id)
+        response, last_analytics_result = _run_function_call_loop(response, hotel_id, session_id)
     except Exception as exc:
         logger.exception("Agent call failed")
         return jsonify({"error": str(exc)}), 502
 
-    result = _summarize_response(response)
+    result = _summarize_response(response, last_analytics_result)
 
     convo["messages"].append({"role": "user", "text": message})
     if result["text"]:
-        convo["messages"].append({"role": "assistant", "text": result["text"]})
+        convo["messages"].append(
+            {
+                "role": "assistant",
+                "text": result["text"],
+                "presentation": result["presentation"],
+                "insights": result["insights"],
+                "actions": result["actions"],
+            }
+        )
     convo["last_response_id"] = result["response_id"]
     convo["updated_at"] = _now()
     _save_store(store)

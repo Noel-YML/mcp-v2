@@ -9,6 +9,7 @@ COPY server.py config.py scope_token.py scope_context.py audit.py health.py ./
 COPY fabric_client/ ./fabric_client/
 COPY dmr/ ./dmr/
 COPY tools/ ./tools/
+COPY analytics/ ./analytics/
 
 ENV HOST=0.0.0.0
 ENV PORT=8000

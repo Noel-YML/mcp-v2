@@ -49,11 +49,24 @@ function addLoading() {
   return transcript.lastElementChild;
 }
 
-function addAgentMessage(text) {
+function addAgentMessage(text, presentation, insights, actions) {
   const tpl = document.getElementById("tpl-agent").content.cloneNode(true);
   tpl.querySelector(".ai-body").textContent = text;
+  if (presentation) {
+    renderPresentation(tpl.querySelector(".ai-presentation"), presentation);
+  }
+  if (insights && insights.length) {
+    renderInsights(tpl.querySelector(".ai-insights-slot"), insights);
+  }
+  if (actions && actions.length) {
+    renderActions(tpl.querySelector(".ai-actions-slot"), actions, onActionClicked);
+  }
   transcript.appendChild(tpl);
   scrollToBottom();
+}
+
+function onActionClicked(action) {
+  sendMessage(action.promptFallback);
 }
 
 function addError(text) {
@@ -65,7 +78,7 @@ function addError(text) {
 
 function renderResult(result) {
   if (result.text) {
-    addAgentMessage(result.text);
+    addAgentMessage(result.text, result.presentation, result.insights, result.actions);
   }
   (result.consents || []).forEach((c) => {
     addError("This tool needs sign-in first: " + c.consent_link);
@@ -309,7 +322,7 @@ async function selectConversation(id) {
     transcript.innerHTML = "";
     (convo.messages || []).forEach((m) => {
       if (m.role === "user") addUserMessage(m.text);
-      else addAgentMessage(m.text);
+      else addAgentMessage(m.text, m.presentation, m.insights, m.actions);
     });
   } catch (err) {
     addError("Could not load that conversation.");

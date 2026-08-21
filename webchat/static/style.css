@@ -526,6 +526,129 @@ body{
   margin-top:12px;
 }
 
+/* ---------- Phase 4: validated presentation / insights / actions ---------- */
+/* Rendered inside .ai-panel (always the dark navy card - see above), so
+   text here follows that same white-on-navy convention as .ai-body, not
+   the light-mode --ink-* tokens used elsewhere on the page. */
+
+.ai-presentation{margin-top:14px}
+
+.ariel-chart-title{
+  font-family:var(--font-sans);
+  font-size:12.5px;
+  font-weight:500;
+  color:rgba(255,255,255,.88);
+  margin-bottom:2px;
+}
+.ariel-chart-subtitle{
+  font-size:11px;
+  color:rgba(255,255,255,.5);
+  margin-bottom:10px;
+}
+
+.ariel-chart{
+  width:100%;
+  height:260px;
+}
+
+.ariel-chart-empty{
+  font-size:12.5px;
+  color:rgba(255,255,255,.5);
+  padding:16px 0;
+}
+
+.ariel-table-wrap{
+  overflow-x:auto;
+  border-radius:8px;
+  border:1px solid rgba(255,255,255,.12);
+}
+.ariel-table{
+  width:100%;
+  border-collapse:collapse;
+  font-family:var(--font-mono);
+  font-size:12px;
+}
+.ariel-table th{
+  text-align:left;
+  font-weight:500;
+  letter-spacing:.03em;
+  color:rgba(255,255,255,.55);
+  background:rgba(255,255,255,.05);
+  padding:8px 12px;
+  white-space:nowrap;
+  border-bottom:1px solid rgba(255,255,255,.12);
+}
+.ariel-table td{
+  padding:7px 12px;
+  color:rgba(255,255,255,.85);
+  border-bottom:1px solid rgba(255,255,255,.06);
+  white-space:nowrap;
+  font-variant-numeric:tabular-nums;
+}
+.ariel-table tr:last-child td{border-bottom:none}
+
+.ariel-kpi-card{
+  display:inline-flex;
+  flex-direction:column;
+  gap:4px;
+  padding:14px 20px;
+  border-radius:10px;
+  background:rgba(255,255,255,.06);
+  border:1px solid rgba(255,255,255,.1);
+}
+.ariel-kpi-label{
+  font-size:10.5px;
+  letter-spacing:.06em;
+  text-transform:uppercase;
+  color:rgba(255,255,255,.5);
+}
+.ariel-kpi-value{
+  font-family:var(--font-serif);
+  font-size:28px;
+  color:#fff;
+  font-variant-numeric:tabular-nums;
+}
+
+.ariel-insights{
+  list-style:none;
+  margin:12px 0 0;
+  padding:0;
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+}
+.ariel-insight{
+  font-size:12.5px;
+  line-height:1.5;
+  padding:8px 12px;
+  border-radius:8px;
+  border-left:3px solid var(--sky);
+  background:rgba(255,255,255,.05);
+  color:rgba(255,255,255,.85);
+}
+.ariel-insight-high{border-left-color:var(--orange)}
+.ariel-insight-medium{border-left-color:var(--sky)}
+.ariel-insight-low{border-left-color:rgba(255,255,255,.3)}
+
+.ariel-actions{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:12px;
+}
+.ariel-action-btn{
+  font-family:var(--font-sans);
+  font-size:11.5px;
+  color:rgba(255,255,255,.85);
+  background:rgba(255,255,255,.08);
+  border:1px solid rgba(255,255,255,.16);
+  padding:7px 14px;
+  border-radius:20px;
+  cursor:pointer;
+  transition:border-color .15s ease, background .15s ease;
+}
+.ariel-action-btn:hover{border-color:var(--orange);background:rgba(255,255,255,.14)}
+
 /* ---------- scrollbar ---------- */
 .chat-area::-webkit-scrollbar{width:6px}
 .chat-area::-webkit-scrollbar-thumb{background:var(--gray-rule);border-radius:3px}

@@ -115,3 +115,40 @@ class FabricOptions:
             # verification key the way there is for credential mode.
             scope_public_keys=_parse_public_keys(os.environ.get("ARIEL_SCOPE_PUBLIC_KEYS")),
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 - the analytics contract compatibility flag. Read fresh on every
+# call (not cached at import) so tests can flip it per-test via monkeypatch
+# without re-importing this module.
+# ---------------------------------------------------------------------------
+_ANALYTICS_SCHEMA_LEGACY = "legacy"
+_ANALYTICS_SCHEMA_V1 = "v1"
+_VALID_ANALYTICS_SCHEMA_VERSIONS = (_ANALYTICS_SCHEMA_LEGACY, _ANALYTICS_SCHEMA_V1)
+
+
+def analytics_schema_version() -> str:
+    """`ARIEL_ANALYTICS_SCHEMA_VERSION` - "legacy" (default, unset) keeps
+    every tool's current bare-array success response unchanged; "v1"
+    switches get_dmr_revenue_trend's successful response to the new
+    AnalyticsResult contract (analytics/contract.py). Any other value
+    (typos, "true", "1", a not-yet-real "v2") fails fast here rather than
+    silently falling back to legacy - the same fail-fast posture as
+    AR_FABRIC_AUTH_MODE above, for the same reason: a misconfigured flag
+    should be loud, not silently do the wrong (or old) thing.
+    """
+    raw = os.environ.get("ARIEL_ANALYTICS_SCHEMA_VERSION", _ANALYTICS_SCHEMA_LEGACY)
+    if raw not in _VALID_ANALYTICS_SCHEMA_VERSIONS:
+        allowed = ", ".join(_VALID_ANALYTICS_SCHEMA_VERSIONS)
+        raise FabricConfigError(f"ARIEL_ANALYTICS_SCHEMA_VERSION must be one of [{allowed}], got {raw!r}.")
+    return raw
+
+
+# A potential internal processing default ONLY - nothing in the analytics
+# contract consumes this today, and it is never presented to a caller as if
+# it were authoritative per-hotel data. Nothing in the DMR semantic model
+# gives a real per-hotel timezone (see dmr/hotel_lookup.py's docstring for
+# why Country="Australia" alone isn't enough - Sydney observes daylight
+# saving, Brisbane doesn't). Kept here, unused, for a future internal
+# date-boundary computation that might need SOME default.
+ARIEL_DEFAULT_TIMEZONE = os.environ.get("ARIEL_DEFAULT_TIMEZONE", "Australia/Brisbane")

@@ -45,6 +45,16 @@ SUCCESSFUL response stays exactly what it was - a bare JSON array of rows -
 since changing that shape isn't verifiable against the live `ask-ariel`
 agent from here.
 
+Phase 3 (analytics contract, Aug 2026): when `config.analytics_schema_version()
+== "v1"`, `get_dmr_revenue_trend`'s SUCCESSFUL response switches from the
+bare array to the versioned `AnalyticsResult` contract (analytics/contract.py) -
+semantic column metadata, deterministic facts, a resolved hotel display
+name/currency (dmr/hotel_lookup.py), quality warnings. Default is "legacy"
+(unset), which keeps every tool's response exactly as Phase 2 left it - this
+is a compatibility flag, not a redesign of every tool at once; the other
+three reports don't look at this setting at all yet. Error/empty responses
+are unaffected either way - they stay on the Phase 2 ToolError envelope.
+
 `_verify_rows` is the response-boundary check - it does NOT prove a
 measure's aggregate value was computed only from the scoped hotel; see
 measure_guard.py for the (currently blocked - see that file) check that
@@ -66,8 +76,10 @@ from datetime import datetime, timezone
 from mcp.server.mcpserver import Context
 
 import audit
+import config
 import scope_token
-from dmr import dax_query_builder
+from analytics import revenue_trend as analytics_revenue_trend
+from dmr import dax_query_builder, hotel_lookup
 from dmr.dax_query_builder import MAX_DAYS, QuerySpec
 from dmr.reports import Report
 from fabric_client.result import ErrorCode, ToolError, new_trace_id
@@ -279,6 +291,23 @@ def _execute_report(
         cleaned_rows = [_clean_row(row) for row in result.rows]
         row_count = len(cleaned_rows)
         max_business_date = _extract_max_business_date(cleaned_rows, report)
+
+        if report is Report.REVENUE_TREND and config.analytics_schema_version() == "v1":
+            # Phase 3: the new versioned analytics contract - success only.
+            # Errors/empty results above already returned via the Phase 2
+            # ToolError envelope, unchanged, regardless of this flag - see
+            # analytics/contract.py's module docstring.
+            metadata = hotel_lookup.resolve(service, scope.hotel_id)
+            analytics_result = analytics_revenue_trend.build(
+                scope=scope,
+                hotel_metadata=metadata,
+                cleaned_rows=cleaned_rows,
+                requested_days=validated_days,
+                trace_id=trace_id,
+            )
+            response = analytics_result.to_json()
+            return response
+
         response = json.dumps(cleaned_rows, default=str)
         return response
     finally:

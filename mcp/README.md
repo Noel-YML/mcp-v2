@@ -85,6 +85,20 @@ Once a tool resolves its `Hotel_ID` (from the JWT, never a free-text argument), 
 
 **Known open gap:** `measure_guard.py` is meant to catch a future measure using `ALL`/`ALLEXCEPT`/`ALLSELECTED`/`REMOVEFILTERS` (which could compute an aggregate across hotels while still showing the right `Hotel_ID` on the row). Getting real DAX expression text out of `INFO.VIEW.MEASURES()` via the `executeQueries` REST API doesn't work for this model — `[Expression]` comes back blank for every measure tested, not just the DMR ones. Treat that specific risk as **unverified**, not confirmed clean, until someone wires this guard up to real expression text (likely needs XMLA/TOM-level access).
 
+## The analytics contract (Phase 3, `get_dmr_revenue_trend` only so far)
+
+`get_dmr_revenue_trend`'s **successful** response can switch from a bare JSON array to a versioned, semantically-annotated result — `mcp/analytics/`: `contract.py` (the pydantic models), `columns.py` (per-column semantics — critically, which columns are `additive` daily figures vs. `non_additive` cumulative snapshots, so a consumer can't accidentally reproduce the ~350x MTD-overcounting bug `dax_query_builder.py` already documents once), `facts.py` (deterministic highest/lowest day, period-over-period change, latest budget variance — computed in Python, never left for the model to recalculate), and `actions.py` (every advertised follow-up action maps to something Ariel can genuinely execute today). `dmr/hotel_lookup.py` resolves a real display name and, from the real `_Hotels[Country]` column, a currency — with no silent fallback: an unmapped country comes back `currency: null`, not a guessed value.
+
+Controlled by `ARIEL_ANALYTICS_SCHEMA_VERSION`:
+
+| Value | Behavior |
+|---|---|
+| unset / `legacy` (default) | Every tool's response is exactly what Phase 2 shipped — the bare array, unchanged. |
+| `v1` | `get_dmr_revenue_trend`'s successful response uses the new contract. The other 3 tools ignore this setting — nothing to switch to yet. |
+| anything else | Fails fast at call time (same posture as `AR_FABRIC_AUTH_MODE`) rather than silently falling back. |
+
+Error and empty (`no_data`) responses are unaffected either way — they stay on the Phase 2 `ToolError` envelope for every tool, migrated or not. **Not enabled on the deployed Function App** — this is a local/testing flag until the `ask-ariel` agent's own instructions are updated to understand the new shape.
+
 ## Health endpoints (not AI-callable tools)
 
 Diagnostics moved out of the tool list in the Aug 2026 hardening pass — there is no `echo` tool any more. Both hostings expose plain HTTP routes instead (`mcp/health.py`):
