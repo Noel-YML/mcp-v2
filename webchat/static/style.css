@@ -364,27 +364,92 @@ body{
   white-space:pre-wrap;
 }
 
-/* ---------- approval card ---------- */
-.approval-card{
-  max-width:78%;
-  background:var(--orange-pale);
-  border-left:3px solid var(--orange);
-  padding:14px 18px;
-  border-radius:0 12px 12px 0;
+/* ---------- hotel identification overlay ---------- */
+.identify-overlay{
+  display:none;
+  position:fixed;
+  inset:0;
+  z-index:100;
+  background:var(--navy-deep);
+  align-items:center;
+  justify-content:center;
 }
-.approval-label{
-  font-size:9px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;
-  color:var(--orange);margin-bottom:.4rem;
+.identify-overlay.open{display:flex}
+
+.identify-card{
+  width:100%;
+  max-width:340px;
+  padding:0 24px;
+  text-align:center;
 }
-.approval-name{font-family:var(--font-mono);font-size:13px;color:var(--navy-deep);margin-bottom:.25rem}
-.approval-args{font-family:var(--font-mono);font-size:11px;color:var(--ink-muted);margin-bottom:.75rem;word-break:break-all}
-.approval-actions{display:flex;gap:8px}
-.approval-btn{
-  font-size:12px;font-family:var(--font-sans);font-weight:500;
-  padding:6px 14px;border-radius:6px;border:none;cursor:pointer;
+
+.identify-mark{
+  width:44px;height:44px;
+  margin:0 auto 20px;
+  border-radius:10px;
+  background:var(--orange);
+  color:#fff;
+  font-family:var(--font-serif);
+  font-weight:500;
+  font-size:22px;
+  display:flex;align-items:center;justify-content:center;
 }
-.approval-btn.approve{background:var(--navy-deep);color:#fff}
-.approval-btn.deny{background:transparent;color:var(--ink-muted);border:1px solid var(--gray-rule)}
+
+.identify-title{
+  font-family:var(--font-serif);
+  font-weight:500;
+  font-size:24px;
+  color:#fff;
+  margin-bottom:8px;
+}
+
+.identify-sub{
+  font-size:12.5px;
+  font-weight:300;
+  color:rgba(255,255,255,.5);
+  line-height:1.6;
+  margin-bottom:24px;
+}
+
+.identify-input{
+  width:100%;
+  padding:12px 14px;
+  border-radius:10px;
+  border:1px solid rgba(255,255,255,.15);
+  background:rgba(255,255,255,.06);
+  color:#fff;
+  font-family:var(--font-mono);
+  font-size:14px;
+  text-align:center;
+  outline:none;
+  margin-bottom:12px;
+  transition:border-color .15s ease;
+}
+.identify-input::placeholder{color:rgba(255,255,255,.3);font-family:var(--font-sans)}
+.identify-input:focus{border-color:var(--orange)}
+
+.identify-btn{
+  width:100%;
+  padding:12px;
+  border-radius:10px;
+  border:none;
+  background:var(--orange);
+  color:#fff;
+  font-family:var(--font-sans);
+  font-weight:500;
+  font-size:14px;
+  cursor:pointer;
+  transition:background .15s ease;
+}
+.identify-btn:hover{background:var(--orange-mid)}
+.identify-btn:disabled{background:rgba(255,255,255,.15);cursor:default}
+
+.identify-error{
+  min-height:16px;
+  margin-top:12px;
+  font-size:12px;
+  color:#e8776a;
+}
 
 /* ---------- composer ---------- */
 .composer-wrap{

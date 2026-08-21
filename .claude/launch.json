@@ -5,7 +5,8 @@
       "name": "ariel-webchat",
       "runtimeExecutable": "python",
       "runtimeArgs": ["webchat/server.py"],
-      "port": 5050
+      "port": 5050,
+      "autoPort": true
     }
   ]
 }
