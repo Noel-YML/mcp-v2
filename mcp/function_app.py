@@ -3,111 +3,165 @@ Ask ARIEL MCP server (v2) - Azure Functions hosting.
 
 This is the entry point for publishing to Azure Functions, using the same
 native MCP extension as `../mcp-server/function_app.py` (v1):
-`@app.mcp_tool_trigger` / `@app.mcp_resource_trigger`, backed by the
-`extensions.mcp` block in host.json. It gets the platform's built-in access
-control for free - the MCP extension's system key, the same mechanism v1
-already uses - unlike server.py's Streamable HTTP hosting, which has no
-endpoint auth of its own.
+`@app.mcp_tool_trigger`, backed by the `extensions.mcp` block in host.json.
+It gets the platform's built-in access control for free - the MCP
+extension's system key - unlike server.py's Streamable HTTP hosting, which
+has no endpoint auth of its own.
 
-Same DAX, same Fabric auth, same tools as v1 - this file only adapts the
-Azure Functions "JSON-string context in, string out" calling convention to
-the shared implementations in tools/ and products/, so none of that logic is
-duplicated between the two hostings. New versus v1: the 2 Agent Skills from
-skills/ariel_skills.py are exposed here too, via mcp_resource_trigger.
+This file adapts the Azure Functions "JSON-string context in, string out"
+calling convention to the shared implementations in tools/dmr_tools.py, so
+none of that logic is duplicated between the two hostings.
 
-Not deployed yet - this is the structure only. Requires the same
-AR_FABRIC_TENANT_ID / AR_FABRIC_CLIENT_ID / AR_FABRIC_CLIENT_SECRET /
-PRODUCT_FABRIC_WORKSPACE_ID / PRODUCT_FABRIC_DATASET_ID app settings as v1
-and as server.py (see local.settings.json for local dev placeholders).
+DMR data is queried via DAX against the Power BI semantic model - see
+fabric_client/service.py for why that initially returned 401 for a service
+principal (SSO passthrough to the model's Fabric Lakehouse data source) and
+what changed to fix it. The earlier customer-facing product-automation tools
+and Agent Skills have been removed - this build is DMR-only.
+
+None of the 4 DMR tools take a `hotel_name` OR a `scope_token` argument -
+see tools/dmr_tools.py and scope_token.py for the full design. Scope arrives
+as the `X-Ariel-Scope` HTTP header, which webchat (the broker - see
+webchat/server.py) attaches on its server-to-server call to this MCP server;
+the model calling webchat's Foundry agent never sees a scope field of any
+kind, on any tool.
+
+CORRECTION (2026-08-21): an earlier version of this file, and of
+scope_token.py, claimed the native Azure Functions MCP trigger's `context`
+payload "only ever carries arguments... no way to read the incoming
+request's headers." That was true before the MCP extension's 1.0.0 GA
+(Oct 2025) and is false now - the trigger payload also carries
+`transport.name` and `transport.properties.headers` (every incoming HTTP
+header), via `McpTriggerTransportHelper.GetTransportInformation` in the host
+extension. Confirmed locally against this exact codebase (Phase 1A spike):
+`transport.name == "http-streamable"` and a custom `X-Ariel-Scope` header
+sent by an MCP client round-trips into the tool handler correctly, including
+under concurrent calls with distinct per-call values - no cross-contamination.
+
+Two things this depends on, both enforced in `_resolve_scope` below:
+  - Headers are only current-and-correct on Streamable HTTP. On the legacy
+    SSE transport they'd be the long-lived SSE handshake's headers, not the
+    current call's - so anything other than `transport.name ==
+    "http-streamable"` is rejected outright, including the `"unknown"` value
+    the extension emits when it can't resolve transport info at all.
+  - `transport.properties.headers` is UNFILTERED and includes
+    `x-functions-key` in plaintext. Never log the raw `context` payload.
+
+Requires AR_FABRIC_AUTH_MODE, ARIEL_SCOPE_PUBLIC_KEYS, and (in
+`client_secret` auth mode only) AR_FABRIC_TENANT_ID / AR_FABRIC_CLIENT_ID /
+AR_FABRIC_CLIENT_SECRET (see local.settings.json for local dev placeholders
+and config.py for validation) and optionally DMR_FABRIC_WORKSPACE_ID /
+DMR_FABRIC_DATASET_ID to override the defaults in config.py.
+
+Phase 2 hardening (Aug 2026): the `echo` tool is gone - diagnostics are no
+longer AI-callable (see mcp/health.py). This file instead exposes
+/api/health/live, /api/health/ready (both anonymous - see mcp/health.py for
+what "ready" actually checks), and /api/health/deep (function-key
+protected, a real Fabric round-trip) as plain HTTP routes alongside the MCP
+tool triggers - Azure Functions supports mixing trigger types on one
+FunctionApp.
 """
 
 import json
 
 import azure.functions as func
 
+import health
 from config import FabricOptions
 from fabric_client.service import FabricQueryService
-from products.catalog import PRODUCT_NAMES_HELP
-from skills import ariel_skills
-from tools import ariel_product_tools, diagnostics
+from tools import dmr_tools
 
 app = func.FunctionApp()
 
-fabric_service = FabricQueryService(FabricOptions.from_env())
+_fabric_options = FabricOptions.from_env()
+fabric_service = FabricQueryService(_fabric_options)
+_public_keys = _fabric_options.scope_public_keys
+_readiness = health.Readiness(fabric_service, _public_keys)
+
+_SCOPE_HEADER = "x-ariel-scope"
+_ALLOWED_TRANSPORT = "http-streamable"
+
+_BAD_TRANSPORT_ERROR = (
+    "{tool} was rejected: this call arrived over transport {transport!r}, not "
+    "{allowed!r}. Scope headers are only trustworthy on the streamable-http "
+    "transport - this fails closed rather than trusting a header that may be "
+    "stale (e.g. from a long-lived SSE handshake instead of this call)."
+)
+
+
+def _resolve_scope(payload: dict, tool: str) -> tuple:
+    """Extracts and verifies the hotel scope for one tool call from the MCP
+    trigger's transport headers - never from `arguments`, which is the
+    model-visible, model-suppliable part of the payload. Returns
+    (ScopeContext, error); exactly one is set.
+    """
+    transport = payload.get("transport") or {}
+    transport_name = transport.get("name")
+    if transport_name != _ALLOWED_TRANSPORT:
+        return None, _BAD_TRANSPORT_ERROR.format(tool=tool, transport=transport_name, allowed=_ALLOWED_TRANSPORT)
+
+    headers = (transport.get("properties") or {}).get("headers") or {}
+    headers_ci = {k.lower(): v for k, v in headers.items()}
+    token = headers_ci.get(_SCOPE_HEADER)
+    return dmr_tools.resolve_scope_from_token(token, _public_keys, tool)
+
 
 # ---------------------------------------------------------------------------
 # Tool property schemas (the MCP extension needs these as a JSON string per
 # tool - there's no decorator-driven introspection of type hints/docstrings
-# like the SDK hosting in server.py gets, so they're declared explicitly here,
-# matching v1's exact shape).
+# like the SDK hosting in server.py gets, so they're declared explicitly here).
+# None of the DMR tools declare a scope property - there is nothing in their
+# schema for a model to see or set to another hotel.
 # ---------------------------------------------------------------------------
-_ECHO_TOOL_PROPERTIES = json.dumps(
-    [
-        {
-            "propertyName": "message",
-            "propertyType": "string",
-            "description": "The message to echo back.",
-            "isRequired": True,
-        }
-    ]
-)
+_DAYS_PROPERTY = {
+    "propertyName": "days",
+    "propertyType": "integer",
+    "description": "How many of the most recent audit days to return. Defaults to 30.",
+    "isRequired": False,
+}
 
-_PRODUCT_TOOL_PROPERTIES = json.dumps(
-    [
-        {
-            "propertyName": "product_name",
-            "propertyType": "string",
-            "description": "Exact product name. One of: " + PRODUCT_NAMES_HELP,
-            "isRequired": True,
-        },
-        {
-            "propertyName": "hotel_name",
-            "propertyType": "string",
-            "description": (
-                "Exact hotel name to filter by, e.g. 'IBIS Brisbane Airport'. "
-                "Omit for organization-wide totals across all hotels."
-            ),
-            "isRequired": False,
-        },
-    ]
-)
+_HOLDINGS_DAYS_PROPERTY = {
+    "propertyName": "days",
+    "propertyType": "integer",
+    "description": "How many upcoming stay dates to return. Defaults to 14.",
+    "isRequired": False,
+}
 
-_AVAILABLE_PRODUCTS_TOOL_PROPERTIES = json.dumps(
-    [
-        {
-            "propertyName": "hotel_name",
-            "propertyType": "string",
-            "description": ("Exact hotel name to check, e.g. 'IBIS Brisbane Airport'. Omit to check organization-wide."),
-            "isRequired": False,
-        }
-    ]
-)
+_REVENUE_TREND_TOOL_PROPERTIES = json.dumps([_DAYS_PROPERTY])
+_NO_TOOL_PROPERTIES = json.dumps([])
+_HOLDINGS_TOOL_PROPERTIES = json.dumps([_HOLDINGS_DAYS_PROPERTY])
 
-_TREND_TOOL_PROPERTIES = json.dumps(
-    [
-        {
-            "propertyName": "product_name",
-            "propertyType": "string",
-            "description": "Exact product name. One of: " + PRODUCT_NAMES_HELP,
-            "isRequired": True,
-        },
-        {
-            "propertyName": "hotel_name",
-            "propertyType": "string",
-            "description": (
-                "Exact hotel name to filter by, e.g. 'IBIS Brisbane Airport'. "
-                "Omit for organization-wide totals across all hotels."
-            ),
-            "isRequired": False,
-        },
-        {
-            "propertyName": "months",
-            "propertyType": "integer",
-            "description": "How many of the most recent months to return. Defaults to 12.",
-            "isRequired": False,
-        },
-    ]
-)
+
+# ---------------------------------------------------------------------------
+# Health endpoints - plain HTTP routes, not MCP tools. Not AI-callable by
+# design (see mcp/health.py's module docstring for why diagnostics moved out
+# of the tool list). Deployed under the default Functions route prefix, so
+# these are /api/health/live, /api/health/ready, /api/health/deep.
+# ---------------------------------------------------------------------------
+@app.route(route="health/live", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def health_live(req: func.HttpRequest) -> func.HttpResponse:
+    return func.HttpResponse(json.dumps(health.liveness()), mimetype="application/json")
+
+
+@app.route(route="health/ready", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def health_ready(req: func.HttpRequest) -> func.HttpResponse:
+    ready = _readiness.check()
+    status_code = 200 if ready else 503
+    return func.HttpResponse(
+        json.dumps({"status": "ready" if ready else "not_ready"}),
+        status_code=status_code,
+        mimetype="application/json",
+    )
+
+
+@app.route(route="health/deep", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def health_deep(req: func.HttpRequest) -> func.HttpResponse:
+    result = health.deep_check(fabric_service)
+    status_code = 200 if result.ok else 503
+    return func.HttpResponse(
+        json.dumps({"status": "ok" if result.ok else "failed"}),
+        status_code=status_code,
+        mimetype="application/json",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -115,100 +169,71 @@ _TREND_TOOL_PROPERTIES = json.dumps(
 # ---------------------------------------------------------------------------
 @app.mcp_tool_trigger(
     arg_name="context",
-    tool_name="echo",
-    description="Echoes back the provided message. Used to verify the MCP server is reachable end-to-end.",
-    tool_properties=_ECHO_TOOL_PROPERTIES,
+    tool_name="get_dmr_revenue_trend",
+    description=(
+        "Gets a day-by-day Total Revenue trend for your hotel - actual, MTD, "
+        "YTD, budget, and forecast. Rows are ordered oldest to most recent."
+    ),
+    tool_properties=_REVENUE_TREND_TOOL_PROPERTIES,
 )
-def echo(context) -> str:
-    args = json.loads(context)["arguments"]
-    return diagnostics.echo(args["message"])
+def get_dmr_revenue_trend(context) -> str:
+    payload = json.loads(context)
+    scope, error = _resolve_scope(payload, "get_dmr_revenue_trend")
+    if error:
+        return error
+    return dmr_tools.get_dmr_revenue_trend(fabric_service, scope, payload.get("arguments", {}).get("days"))
 
 
 @app.mcp_tool_trigger(
     arg_name="context",
-    tool_name="get_product_automation_metrics",
+    tool_name="get_dmr_segment_mix",
     description=(
-        "Gets ARIEL automation and labour-savings metrics for a specific product "
-        "(AR Invoices Automation, VCC Automation, Reservation Module, Audit, "
-        "Booking.com Reconciliation, Fastcom Reconciliation, or DMR), for a hotel "
-        "or organization-wide if no hotel is given."
+        "Gets your hotel's current market-segment revenue mix (e.g. Corporate, "
+        "Leisure, Crew), as of the most recent audit date - MTD/YTD revenue "
+        "and occupancy per segment, vs. budget, last-year, and forecast."
     ),
-    tool_properties=_PRODUCT_TOOL_PROPERTIES,
+    tool_properties=_NO_TOOL_PROPERTIES,
 )
-def get_product_automation_metrics(context) -> str:
-    args = json.loads(context).get("arguments", {})
-    return ariel_product_tools.get_product_automation_metrics(
-        fabric_service, args.get("product_name", ""), args.get("hotel_name")
-    )
+def get_dmr_segment_mix(context) -> str:
+    payload = json.loads(context)
+    scope, error = _resolve_scope(payload, "get_dmr_segment_mix")
+    if error:
+        return error
+    return dmr_tools.get_dmr_segment_mix(fabric_service, scope)
 
 
 @app.mcp_tool_trigger(
     arg_name="context",
-    tool_name="list_available_products",
+    tool_name="get_dmr_fnb_performance",
     description=(
-        "Lists which ARIEL products actually have data for a hotel (or "
-        "organization-wide if no hotel is given). Use this before asking about a "
-        "specific product if you don't already know which ones apply."
+        "Gets your hotel's current food & beverage outlet performance (e.g. "
+        "restaurant, bar, breakfast service), as of the most recent audit date "
+        "- revenue, covers, and average spend per outlet, vs. budget, "
+        "last-year, and forecast."
     ),
-    tool_properties=_AVAILABLE_PRODUCTS_TOOL_PROPERTIES,
+    tool_properties=_NO_TOOL_PROPERTIES,
 )
-def list_available_products(context) -> str:
-    args = json.loads(context).get("arguments", {})
-    return ariel_product_tools.list_available_products(fabric_service, args.get("hotel_name"))
+def get_dmr_fnb_performance(context) -> str:
+    payload = json.loads(context)
+    scope, error = _resolve_scope(payload, "get_dmr_fnb_performance")
+    if error:
+        return error
+    return dmr_tools.get_dmr_fnb_performance(fabric_service, scope)
 
 
 @app.mcp_tool_trigger(
     arg_name="context",
-    tool_name="get_product_automation_trend",
+    tool_name="get_dmr_holdings_outlook",
     description=(
-        "Gets a month-by-month trend (one row per month, most recent last) of "
-        "automation metrics for a specific product, for a hotel or "
-        "organization-wide if no hotel is given. Use this for questions about "
-        "trends, history, or month-over-month change - get_product_automation_metrics "
-        "only returns a single current snapshot, not a series."
+        "Gets your hotel's forward occupancy/holdings outlook (rooms held, "
+        "arrivals, departures, guests, revenue, ADR) for upcoming stay dates, "
+        "as of the most recent audit date."
     ),
-    tool_properties=_TREND_TOOL_PROPERTIES,
+    tool_properties=_HOLDINGS_TOOL_PROPERTIES,
 )
-def get_product_automation_trend(context) -> str:
-    args = json.loads(context).get("arguments", {})
-    return ariel_product_tools.get_product_automation_trend(
-        fabric_service, args.get("product_name", ""), args.get("hotel_name"), args.get("months")
-    )
-
-
-# ---------------------------------------------------------------------------
-# Skills (new in v2 - not present in v1)
-# ---------------------------------------------------------------------------
-@app.mcp_resource_trigger(
-    arg_name="context",
-    uri="skill://ariel/interpreting-ariel-metrics/SKILL.md",
-    resource_name="interpreting-ariel-metrics",
-    mime_type="text/markdown",
-    description=(
-        "How to interpret and narrate the automation-rate, labour-savings, and "
-        "FTE numbers returned by get_product_automation_metrics and "
-        "get_product_automation_trend - including what these numbers must never "
-        "be implied to mean. Load this before answering any question that cites "
-        "a specific metric value."
-    ),
-)
-def interpreting_ariel_metrics(context) -> str:
-    return ariel_skills.INTERPRETING_ARIEL_METRICS
-
-
-@app.mcp_resource_trigger(
-    arg_name="context",
-    uri="skill://ariel/hotel-business-ontology/SKILL.md",
-    resource_name="hotel-business-ontology",
-    mime_type="text/markdown",
-    description=(
-        "The business ontology for the hospitality domain this data describes "
-        "(Hotel, Operating Company vs. Management Company, Reservations, AR, "
-        "Audit, Subscriptions, Opportunities) - including which of these are "
-        "actually queryable through this MCP server today versus background "
-        "context only. Load this when a question uses ambiguous domain terms "
-        "(e.g. 'who manages this hotel', 'subscription', 'booking')."
-    ),
-)
-def hotel_business_ontology(context) -> str:
-    return ariel_skills.HOTEL_BUSINESS_ONTOLOGY
+def get_dmr_holdings_outlook(context) -> str:
+    payload = json.loads(context)
+    scope, error = _resolve_scope(payload, "get_dmr_holdings_outlook")
+    if error:
+        return error
+    return dmr_tools.get_dmr_holdings_outlook(fabric_service, scope, payload.get("arguments", {}).get("days"))

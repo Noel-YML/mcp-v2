@@ -1,0 +1,51 @@
+name: mcp CI
+
+on:
+  push:
+    paths:
+      - "mcp/**"
+      - ".github/workflows/mcp-ci.yml"
+  pull_request:
+    paths:
+      - "mcp/**"
+      - ".github/workflows/mcp-ci.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mcp
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install production dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests -v
+
+      - name: Import-check every module (catches syntax/import errors early)
+        run: |
+          python -c "
+          import py_compile, pathlib
+          for path in pathlib.Path('.').rglob('*.py'):
+              if '.venv' in path.parts or 'tests' in path.parts or '__pycache__' in path.parts:
+                  continue
+              py_compile.compile(str(path), doraise=True)
+          print('OK: all non-test modules compile.')
+          "
+
+      - name: Confirm dev-only files are excluded from the deployment package
+        run: |
+          for entry in tests requirements-dev.txt; do
+            grep -qx "$entry" .funcignore || { echo "::error::'$entry' is missing from .funcignore"; exit 1; }
+          done
+          echo "OK: tests/ and requirements-dev.txt are listed in .funcignore."

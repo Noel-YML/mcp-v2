@@ -5,11 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py config.py ./
+COPY server.py config.py scope_token.py scope_context.py audit.py health.py ./
 COPY fabric_client/ ./fabric_client/
-COPY products/ ./products/
+COPY dmr/ ./dmr/
 COPY tools/ ./tools/
-COPY skills/ ./skills/
 
 ENV HOST=0.0.0.0
 ENV PORT=8000

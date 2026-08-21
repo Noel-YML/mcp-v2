@@ -1,5 +1,6 @@
 {
   "version": "2.0",
+  "functionTimeout": "00:02:30",
   "logging": {
     "applicationInsights": {
       "samplingSettings": {
@@ -14,7 +15,7 @@
   },
   "extensions": {
     "mcp": {
-      "instructions": "Remote MCP server for Ask ARIEL - ARIEL product automation metrics.",
+      "instructions": "Remote MCP server for Ask ARIEL - DMR (Daily Management Report) data.",
       "serverName": "ariel-mcp-v2",
       "serverVersion": "2.0.0"
     }
