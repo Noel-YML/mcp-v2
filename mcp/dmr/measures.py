@@ -55,7 +55,12 @@ MEASURE_DEFINITIONS: dict[Measure, tuple[str, str]] = {
     Measure.FNB_REVENUE_YTD: ("Revenue YTD", "[FNB: Revenue (YTD)]"),
     Measure.FNB_REVENUE_BUDGET: ("Revenue Budget", "[FNB: Revenue (Budget)]"),
     Measure.FNB_REVENUE_VS_BUDGET_MTD: ("Revenue Vs Budget MTD", "[FNB: Revenue Vs Budget MTD]"),
-    Measure.FNB_REVENUE_LAST_YEAR_MONTH: ("Revenue Last Year Month", "[FNB: Revenue (Last Year Month)]"),
+    # Confirmed against live INFO.VIEW.MEASURES() (Aug 2026 UC3 F&B live
+    # acceptance pass) - the model's real name is "FNB: Revenue (LY MTD)",
+    # not "(Last Year Month)". The old reference didn't exist in the model
+    # at all and caused a 400 from Fabric on every get_dmr_fnb_performance
+    # call - this measure had never actually been exercised live before.
+    Measure.FNB_REVENUE_LAST_YEAR_MONTH: ("Revenue Last Year Month", "[FNB: Revenue (LY MTD)]"),
     Measure.FNB_REVENUE_FORECAST: ("Revenue Forecast", "[FNB: Revenue (Forecast)]"),
     Measure.HOLDINGS_ROOMS: ("Rooms", "[Holdings: Rooms (Current)]"),
     Measure.HOLDINGS_REVENUE: ("Revenue", "[Holdings: Revenue (Current)]"),

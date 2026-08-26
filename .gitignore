@@ -3,6 +3,7 @@
 *.key
 .env
 .env.*
+mcp/local.settings.json
 
 # Python
 __pycache__/

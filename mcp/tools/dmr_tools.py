@@ -78,7 +78,10 @@ from mcp.server.mcpserver import Context
 import audit
 import config
 from scope import scope_token
+from analytics import fnb_performance as analytics_fnb_performance
+from analytics import revenue_snapshot as analytics_revenue_snapshot
 from analytics import revenue_trend as analytics_revenue_trend
+from analytics import segment_mix as analytics_segment_mix
 from dmr import dax_query_builder, hotel_lookup
 from dmr.dax_query_builder import QuerySpec
 from dmr.reports import Report
@@ -117,6 +120,16 @@ _DATE_FIELD_BY_REPORT = {
     Report.REVENUE_TREND: "Date",
     Report.REVENUE_SNAPSHOT: "Date",
     Report.HOLDINGS_OUTLOOK: "SelDate",
+}
+
+# Reports with an analytics-contract builder (analytics/) - checked in
+# _execute_report alongside config.analytics_schema_version(). holdings_outlook
+# isn't here yet - nothing built for it.
+_ANALYTICS_ENABLED_REPORTS = {
+    Report.REVENUE_TREND,
+    Report.REVENUE_SNAPSHOT,
+    Report.SEGMENT_MIX,
+    Report.FNB_PERFORMANCE,
 }
 
 _EMPTY_MESSAGES = {
@@ -310,19 +323,31 @@ def _execute_report(
         row_count = len(cleaned_rows)
         max_business_date = _extract_max_business_date(cleaned_rows, report)
 
-        if report is Report.REVENUE_TREND and config.analytics_schema_version() == "v1":
-            # Phase 3: the new versioned analytics contract - success only.
-            # Errors/empty results above already returned via the Phase 2
-            # ToolError envelope, unchanged, regardless of this flag - see
-            # analytics/contract.py's module docstring.
+        if report in _ANALYTICS_ENABLED_REPORTS and config.analytics_schema_version() == "v1":
+            # Phase 3 (revenue_trend) + Aug 2026 (revenue_snapshot,
+            # segment_mix, fnb_performance): the versioned analytics
+            # contract - success only. Errors/empty results above already
+            # returned via the Phase 2 ToolError envelope, unchanged,
+            # regardless of this flag - see analytics/contract.py's module
+            # docstring. holdings_outlook isn't in _ANALYTICS_ENABLED_REPORTS
+            # yet - nothing to switch to there.
             metadata = hotel_lookup.resolve(service, scope.hotel_id)
-            analytics_result = analytics_revenue_trend.build(
-                scope=scope,
-                hotel_metadata=metadata,
-                cleaned_rows=cleaned_rows,
-                requested_days=validated_days,
-                trace_id=trace_id,
-            )
+            if report is Report.REVENUE_TREND:
+                analytics_result = analytics_revenue_trend.build(
+                    scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, requested_days=validated_days, trace_id=trace_id
+                )
+            elif report is Report.REVENUE_SNAPSHOT:
+                analytics_result = analytics_revenue_snapshot.build(
+                    scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, requested_days=validated_days, trace_id=trace_id
+                )
+            elif report is Report.SEGMENT_MIX:
+                analytics_result = analytics_segment_mix.build(
+                    scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, trace_id=trace_id
+                )
+            else:
+                analytics_result = analytics_fnb_performance.build(
+                    scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, trace_id=trace_id
+                )
             response = analytics_result.to_json()
             return response
 

@@ -63,15 +63,20 @@ mcp/
 │   ├── reports.py                 <- Report/Measure/Granularity enums - the only values a query can ever reference
 │   ├── measures.py                <- curated DAX measure names (the "Matrix v2" family) + table references, keyed by enum
 │   ├── dax_query_builder.py       <- build(spec, scope) - the only entry point; requires a verified ScopeContext
-│   └── measure_guard.py           <- scan for filter-removing DAX in measures (see caveat in that file - currently blocked on data access)
+│   ├── measure_guard.py           <- scan for filter-removing DAX in measures (see caveat in that file - currently blocked on data access)
+│   ├── semantics.py               <- business-semantics registry (aggregation type, capabilities, lineage/queryability state, reconciliation relationships) - the single source of truth analytics/columns.py and analytics/facts.py consult, never re-declared
+│   └── reconciliation.py          <- reconcile() - compares two already-fetched values against a registered semantics.py relationship (PASS/FAIL/NOT_APPLICABLE/INSUFFICIENT_DATA)
 ├── tools/
 │   └── dmr_tools.py                <- the 5 DMR tools (no scope arg), one shared _execute_report path, result-row verification, TOOL_NAMES
-├── analytics/                      <- the versioned "rich answer" contract - get_dmr_revenue_trend only so far (see below)
-│   ├── contract.py                 <- AnalyticsResult pydantic models (the versioned response shape)
-│   ├── columns.py                  <- per-column semantics: additive vs non-additive, currency, etc.
-│   ├── facts.py                    <- deterministic best/worst day, period-over-period change, budget variance
-│   ├── actions.py                  <- which follow-up actions this report can genuinely execute
-│   └── revenue_trend.py            <- assembles the above into one AnalyticsResult for get_dmr_revenue_trend
+├── analytics/                      <- the versioned "rich answer" contract - 4 of 5 tools now (see below)
+│   ├── contract.py                 <- AnalyticsResult pydantic models (the versioned response shape, shared by every report)
+│   ├── columns.py                  <- per-column semantics: additive / non-additive / rate, currency, etc.
+│   ├── facts.py                    <- trend facts (day-based) + breakdown facts (dimension-based - max/same-row-diff only, never a sum)
+│   ├── actions.py                  <- which follow-up actions each report can genuinely execute
+│   ├── revenue_trend.py            <- assembles an AnalyticsResult for get_dmr_revenue_trend
+│   ├── revenue_snapshot.py         <- assembles an AnalyticsResult for get_dmr_revenue_snapshot
+│   ├── segment_mix.py              <- assembles an AnalyticsResult for get_dmr_segment_mix
+│   └── fnb_performance.py          <- assembles an AnalyticsResult for get_dmr_fnb_performance
 ├── scripts/
 │   └── smoke_test_revenue.py      <- manual real-Fabric smoke test for the revenue tools, bypassing JWT/MCP transport
 └── tests/                         <- pytest suite (dev-only - see requirements-dev.txt, excluded from the Functions package via .funcignore)
@@ -122,19 +127,23 @@ Once a tool resolves its `Hotel_ID` (from the JWT, never a free-text argument), 
 
 **Known open gap:** `dmr/measure_guard.py` is meant to catch a future measure using `ALL`/`ALLEXCEPT`/`ALLSELECTED`/`REMOVEFILTERS` (which could compute an aggregate across hotels while still showing the right `Hotel_ID` on the row). Getting real DAX expression text out of `INFO.VIEW.MEASURES()` via the `executeQueries` REST API doesn't work for this model — `[Expression]` comes back blank for every measure tested, not just the DMR ones. Treat that specific risk as **unverified**, not confirmed clean, until someone wires this guard up to real expression text (likely needs XMLA/TOM-level access).
 
-## The analytics contract (Phase 3, `get_dmr_revenue_trend` only so far)
+## The analytics contract (4 of 5 tools now — `get_dmr_holdings_outlook` is the one left)
 
-`get_dmr_revenue_trend`'s **successful** response can switch from a bare JSON array to a versioned, semantically-annotated result — `mcp/analytics/`: `contract.py` (the pydantic models), `columns.py` (per-column semantics — critically, which columns are `additive` daily figures vs. `non_additive` cumulative snapshots, so a consumer can't accidentally reproduce the ~350x MTD-overcounting bug `dax_query_builder.py` already documents once), `facts.py` (deterministic highest/lowest day, period-over-period change, latest budget variance — computed in Python, never left for the model to recalculate), and `actions.py` (every advertised follow-up action maps to something Ariel can genuinely execute today). `dmr/hotel_lookup.py` resolves a real display name and, from the real `_Hotels[Country]` column, a currency — with no silent fallback: an unmapped country comes back `currency: null`, not a guessed value.
+A tool's **successful** response can switch from a bare JSON array to a versioned, semantically-annotated result — `mcp/analytics/`: `contract.py` (the pydantic models, shared by every report), `columns.py` (per-column semantics — critically, which columns are `additive` daily figures, `non_additive` cumulative snapshots, or `rate` ratios like ADR that can never be summed, so a consumer can't accidentally reproduce the ~350x MTD-overcounting bug `dax_query_builder.py` already documents once), `facts.py` (deterministic facts computed in Python, never left for the model to recalculate), and `actions.py` (every advertised follow-up action maps to something Ariel can genuinely execute today). `dmr/hotel_lookup.py` resolves a real display name and, from the real `_Hotels[Country]` column, a currency — with no silent fallback: an unmapped country comes back `currency: null`, not a guessed value.
+
+Two families of facts, not one:
+- **Trend facts** (`revenue_trend.py`) — day-based: highest/lowest day, period-over-period change, latest budget variance.
+- **Breakdown facts** (`segment_mix.py`, `fnb_performance.py`, `revenue_snapshot.py`) — dimension-based (segment, outlet, revenue type), and deliberately narrower: only a max (`top_contributor`) or a same-row subtraction (`computed_variance_leader`) or a real precomputed variance measure (`biggest_variance`) — **never a sum across rows**. Unlike revenue_trend's confirmed "Total Revenue" row, there's no verified evidence segment_mix/fnb_performance are free of a self-referential rollup row the way revenue_matrix's `Revenue_Group` is known to have one — summing an unverified table risks exactly the same class of bug, one level down.
 
 Controlled by `ARIEL_ANALYTICS_SCHEMA_VERSION`:
 
 | Value | Behavior |
 |---|---|
 | unset / `legacy` (default) | Every tool's response is exactly what Phase 2 shipped — the bare array, unchanged. |
-| `v1` | `get_dmr_revenue_trend`'s successful response uses the new contract. The other 4 tools ignore this setting — nothing to switch to yet. |
+| `v1` | `get_dmr_revenue_trend`, `get_dmr_revenue_snapshot`, `get_dmr_segment_mix`, and `get_dmr_fnb_performance`'s successful responses use the new contract. `get_dmr_holdings_outlook` ignores this setting — nothing built for it yet. |
 | anything else | Fails fast at call time (same posture as `AR_FABRIC_AUTH_MODE`) rather than silently falling back. |
 
-Error and empty (`no_data`) responses are unaffected either way — they stay on the Phase 2 `ToolError` envelope for every tool, migrated or not. **Not enabled on the deployed Function App** — this is a local/testing flag until the `ask-ariel` agent's own instructions are updated to understand the new shape.
+Error and empty (`no_data`) responses are unaffected either way — they stay on the Phase 2 `ToolError` envelope for every tool, migrated or not. **Not enabled on the deployed Function App** — this is a local/testing flag until the `ask-ariel` agent's own instructions are updated to understand the new shape. `webchat/presentation_validator.py` and the agent's own instructions are already report-agnostic — they check whatever `dataset.columns`/`presentationHints` a result actually has, so no webchat changes were needed to light this up for the 3 new reports.
 
 ## Resources (E5 — not AI-callable tools, not HTTP routes)
 

@@ -79,10 +79,26 @@ class ColumnDef(_CamelModel):
     # that's exactly the ~350x overcounting bug dax_query_builder.py already
     # documents. See analytics/columns.py.
     additivity: Optional[Literal["additive", "non_additive"]] = None
-    value_kind: Optional[Literal["period_value", "cumulative_snapshot", "variance"]] = Field(
+    # "rate" (Aug 2026 breakdown-report addition): a ratio/average measure
+    # (ADR, avg spend per cover) - never additive across rows, and not a
+    # cumulative snapshot either, so it needed its own kind rather than
+    # being mislabeled as one of the other two.
+    value_kind: Optional[Literal["period_value", "cumulative_snapshot", "variance", "rate"]] = Field(
         default=None, alias="valueKind"
     )
     period: Optional[Literal["day", "month_to_date", "year_to_date"]] = None
+    # True only for revenue_snapshot's measure columns (Aug 2026): one
+    # column ("current", "mtd", ...) holds a DIFFERENT unit depending on
+    # which Revenue_Type the row represents (a dollar figure for Food, a
+    # percentage for Occupancy %, a rate for ADR). additivity/valueKind/
+    # semanticType above are then a conservative common-case default, NOT
+    # the authoritative per-row answer - dmr.semantics.semantic_key_for_
+    # revenue_type(row's Revenue_Type, period) resolves the real one (see
+    # analytics/facts.py's revenue_snapshot filtering, which already does
+    # this per-row rather than trusting the column declaration). Added
+    # rather than silently flattening a genuinely row-varying property into
+    # one static value.
+    heterogeneous: bool = False
     default_aggregation: Optional[Literal["sum", "none"]] = Field(default=None, alias="defaultAggregation")
 
 
@@ -93,8 +109,16 @@ class Dataset(_CamelModel):
 
 class Fact(_CamelModel):
     id: str
-    kind: Optional[Literal["extreme", "comparison", "snapshot"]] = None
+    # "share" (Aug 2026 breakdown-report addition): a row's contribution as
+    # a fraction of the reconciled total - segment/F&B/revenue-snapshot
+    # facts, not something a day-based trend ever needed.
+    kind: Optional[Literal["extreme", "comparison", "snapshot", "share"]] = None
     metric: Optional[str] = None
+    # Which dimension value this fact is about (e.g. "Public Indirect",
+    # "Restaurant") - breakdown-report facts (Aug 2026) need this to say
+    # what they're describing; day-based trend facts don't (the day is
+    # already in `period`), so this stays optional and unused there.
+    subject: Optional[str] = None
     calculation: Optional[str] = None
     period: Optional[str] = None
     value: Optional[float] = None
@@ -105,7 +129,14 @@ class Fact(_CamelModel):
     # Set instead of a numeric `value` when a calculation is deliberately
     # not performed (e.g. a zero baseline) - never Infinity, never a
     # fabricated number. See analytics/facts.py.
-    reason: Optional[Literal["zero_baseline", "insufficient_data"]] = None
+    # "comparator_zero_base" (Aug 2026): every row's comparator (budget,
+    # last year, ...) is exactly 0 - the variance/mover fact would be
+    # mathematically correct (actual - 0 = actual) but presenting it as a
+    # meaningful business comparison would be misleading (it's really just
+    # restating the actual value). Deliberately NOT "comparator_missing" -
+    # zero could genuinely mean zero budget, not absent data; this flags the
+    # degenerate case neutrally without asserting why.
+    reason: Optional[Literal["zero_baseline", "insufficient_data", "comparator_zero_base"]] = None
 
 
 class PresentationHints(_CamelModel):
