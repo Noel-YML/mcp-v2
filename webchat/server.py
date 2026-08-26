@@ -211,6 +211,7 @@ ARIEL_MCP_FUNCTION_KEY = os.environ.get("ARIEL_MCP_FUNCTION_KEY")
 FUNCTION_TOOL_NAMES = frozenset(
     {
         "get_dmr_revenue_trend",
+        "get_dmr_revenue_snapshot",
         "get_dmr_segment_mix",
         "get_dmr_fnb_performance",
         "get_dmr_holdings_outlook",
@@ -358,12 +359,22 @@ def _check_rate_limit(session_id: str) -> bool:
 
 
 def _scope_instruction(hotel_name: str) -> str:
+    """A per-turn reminder, not the security boundary itself - hotel scope is
+    already enforced server-side by the signed token the MCP server
+    independently verifies (_mint_scope_token below); this only reduces the
+    chance the model's wording drifts toward another hotel. Sent as its own
+    role-tagged input item (see chat()) rather than appended to the user's
+    text behind a "---" divider - that shape (user text, divider, then a
+    parenthetical directive) is structurally identical to a prompt-injection
+    template and got flagged by Azure OpenAI's jailbreak content filter on a
+    literal "hello" - nothing in the text itself was the problem, its shape
+    relative to the user's message was.
+    """
     return (
-        "\n\n---\n"
-        f"(Scope: you are answering only for hotel '{hotel_name}'. Every DMR tool you "
+        f"Scope: you are answering only for hotel '{hotel_name}'. Every DMR tool you "
         "call is already scoped to it automatically - there is no hotel field for you "
         "to set, and nothing you say here changes that. Never answer about, compare "
-        "to, or reveal data for any other hotel.)"
+        "to, or reveal data for any other hotel."
     )
 
 
@@ -661,7 +672,10 @@ def chat():
 
     try:
         response = _client.responses.create(
-            input=message + _scope_instruction(hotel_name),
+            input=[
+                {"type": "message", "role": "developer", "content": _scope_instruction(hotel_name)},
+                {"type": "message", "role": "user", "content": message},
+            ],
             previous_response_id=convo.get("last_response_id"),
             extra_body={"agent_reference": AGENT_REFERENCE},
         )

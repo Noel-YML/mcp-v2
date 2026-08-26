@@ -2,7 +2,7 @@
 its verified `hotel_id` - never the other way around, and never trusting
 anything a caller supplies. Used only for the analytics contract's
 `scope.hotelDisplayName`/`context.currency` (Phase 3) - this has nothing to
-do with authorization, which is scope_token.py's job alone.
+do with authorization, which is scope/scope_token.py's job alone.
 
 Does its own small, direct `_Hotels` lookup through the SAME
 `IFabricQueryService` already passed into the calling tool - no separate

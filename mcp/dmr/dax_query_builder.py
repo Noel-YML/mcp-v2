@@ -28,7 +28,7 @@ matches scope before handing anything back - detects a relationship
 problem or a mis-filtered query; it does NOT prove a measure's aggregate
 value was computed only from the scoped hotel (a future measure using
 REMOVEFILTERS inside CALCULATE could still show the right Hotel_ID on a row
-whose number includes other hotels - see measure_guard.py for the check
+whose number includes other hotels - see dmr/measure_guard.py for the check
 that actually watches for that).
 
 Snapshot-style reports (segment mix, F&B, holdings) filter each table down
@@ -43,6 +43,32 @@ Holdings pins to its physical `AuditDate` column directly rather than going
 through `_Dates[Date]`, because that table's `_Dates` relationship runs
 through `SelDate` (the forward-looking stay date), not `AuditDate` - verified
 against the model's actual relationship graph, not assumed.
+
+Revenue is long/pivoted, not one-column-per-metric: each row is one
+`Revenue_Type` (e.g. Room Revenue, Total F&B Revenue, Total Revenue itself)
+within a `Revenue_Group` (ROOMS / F&B Revenue / Other & Misc. Rev. / Total
+Revenue), and the `Matrix: Value (...)` measures are plain `SUM()`s with no
+metric filter of their own - they only return the right number when
+`Revenue_Type` is in the query's row context (normally supplied by a matrix
+visual).
+
+`_build_revenue_trend_query` filters to `Revenue_Type = "Total Revenue"` -
+confirmed against a live rendered report (not guessed): the grand-total row
+is self-named, reconciles exactly to the Total Revenue KPI tile, and sits
+inside the "Total Revenue" `Revenue_Group` alongside other, unrelated
+per-guest/per-room metrics (Avg. Spend / Guest, Total Revenue POR) that a
+group-only filter would incorrectly sum in.
+
+`_build_revenue_snapshot_query` deliberately does NOT collapse to one type:
+it puts `Revenue_Group`/`Revenue_Type` in the row context, so every row's
+SUM is correct by construction, and the caller (agent/skill/facts layer)
+reads whichever group/type it needs directly off the returned label - no
+further filtering or guessing required, by design. `days` bounds it to the
+N most recent AuditDates (not N rows - each date carries ~21 canonical type
+rows, so bounding by row count would cut a day's breakdown in half); a
+tighter per-report day ceiling than the generic MAX_DAYS applies here, since
+each day is a multi-row group rather than a single value - see
+`_MAX_DAYS_OVERRIDE`.
 """
 
 from dataclasses import dataclass
@@ -54,12 +80,13 @@ from dmr.measures import (
     HOLDINGS_TABLE,
     MEASURE_DEFINITIONS,
     REVENUE_MEASURES,
+    REVENUE_SNAPSHOT_MEASURES,
     REVENUE_TABLE,
     SEGMENT_MEASURES,
     SEGMENT_TABLE,
 )
 from dmr.reports import Measure, Report
-from scope_context import ScopeContext
+from scope.scope_context import ScopeContext
 
 # Hard ceiling regardless of what a caller asks for - about a quarter of
 # daily rows. Applies to both TOPN-bounded reports (revenue trend, holdings
@@ -68,23 +95,36 @@ from scope_context import ScopeContext
 # caller-supplied count.
 MAX_DAYS = 92
 
+# The revenue snapshot's "days" is a day COUNT, but each day is ~21 canonical
+# Revenue_Type rows, not 1 - the generic MAX_DAYS ceiling would let a request
+# return ~1,900 rows. A report not listed here still falls back to the
+# generic MAX_DAYS via max_days_for().
+_MAX_DAYS_OVERRIDE = {
+    Report.REVENUE_SNAPSHOT: 31,
+}
+
 _DEFAULT_DAYS = {
     Report.REVENUE_TREND: 30,
+    Report.REVENUE_SNAPSHOT: 1,
     Report.HOLDINGS_OUTLOOK: 14,
 }
+
+
+def max_days_for(report: Report) -> int:
+    return _MAX_DAYS_OVERRIDE.get(report, MAX_DAYS)
 
 
 @dataclass(frozen=True)
 class QuerySpec:
     report: Report
-    days: int | None = None  # only meaningful for REVENUE_TREND / HOLDINGS_OUTLOOK
+    days: int | None = None  # only meaningful for REVENUE_TREND / REVENUE_SNAPSHOT / HOLDINGS_OUTLOOK
 
 
 def _clamp_days(days: int | None, report: Report) -> int:
     value = _DEFAULT_DAYS[report] if days is None else days
     if value < 1:
         raise ValueError(f"days must be >= 1, got {value}")
-    return min(value, MAX_DAYS)
+    return min(value, max_days_for(report))
 
 
 def _measure_columns(measures: list[Measure]) -> str:
@@ -102,6 +142,8 @@ def build(spec: QuerySpec, scope: ScopeContext) -> str:
 
     if spec.report is Report.REVENUE_TREND:
         return _build_revenue_trend_query(scope.hotel_id, _clamp_days(spec.days, spec.report))
+    if spec.report is Report.REVENUE_SNAPSHOT:
+        return _build_revenue_snapshot_query(scope.hotel_id, _clamp_days(spec.days, spec.report))
     if spec.report is Report.SEGMENT_MIX:
         return _build_segment_mix_query(scope.hotel_id)
     if spec.report is Report.FNB_PERFORMANCE:
@@ -112,6 +154,8 @@ def build(spec: QuerySpec, scope: ScopeContext) -> str:
 
 
 def _build_revenue_trend_query(hotel_id: int, days: int) -> str:
+    # Pinned to the confirmed grand-total line item - see module docstring
+    # for how this was verified against a live rendered report, not guessed.
     measure_columns = _measure_columns(REVENUE_MEASURES)
     return f"""
     EVALUATE
@@ -123,11 +167,57 @@ def _build_revenue_trend_query(hotel_id: int, days: int) -> str:
                 {measure_columns}
             ),
             _Hotels[Hotel_ID] = {int(hotel_id)},
-            {REVENUE_TABLE}[Hotel_ID] = {int(hotel_id)}
+            {REVENUE_TABLE}[Hotel_ID] = {int(hotel_id)},
+            {REVENUE_TABLE}[Revenue_Type] = "Total Revenue"
         ),
         _Dates[Date], 0
     )
     ORDER BY _Dates[Date] ASC
+    """
+
+
+# Canonical Revenue_Type rows are marked Revenue_Type_Sort 1-21; 99 marks
+# hotel-specific long-tail line items that vary in number per property. The
+# snapshot returns canonical rows only - see the E4 decision on this.
+_REVENUE_SNAPSHOT_MAX_TYPE_SORT = 21
+
+
+def _build_revenue_snapshot_query(hotel_id: int, days: int) -> str:
+    """One row per (date, Revenue_Group, Revenue_Type) for the `days` most
+    recent AuditDates. Bounded by DISTINCT DATE COUNT, not row count - each
+    date carries ~21 canonical type rows, so a plain TOPN on the final
+    row-level table would cut a boundary day's breakdown in half instead of
+    including or excluding it whole. `days=1` (the default) reproduces the
+    original single-latest-day snapshot exactly, since the boundary date and
+    the latest date are then the same value.
+    """
+    measure_columns = _measure_columns(REVENUE_SNAPSHOT_MEASURES)
+    return f"""
+    DEFINE
+        VAR __CandidateDates = CALCULATETABLE(
+            VALUES({REVENUE_TABLE}[AuditDate]),
+            _Hotels[Hotel_ID] = {int(hotel_id)},
+            {REVENUE_TABLE}[Hotel_ID] = {int(hotel_id)}
+        )
+        VAR __TopDates = TOPN({int(days)}, __CandidateDates, {REVENUE_TABLE}[AuditDate], 0)
+        VAR __BoundaryDate = MINX(__TopDates, {REVENUE_TABLE}[AuditDate])
+    EVALUATE
+    CALCULATETABLE(
+        SUMMARIZECOLUMNS(
+            _Dates[Date],
+            {REVENUE_TABLE}[Revenue_Group],
+            {REVENUE_TABLE}[Revenue_Group_Sort],
+            {REVENUE_TABLE}[Revenue_Type],
+            {REVENUE_TABLE}[Revenue_Type_Sort],
+            {REVENUE_TABLE}[Hotel_ID],
+            {measure_columns}
+        ),
+        _Hotels[Hotel_ID] = {int(hotel_id)},
+        {REVENUE_TABLE}[Hotel_ID] = {int(hotel_id)},
+        {REVENUE_TABLE}[Revenue_Type_Sort] <= {_REVENUE_SNAPSHOT_MAX_TYPE_SORT},
+        _Dates[Date] >= __BoundaryDate
+    )
+    ORDER BY _Dates[Date] ASC, {REVENUE_TABLE}[Revenue_Group_Sort], {REVENUE_TABLE}[Revenue_Type_Sort]
     """
 
 

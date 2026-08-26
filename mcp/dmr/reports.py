@@ -12,6 +12,7 @@ from enum import Enum
 
 class Report(Enum):
     REVENUE_TREND = "revenue_trend"
+    REVENUE_SNAPSHOT = "revenue_snapshot"
     SEGMENT_MIX = "segment_mix"
     FNB_PERFORMANCE = "fnb_performance"
     HOLDINGS_OUTLOOK = "holdings_outlook"
@@ -22,13 +23,23 @@ class Granularity(Enum):
 
 
 class Measure(Enum):
-    # Revenue trend - 'derived mart_dmr_revenue_matrix'
+    # Revenue - 'derived mart_dmr_revenue_matrix' (trend + full snapshot)
     REVENUE_CURRENT = "revenue_current"
+    REVENUE_LAST_YEAR = "revenue_last_year"
     REVENUE_MTD = "revenue_mtd"
-    REVENUE_YTD = "revenue_ytd"
+    REVENUE_LY_MTD = "revenue_ly_mtd"
+    REVENUE_VS_LY_MTD = "revenue_vs_ly_mtd"
     REVENUE_BUDGET_MTD = "revenue_budget_mtd"
     REVENUE_VS_BUDGET_MTD = "revenue_vs_budget_mtd"
+    REVENUE_YTD = "revenue_ytd"
+    REVENUE_LY_YTD = "revenue_ly_ytd"
+    REVENUE_VS_LY_YTD = "revenue_vs_ly_ytd"
+    REVENUE_BUDGET_YTD = "revenue_budget_ytd"
+    REVENUE_VS_BUDGET_YTD = "revenue_vs_budget_ytd"
     REVENUE_FORECAST_MTD = "revenue_forecast_mtd"
+    REVENUE_VS_FORECAST_MTD = "revenue_vs_forecast_mtd"
+    REVENUE_FORECAST_YTD = "revenue_forecast_ytd"
+    REVENUE_VS_FORECAST_YTD = "revenue_vs_forecast_ytd"
 
     # Segment mix - 'derived mart_dmr_segment_matrix'
     SEGMENT_REVENUE_MTD = "segment_revenue_mtd"

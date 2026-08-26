@@ -14,7 +14,7 @@ import pytest
 from analytics.actions import ACTION_REGISTRY
 from dmr.hotel_lookup import HotelMetadata
 from fabric_client.result import FabricQueryResult
-from scope_context import ScopeContext
+from scope.scope_context import ScopeContext
 from tools import dmr_tools
 
 HOTEL_ID = 1

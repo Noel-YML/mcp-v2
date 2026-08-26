@@ -91,6 +91,32 @@ V10_TOOLS = [
     },
 ]
 
+# E4 addition (Aug 2026): the new revenue snapshot tool - full group/type
+# breakdown, not just the Total Revenue trend line. Everything else here is
+# still verbatim from v10/v11 - only this one tool is new.
+CURRENT_TOOLS = V10_TOOLS + [
+    {
+        "type": "function",
+        "name": "get_dmr_revenue_snapshot",
+        "description": (
+            "Gets your hotel's full revenue breakdown - every revenue group (Rooms, F&B, Other & Misc, "
+            "Total Revenue) and every line item within each group, each with actual, MTD, YTD, budget, "
+            "last-year, and forecast figures plus their variances. Use this for \"how's revenue doing\" "
+            "style questions, including ones about one specific group/line item - the full breakdown is "
+            "already in the result, nothing further to query. Defaults to the most recent audit date only; "
+            "ask for more days to get the same breakdown across a window."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "How many days to return. Defaults to 1 if omitted.", "minimum": 1, "maximum": 31}
+            },
+            "required": [],
+        },
+        "strict": False,
+    },
+]
+
 
 def build_instructions() -> str:
     action_lines = "\n".join(f'   - {action_id}' for action_id in ACTIONS)
@@ -115,13 +141,18 @@ Respond with a single JSON object matching your configured response schema: {{"m
 
 
 def main():
+    # Default stays draft=True - a permanent, sequentially-numbered version
+    # is immutable once created, so promoting off draft is an explicit,
+    # opt-in choice (--publish), not this script's default behavior.
+    publish = "--publish" in sys.argv[1:]
+
     project = AIProjectClient(endpoint=PROJECT_ENDPOINT, credential=DefaultAzureCredential())
 
     definition = PromptAgentDefinition(
         model="gpt-5",
         reasoning=Reasoning(effort="low"),
         instructions=build_instructions(),
-        tools=[Tool(t) for t in V10_TOOLS],
+        tools=[Tool(t) for t in CURRENT_TOOLS],
         text=PromptAgentDefinitionTextOptions(
             format=TextResponseFormatJsonSchema(
                 name="ariel_agent_response",
@@ -135,10 +166,13 @@ def main():
     version = project.agents.create_version(
         AGENT_NAME,
         definition=definition,
-        description="Phase 4: schema-constrained AgentResponse (message/presentation/insights/actions), validated against the real tool result in webchat before rendering. Tools unchanged from v10.",
-        draft=True,
+        description="Phase 4 + E4 revenue snapshot: schema-constrained AgentResponse (message/presentation/insights/actions), validated against the real tool result in webchat before rendering. Adds get_dmr_revenue_snapshot; other 4 tools unchanged from v10.",
+        draft=not publish,
     )
-    print(f"Created draft version: {version.version}")
+    label = "version" if publish else "draft version"
+    print(f"Created {label}: {version.version}")
+    if publish:
+        print('Set ARIEL_AGENT_VERSION to this number to use it - webchat\'s own default is untouched.')
 
 
 if __name__ == "__main__":

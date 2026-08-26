@@ -19,14 +19,14 @@ what changed to fix it. The earlier customer-facing product-automation tools
 and Agent Skills have been removed - this build is DMR-only.
 
 None of the 4 DMR tools take a `hotel_name` OR a `scope_token` argument -
-see tools/dmr_tools.py and scope_token.py for the full design. Scope arrives
+see tools/dmr_tools.py and scope/scope_token.py for the full design. Scope arrives
 as the `X-Ariel-Scope` HTTP header, which webchat (the broker - see
 webchat/server.py) attaches on its server-to-server call to this MCP server;
 the model calling webchat's Foundry agent never sees a scope field of any
 kind, on any tool.
 
 CORRECTION (2026-08-21): an earlier version of this file, and of
-scope_token.py, claimed the native Azure Functions MCP trigger's `context`
+scope/scope_token.py, claimed the native Azure Functions MCP trigger's `context`
 payload "only ever carries arguments... no way to read the incoming
 request's headers." That was true before the MCP extension's 1.0.0 GA
 (Oct 2025) and is false now - the trigger payload also carries
@@ -65,6 +65,7 @@ import json
 
 import azure.functions as func
 
+import config
 import health
 from config import FabricOptions
 from fabric_client.service import FabricQueryService
@@ -126,9 +127,36 @@ _HOLDINGS_DAYS_PROPERTY = {
     "isRequired": False,
 }
 
+_REVENUE_SNAPSHOT_DAYS_PROPERTY = {
+    "propertyName": "days",
+    "propertyType": "integer",
+    "description": "How many of the most recent audit days to return. Defaults to 1.",
+    "isRequired": False,
+}
+
 _REVENUE_TREND_TOOL_PROPERTIES = json.dumps([_DAYS_PROPERTY])
 _NO_TOOL_PROPERTIES = json.dumps([])
 _HOLDINGS_TOOL_PROPERTIES = json.dumps([_HOLDINGS_DAYS_PROPERTY])
+_REVENUE_SNAPSHOT_TOOL_PROPERTIES = json.dumps([_REVENUE_SNAPSHOT_DAYS_PROPERTY])
+
+
+# ---------------------------------------------------------------------------
+# Resources (E5) - readable via the MCP protocol itself (resources/list,
+# resources/read), unlike the HTTP-only health endpoints below. Static: one
+# fixed uri, no per-read arguments - mcp_resource_trigger's own docs say the
+# uri must be absolute, with no sign of URI templating for anything dynamic,
+# so this stays intentionally simple.
+# ---------------------------------------------------------------------------
+@app.mcp_resource_trigger(
+    arg_name="context",
+    uri="ariel://status",
+    resource_name="status",
+    title="Ariel MCP server status",
+    description="Readiness, active analytics schema version, and registered DMR tools - no secrets or infra details (see health.status_resource).",
+    mime_type="application/json",
+)
+def status_resource(context) -> str:
+    return json.dumps(health.status_resource(_readiness, config.analytics_schema_version(), dmr_tools.TOOL_NAMES))
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +210,28 @@ def get_dmr_revenue_trend(context) -> str:
     if error:
         return error
     return dmr_tools.get_dmr_revenue_trend(fabric_service, scope, payload.get("arguments", {}).get("days"))
+
+
+@app.mcp_tool_trigger(
+    arg_name="context",
+    tool_name="get_dmr_revenue_snapshot",
+    description=(
+        "Gets your hotel's full revenue breakdown - every revenue group "
+        "(Rooms, F&B, Other & Misc, Total Revenue) and every line item within "
+        "each group, each with actual, MTD, YTD, budget, last-year, and "
+        "forecast figures plus their variances. Use this for \"how's revenue "
+        "doing\" style questions, including ones about one specific "
+        "group/line item. Defaults to the most recent audit date only; ask "
+        "for more days to get the same breakdown across a window."
+    ),
+    tool_properties=_REVENUE_SNAPSHOT_TOOL_PROPERTIES,
+)
+def get_dmr_revenue_snapshot(context) -> str:
+    payload = json.loads(context)
+    scope, error = _resolve_scope(payload, "get_dmr_revenue_snapshot")
+    if error:
+        return error
+    return dmr_tools.get_dmr_revenue_snapshot(fabric_service, scope, payload.get("arguments", {}).get("days"))
 
 
 @app.mcp_tool_trigger(

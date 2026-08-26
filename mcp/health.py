@@ -79,3 +79,21 @@ class DeepCheckResult:
 def deep_check(fabric_service: FabricQueryService) -> DeepCheckResult:
     result = fabric_service.run_query(_DEEP_CHECK_QUERY)
     return DeepCheckResult(ok=result.error is None)
+
+
+def status_resource(readiness: Readiness, analytics_schema_version: str, tool_names: tuple[str, ...]) -> dict:
+    """Content for the `ariel://status` MCP resource (E5) - an MCP-protocol-
+    native counterpart to /health/ready, readable by any MCP client without
+    a separate HTTP call or function key. Same minimalism policy as the rest
+    of this module: readiness reuses the existing cached check (no extra
+    Fabric round-trip per read), and nothing here is a secret, an
+    environment-variable value, or a package/runtime version - just the
+    protocol-level facts (is it ready, which analytics contract is active,
+    which tools exist) a client would actually want to introspect.
+    """
+    return {
+        "server": "ariel-mcp-v2",
+        "status": "ready" if readiness.check() else "not_ready",
+        "analyticsSchemaVersion": analytics_schema_version,
+        "tools": list(tool_names),
+    }

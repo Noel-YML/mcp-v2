@@ -6,7 +6,7 @@ source credential was switched from single sign-on to a fixed account).
 
 None of the 4 tools take a `hotel_name` argument, or any scope field at
 all - there is nothing in their schema for a model to see or set to
-another hotel. Scope instead comes from a signed JWT (`scope_token.py`)
+another hotel. Scope instead comes from a signed JWT (`scope/scope_token.py`)
 minted by webchat, carried as the `X-Ariel-Scope` HTTP header on webchat's
 server-to-server call to whichever MCP hosting is live:
 
@@ -57,7 +57,7 @@ are unaffected either way - they stay on the Phase 2 ToolError envelope.
 
 `_verify_rows` is the response-boundary check - it does NOT prove a
 measure's aggregate value was computed only from the scoped hotel; see
-measure_guard.py for the (currently blocked - see that file) check that
+dmr/measure_guard.py for the (currently blocked - see that file) check that
 watches for that specifically. It also no longer echoes the OTHER hotel's
 id into the client-facing message on a mismatch - that's still captured in
 full in the internal log/audit event, just not handed to the caller.
@@ -77,24 +77,36 @@ from mcp.server.mcpserver import Context
 
 import audit
 import config
-import scope_token
+from scope import scope_token
 from analytics import revenue_trend as analytics_revenue_trend
 from dmr import dax_query_builder, hotel_lookup
-from dmr.dax_query_builder import MAX_DAYS, QuerySpec
+from dmr.dax_query_builder import QuerySpec
 from dmr.reports import Report
 from fabric_client.result import ErrorCode, ToolError, new_trace_id
 from fabric_client.service import IFabricQueryService
-from scope_context import ScopeContext
+from scope.scope_context import ScopeContext
 
 logger = logging.getLogger("ariel-mcp-server")
 
 REQUIRED_PERMISSION = "dmr:read"
+
+# The single source of truth for "what tools does this server register" -
+# health.status_resource() (E5) reads this rather than keeping its own
+# hand-maintained copy that could drift from what's actually wired up below.
+TOOL_NAMES = (
+    "get_dmr_revenue_trend",
+    "get_dmr_revenue_snapshot",
+    "get_dmr_segment_mix",
+    "get_dmr_fnb_performance",
+    "get_dmr_holdings_outlook",
+)
 
 _AUTHORIZATION_FAILED_MESSAGE = "The report request could not be authorized."
 _MISCONFIGURED_MESSAGE = "Server misconfiguration."
 
 _DAYS_DEFAULTS = {
     Report.REVENUE_TREND: 30,
+    Report.REVENUE_SNAPSHOT: 1,
     Report.HOLDINGS_OUTLOOK: 14,
 }
 
@@ -103,11 +115,13 @@ _DAYS_DEFAULTS = {
 # not listed here don't currently project a date column at all.
 _DATE_FIELD_BY_REPORT = {
     Report.REVENUE_TREND: "Date",
+    Report.REVENUE_SNAPSHOT: "Date",
     Report.HOLDINGS_OUTLOOK: "SelDate",
 }
 
 _EMPTY_MESSAGES = {
     Report.REVENUE_TREND: "No revenue history found for hotel_id={hotel_id}.",
+    Report.REVENUE_SNAPSHOT: "No revenue data found for hotel_id={hotel_id}.",
     Report.SEGMENT_MIX: "No segment data found for hotel_id={hotel_id}.",
     Report.FNB_PERFORMANCE: "No F&B data found for hotel_id={hotel_id}.",
     Report.HOLDINGS_OUTLOOK: "No holdings/occupancy outlook found for hotel_id={hotel_id}.",
@@ -218,18 +232,22 @@ def _verify_rows(rows: list[dict], scope: ScopeContext, tool: str, trace_id: str
 
 def _validate_days(report: Report, days: int | None) -> int:
     """Rejects - never silently clamps - an out-of-range `days`. A silent
-    clamp from, say, 500 to MAX_DAYS would make a partial answer look like
-    a complete one. `dax_query_builder._clamp_days` still exists as an
-    internal belt-and-suspenders ceiling, but a value should never reach it
-    out of range in normal operation now that this rejects first.
+    clamp from, say, 500 down to the report's ceiling would make a partial
+    answer look like a complete one. `dax_query_builder._clamp_days` still
+    exists as an internal belt-and-suspenders ceiling, but a value should
+    never reach it out of range in normal operation now that this rejects
+    first. The ceiling itself is per-report (`max_days_for`) - revenue
+    snapshot's is much lower than revenue trend's, since each of its "days"
+    is a ~21-row group, not one value.
     """
     value = _DAYS_DEFAULTS[report] if days is None else days
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("days must be a whole number.")
     if value < 1:
         raise ValueError("days must be at least 1.")
-    if value > MAX_DAYS:
-        raise ValueError(f"days cannot exceed {MAX_DAYS}.")
+    ceiling = dax_query_builder.max_days_for(report)
+    if value > ceiling:
+        raise ValueError(f"days cannot exceed {ceiling}.")
     return value
 
 
@@ -332,6 +350,10 @@ def get_dmr_revenue_trend(service: IFabricQueryService, scope: ScopeContext, day
     return _execute_report(service, scope, "get_dmr_revenue_trend", Report.REVENUE_TREND, days)
 
 
+def get_dmr_revenue_snapshot(service: IFabricQueryService, scope: ScopeContext, days: int | None = None) -> str:
+    return _execute_report(service, scope, "get_dmr_revenue_snapshot", Report.REVENUE_SNAPSHOT, days)
+
+
 def get_dmr_segment_mix(service: IFabricQueryService, scope: ScopeContext) -> str:
     return _execute_report(service, scope, "get_dmr_segment_mix", Report.SEGMENT_MIX, None)
 
@@ -359,6 +381,28 @@ def register(mcp, service: IFabricQueryService, public_keys: dict[str, str]) -> 
         except _ScopeResolutionError as exc:
             return exc.tool_error.to_json()
         return get_dmr_revenue_trend(service, scope, days)
+
+    @mcp.tool(name="get_dmr_revenue_snapshot")
+    def _get_dmr_revenue_snapshot(ctx: Context, days: int | None = None) -> str:
+        """Gets your hotel's full revenue breakdown - every revenue group
+        (Rooms, F&B, Other & Misc, Total Revenue) and every line item within
+        each group, each with actual, MTD, YTD, budget, last-year, and
+        forecast figures plus their variances. Use this for "how's revenue
+        doing" style questions, including ones about one specific
+        group/line item - the full breakdown is already in the result,
+        nothing further to query. Defaults to the most recent audit date
+        only; ask for more days to get the same breakdown across a window
+        (e.g. day-by-day Room Revenue for the last week). Always scoped to
+        the hotel of the current session.
+
+        Args:
+            days: How many of the most recent audit days to return. Defaults to 1.
+        """
+        try:
+            scope = _resolve_scope_from_ctx(ctx, public_keys, "get_dmr_revenue_snapshot")
+        except _ScopeResolutionError as exc:
+            return exc.tool_error.to_json()
+        return get_dmr_revenue_snapshot(service, scope, days)
 
     @mcp.tool(name="get_dmr_segment_mix")
     def _get_dmr_segment_mix(ctx: Context) -> str:

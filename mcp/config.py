@@ -108,7 +108,7 @@ class FabricOptions:
             dataset_id=os.environ.get("DMR_FABRIC_DATASET_ID", "93006692-872c-496f-96de-9a6edf926739"),
             # Public half of webchat's signing key(s) - verifies the signed
             # X-Ariel-Scope header/JWT on every DMR tool call. See
-            # scope_token.py. Optional here (unlike the auth-mode settings
+            # scope/scope_token.py. Optional here (unlike the auth-mode settings
             # above): the server should still start without it, and only
             # fail (closed) when a DMR tool is actually called - there is no
             # equivalent "silently do the wrong thing" risk for a missing

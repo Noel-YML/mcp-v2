@@ -26,6 +26,7 @@ from tools import dmr_tools
 
 _EXPECTED_DMR_TOOLS = {
     "get_dmr_revenue_trend",
+    "get_dmr_revenue_snapshot",
     "get_dmr_segment_mix",
     "get_dmr_fnb_performance",
     "get_dmr_holdings_outlook",

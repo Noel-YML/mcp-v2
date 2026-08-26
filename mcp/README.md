@@ -22,7 +22,7 @@ Holdings has its own wrinkle: its `_Dates` relationship runs through `SelDate` (
 
 ## Hotel scope: no scope field of any kind, by design
 
-The 4 DMR tools don't take a `hotel_name`, `hotel_id`, or `scope_token` parameter — there's nothing in their schema for a calling model to see or set. On Foundry's side the DMR tools are plain OpenAI-style **function tools** (`get_dmr_revenue_trend(days=7)`) that webchat executes itself, not an MCP tool exposed straight to the model — see `webchat/server.py`'s module docstring for that design and why. Scope arrives at this MCP server as a signed **JWT** (`scope_token.py`) carried in the `X-Ariel-Scope` HTTP header on webchat's server-to-server call, verified against `ARIEL_SCOPE_PUBLIC_KEYS` (`tools/dmr_tools.py`'s `resolve_scope_from_token`). Missing, wrongly signed, expired, or lacking the required `dmr:read` permission → the tool rejects with a clear error, never falls back to an unscoped/org-wide query.
+The 5 DMR tools don't take a `hotel_name`, `hotel_id`, or `scope_token` parameter — there's nothing in their schema for a calling model to see or set. On Foundry's side the DMR tools are plain OpenAI-style **function tools** (`get_dmr_revenue_trend(days=7)`) that webchat executes itself, not an MCP tool exposed straight to the model — see `webchat/server.py`'s module docstring for that design and why. Scope arrives at this MCP server as a signed **JWT** (`scope/scope_token.py`) carried in the `X-Ariel-Scope` HTTP header on webchat's server-to-server call, verified against `ARIEL_SCOPE_PUBLIC_KEYS` (`tools/dmr_tools.py`'s `resolve_scope_from_token`). Missing, wrongly signed, expired, or lacking the required `dmr:read` permission → the tool rejects with a clear error, never falls back to an unscoped/org-wide query.
 
 Signing is **asymmetric** (RS256): webchat holds the private key and mints; this server holds only the public half and verifies — it can never mint a valid token itself.
 
@@ -31,6 +31,16 @@ Scope keys on the integer **`Hotel_ID`**, not the free-text `Hotel_Name` — ver
 Both hostings can carry the header — confirmed locally against the real extension (Phase 1A of this hardening pass): the Azure Functions native trigger's `transport.properties.headers` carries every incoming HTTP header on the `http-streamable` transport, contrary to an earlier (incorrect) belief written into an older version of this file.
 
 webchat/server.py is the (only, today) minter of these tokens: it resolves a hotel code to a `Hotel_ID` at login, then mints a fresh one per tool call — see that file's module docstring for the full chain.
+
+## How this folder fits into the bigger picture
+
+**Everything in this folder is `mcp/` — the data engine.** It has no UI, no chart-rendering, no chat loop, and no idea an AI model exists. Its entire job is: verify a scope token, run one allowlisted DAX query, verify the rows that come back, return JSON (or, for `ariel://status`, a small status document). That's it.
+
+- **The chat, the AI agent, and the chart all live in `webchat/`** — a separate deployable, in the sibling `webchat/` folder, not part of this one. `webchat/static/presentation.js` + a vendored copy of ECharts turn a *validated* result into an actual chart; `mcp/` never renders anything and has no chart-related code anywhere in it.
+- **The only connection point is the tool call itself.** webchat calls one of this folder's tools (over MCP/Streamable HTTP locally, or Azure Functions' native MCP trigger once deployed), gets back JSON, and *webchat's own code* decides what — if anything — gets drawn from it. This folder has no idea whether a chart, a table, or nothing at all happens with what it returns.
+- **Security is enforced entirely on this side of that boundary.** webchat mints a signed token; this folder verifies it, independently, before running anything — see "Hotel scope" above for the full chain. The one exception is `ariel://status` (see "Resources" below), which needs no scope at all, since it returns no hotel data.
+
+If you're trying to figure out where something lives — "is this an `mcp/` problem or a `webchat/` problem" — the rule of thumb: if it's about *what data comes back* or *whether it's safe to return it*, it's here. If it's about *how that data looks on screen*, it's `webchat/`.
 
 ## Structure
 
@@ -41,20 +51,29 @@ mcp/
 ├── host.json                      <- Azure Functions host config (extensions.mcp)
 ├── local.settings.json            <- Azure Functions local dev settings (placeholders, not committed secrets)
 ├── config.py                      <- FabricOptions - auth mode + service principal/managed identity + DMR workspace/dataset IDs + scope public keys from env vars
-├── scope_token.py                 <- signs/verifies the JWT that carries hotel scope from webchat to these tools
-├── scope_context.py               <- frozen ScopeContext - hotel_id/session_id/permissions/expires_at, built only after verification
-├── measure_guard.py                <- scan for filter-removing DAX in measures (see caveat in that file - currently blocked on data access)
 ├── audit.py                       <- one telemetry event per tool call (mcp/audit.py) - not an AI-callable tool
 ├── health.py                      <- liveness/readiness/deep-check logic shared by both hostings
+├── scope/
+│   ├── scope_token.py              <- signs/verifies the JWT that carries hotel scope from webchat to these tools
+│   └── scope_context.py            <- frozen ScopeContext - hotel_id/session_id/permissions/expires_at, built only after verification
 ├── fabric_client/
 │   ├── result.py                  <- FabricQueryResult (rows, or a structured ToolError - never both) + ErrorCode
 │   └── service.py                 <- IFabricQueryService contract + FabricQueryService (pooled, retried, capped DAX calls)
 ├── dmr/
 │   ├── reports.py                 <- Report/Measure/Granularity enums - the only values a query can ever reference
 │   ├── measures.py                <- curated DAX measure names (the "Matrix v2" family) + table references, keyed by enum
-│   └── dax_query_builder.py       <- build(spec, scope) - the only entry point; requires a verified ScopeContext
+│   ├── dax_query_builder.py       <- build(spec, scope) - the only entry point; requires a verified ScopeContext
+│   └── measure_guard.py           <- scan for filter-removing DAX in measures (see caveat in that file - currently blocked on data access)
 ├── tools/
-│   └── dmr_tools.py                <- the 4 DMR tools (no scope arg), one shared _execute_report path, result-row verification
+│   └── dmr_tools.py                <- the 5 DMR tools (no scope arg), one shared _execute_report path, result-row verification, TOOL_NAMES
+├── analytics/                      <- the versioned "rich answer" contract - get_dmr_revenue_trend only so far (see below)
+│   ├── contract.py                 <- AnalyticsResult pydantic models (the versioned response shape)
+│   ├── columns.py                  <- per-column semantics: additive vs non-additive, currency, etc.
+│   ├── facts.py                    <- deterministic best/worst day, period-over-period change, budget variance
+│   ├── actions.py                  <- which follow-up actions this report can genuinely execute
+│   └── revenue_trend.py            <- assembles the above into one AnalyticsResult for get_dmr_revenue_trend
+├── scripts/
+│   └── smoke_test_revenue.py      <- manual real-Fabric smoke test for the revenue tools, bypassing JWT/MCP transport
 └── tests/                         <- pytest suite (dev-only - see requirements-dev.txt, excluded from the Functions package via .funcignore)
 ```
 
@@ -68,22 +87,40 @@ the DAX/error-handling logic exists exactly once, not once per hosting mode.
 interface: tools are registered with whatever implements `run_query`, so
 they can be tested against a hand-written fake instead of live Fabric.
 
+## Where do I go to...
+
+| Task | Files |
+|---|---|
+| **Change what an existing tool returns, or its `days` limits** | `tools/dmr_tools.py` (the tool function + `_execute_report`/`_validate_days`) and `dmr/dax_query_builder.py` (the actual query) |
+| **Add a brand-new tool** | 1) `dmr/reports.py` - add a `Report` enum value, and `Measure` values for any new metrics. 2) `dmr/measures.py` - map each new `Measure` to its real DAX expression (verified against the live model, never guessed). 3) `dmr/dax_query_builder.py` - add a `_build_..._query()` function and wire it into `build()`. 4) `tools/dmr_tools.py` - add the module-level function, an `_EMPTY_MESSAGES` entry, and register it in both `register()` (for `server.py`) and as an `@app.mcp_tool_trigger` (in `function_app.py`). 5) Add it to `TOOL_NAMES` in `tools/dmr_tools.py`. |
+| **Add a new table/measures to an existing tool** | `dmr/measures.py` (the table constant + measure DAX mappings) and `dmr/reports.py` (the `Measure` enum values) - never invent a measure name; it has to be confirmed against the real model first |
+| **Change hotel-scope/security logic (the JWT itself)** | `scope/scope_token.py` (mint/verify) and `scope/scope_context.py` (the verified, frozen record) |
+| **Change how a tool's error/empty/success response is shaped** | `fabric_client/result.py` (`ErrorCode`, `ToolError`, `FabricQueryResult`) |
+| **Change Fabric connection behavior** (retries, timeouts, response-size caps) | `fabric_client/service.py` |
+| **Add the "rich answer" treatment (charts hints, facts, semantic columns) to a new tool** | `analytics/` - add a sibling to `revenue_trend.py`, plus columns/facts for that report; wire it into `tools/dmr_tools.py`'s `_execute_report` the same way `get_dmr_revenue_trend` is wired today |
+| **Change health/status checks, or the `ariel://status` resource** | `health.py` (shared logic), then `server.py`'s `@mcp.resource` or `function_app.py`'s `@app.mcp_resource_trigger` |
+| **Change deployment/runtime config** (env vars, auth mode) | `config.py`, and `host.json`/`local.settings.json` for local dev |
+| **Add tests for any of the above** | `tests/` - flat folder, one file per source module regardless of that module's own folder (e.g. `tests/test_dax_query_builder.py` tests `dmr/dax_query_builder.py`) |
+
 ## Tools
 
-All 4 are always scoped to whatever `Hotel_ID` the caller's JWT resolves to (see above) — none take a scope argument. `days` (where applicable) is validated and **rejected** (never silently clamped) if it's out of range — see `tools/dmr_tools.py`'s `_validate_days`, called from both hostings via the shared `_execute_report` path.
+All 5 are always scoped to whatever `Hotel_ID` the caller's JWT resolves to (see above) — none take a scope argument. `days` (where applicable) is validated and **rejected** (never silently clamped) if it's out of range — see `tools/dmr_tools.py`'s `_validate_days`, called from both hostings via the shared `_execute_report` path. Each report also has its own ceiling (`dax_query_builder.max_days_for`) — revenue snapshot's is much lower than trend's, since each of its "days" is a ~21-row group, not a single value.
 
 | Tool | Measures used | Returns |
 |---|---|---|
-| `get_dmr_revenue_trend` | `Matrix: Value (*)` | Day-by-day Total Revenue: actual, MTD, YTD, budget, forecast. |
+| `get_dmr_revenue_trend` | `Matrix: Value (*)`, pinned to the `Revenue_Type = "Total Revenue"` row | Day-by-day Total Revenue: actual, MTD, YTD, budget, forecast, and their variances. |
+| `get_dmr_revenue_snapshot` | `Matrix: Value (*)`, all 16 | Full revenue breakdown for the `days` most recent audit dates — every `Revenue_Group`/`Revenue_Type` line item (Rooms, F&B, Other & Misc, Total Revenue), not collapsed to one number. Defaults to the latest day only. |
 | `get_dmr_segment_mix` | `Segment: * (MTD)` | Current market-segment revenue mix (Corporate, Leisure, Crew, ...) vs. budget/last-year/forecast. |
 | `get_dmr_fnb_performance` | `FNB: * (MTD)` | Current F&B outlet performance: revenue, covers, average spend vs. budget/last-year/forecast. |
 | `get_dmr_holdings_outlook` | `Holdings: * (Current)` | Forward occupancy/holdings pace for upcoming stay dates. |
 
-`get_dmr_daily_snapshot` and `get_dmr_budget_performance` — named in `chatbot/backend.py`'s scoped-tools list as tools that should eventually exist — are deliberately not built yet. They aren't separate measure families; they'd be query variants over the same revenue measures (a single-day slice, and the `Budget MTD`/`Vs Budget MTD` measures respectively). Add them the same way as the 4 above when needed.
+`get_dmr_revenue_trend` and `get_dmr_revenue_snapshot` are deliberately two different shapes over the *same* mart table, not one tool with a mode flag: trend wants one comparable value per day (a line chart), snapshot wants the full breakdown for a point in time (a table/KPI view). See `dmr/dax_query_builder.py`'s module docstring for why trend blindly summing every `Revenue_Type` together was a real, since-fixed bug — the snapshot's grouped-by-type shape doesn't have that failure mode by construction.
+
+`get_dmr_budget_performance` — a variant slicing the same revenue measures by budget only — isn't built yet; would follow the same pattern as the two above when needed.
 
 Once a tool resolves its `Hotel_ID` (from the JWT, never a free-text argument), it filters via **both** `_Hotels[Hotel_ID]` and the mart table's own `Hotel_ID` column directly — DAX relationship propagation is not relied on alone. There is no generic `run_dax_query(query: str)` tool, and `dax_query_builder.build()` cannot be called without a verified `ScopeContext`.
 
-**Known open gap:** `measure_guard.py` is meant to catch a future measure using `ALL`/`ALLEXCEPT`/`ALLSELECTED`/`REMOVEFILTERS` (which could compute an aggregate across hotels while still showing the right `Hotel_ID` on the row). Getting real DAX expression text out of `INFO.VIEW.MEASURES()` via the `executeQueries` REST API doesn't work for this model — `[Expression]` comes back blank for every measure tested, not just the DMR ones. Treat that specific risk as **unverified**, not confirmed clean, until someone wires this guard up to real expression text (likely needs XMLA/TOM-level access).
+**Known open gap:** `dmr/measure_guard.py` is meant to catch a future measure using `ALL`/`ALLEXCEPT`/`ALLSELECTED`/`REMOVEFILTERS` (which could compute an aggregate across hotels while still showing the right `Hotel_ID` on the row). Getting real DAX expression text out of `INFO.VIEW.MEASURES()` via the `executeQueries` REST API doesn't work for this model — `[Expression]` comes back blank for every measure tested, not just the DMR ones. Treat that specific risk as **unverified**, not confirmed clean, until someone wires this guard up to real expression text (likely needs XMLA/TOM-level access).
 
 ## The analytics contract (Phase 3, `get_dmr_revenue_trend` only so far)
 
@@ -94,10 +131,18 @@ Controlled by `ARIEL_ANALYTICS_SCHEMA_VERSION`:
 | Value | Behavior |
 |---|---|
 | unset / `legacy` (default) | Every tool's response is exactly what Phase 2 shipped — the bare array, unchanged. |
-| `v1` | `get_dmr_revenue_trend`'s successful response uses the new contract. The other 3 tools ignore this setting — nothing to switch to yet. |
+| `v1` | `get_dmr_revenue_trend`'s successful response uses the new contract. The other 4 tools ignore this setting — nothing to switch to yet. |
 | anything else | Fails fast at call time (same posture as `AR_FABRIC_AUTH_MODE`) rather than silently falling back. |
 
 Error and empty (`no_data`) responses are unaffected either way — they stay on the Phase 2 `ToolError` envelope for every tool, migrated or not. **Not enabled on the deployed Function App** — this is a local/testing flag until the `ask-ariel` agent's own instructions are updated to understand the new shape.
+
+## Resources (E5 — not AI-callable tools, not HTTP routes)
+
+MCP has a second primitive besides tools: **resources** — addressable content a client reads via `resources/list`/`resources/read`, through the same MCP protocol connection, rather than a separate HTTP call. `mcp/health.py`'s `status_resource()` is the shared payload builder; each hosting wires it up its own way (`@mcp.resource` in `server.py`, `@app.mcp_resource_trigger` in `function_app.py` — Azure Functions' version only supports a fixed, static `uri`, no per-request templating, so this stays intentionally simple).
+
+| Resource | URI | Returns |
+|---|---|---|
+| Status | `ariel://status` | `{"server", "status" (ready/not_ready, from the same cached readiness check as `/health/ready`), "analyticsSchemaVersion", "tools"}` — no secrets, env values, or package/infra versions, same minimalism policy as the health endpoints below. |
 
 ## Health endpoints (not AI-callable tools)
 
@@ -155,14 +200,15 @@ Runs entirely against fakes and a local scripted HTTP server — no live Fabric 
 | `AR_FABRIC_MANAGED_IDENTITY_CLIENT_ID` | User-assigned managed identity client ID | *(optional — system-assigned identity if unset)* |
 | `DMR_FABRIC_WORKSPACE_ID` | "Analytics Dashboard - Dev" workspace | `d03466f9-16a1-4b47-a8cd-20d1975a3088` |
 | `DMR_FABRIC_DATASET_ID` | "DMR" semantic model | `93006692-872c-496f-96de-9a6edf926739` |
-| `ARIEL_SCOPE_PUBLIC_KEYS` | JSON map of `{"kid": "-----BEGIN PUBLIC KEY-----..."}` — the public half of webchat's signing key(s). Must match webchat's `ARIEL_SCOPE_PRIVATE_KEY`/`ARIEL_SCOPE_SIGNING_KID` exactly | *(required for the 4 DMR tools to run)* |
+| `ARIEL_SCOPE_PUBLIC_KEYS` | JSON map of `{"kid": "-----BEGIN PUBLIC KEY-----..."}` — the public half of webchat's signing key(s). Must match webchat's `ARIEL_SCOPE_PRIVATE_KEY`/`ARIEL_SCOPE_SIGNING_KID` exactly | *(required for the 5 DMR tools to run)* |
 | `HOST` / `PORT` | Streamable HTTP bind address (server.py only) | `0.0.0.0` / `8000` |
 
 If DAX queries start returning 401 again, check the DMR semantic model's data source credentials haven't been reverted to single sign-on (see above) — that's an easy thing to accidentally undo when re-publishing the model from Power BI Desktop.
 
-## Docker
+## Deploying
 
 ```bash
-docker build -t ariel-mcp-v2 .
-docker run -p 8000:8000 --env-file .env ariel-mcp-v2
+func azure functionapp publish ariel-mcp-server-v2 --build remote
 ```
+
+Oryx builds the package server-side; `.funcignore` excludes `tests/` and `requirements-dev.txt` from what's actually deployed. There's no Docker path — an earlier `Dockerfile` here packaged `server.py` for container hosting, but that was never what's actually deployed (Flex Consumption via the command above is) and it had drifted (pinned to Python 3.12 against the project's actual 3.14), so it was removed rather than left stale.

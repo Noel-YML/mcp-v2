@@ -7,7 +7,7 @@ filter-removing measure once it's wired up to real expression text. It does
 NOT claim the live model has been checked - that's still an open item.
 """
 
-from measure_guard import find_filter_removing_measures
+from dmr.measure_guard import find_filter_removing_measures
 
 
 def test_flags_each_known_filter_removing_function():
@@ -32,7 +32,7 @@ def test_accepts_the_bracketed_dax_result_row_shape():
 
 
 def test_allowlisted_measure_is_not_flagged():
-    import measure_guard
+    from dmr import measure_guard
 
     measure_guard.ALLOWLIST["Reviewed Exception"] = "reviewed and safe - test fixture"
     try:

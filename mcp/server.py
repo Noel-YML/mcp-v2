@@ -16,7 +16,7 @@ source's credential from SSO to a fixed account).
 None of the 4 DMR tools take a hotel argument - the model has no field to
 set to another hotel. Scope instead comes from a signed JWT carried in the
 `X-Ariel-Scope` header webchat attaches per turn (see tools/dmr_tools.py and
-scope_token.py). `ARIEL_SCOPE_PUBLIC_KEYS` below is a JSON map of key id
+scope/scope_token.py). `ARIEL_SCOPE_PUBLIC_KEYS` below is a JSON map of key id
 (`kid`) to PEM public key text - the public half of webchat's signing
 key(s); this process verifies with them but can never mint a valid token
 itself, since it never holds the private key.
@@ -41,6 +41,7 @@ from mcp.server import MCPServer
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+import config
 import health
 from config import FabricOptions
 from fabric_client.service import FabricQueryService
@@ -58,6 +59,21 @@ fabric_service = FabricQueryService(fabric_options)
 _readiness = health.Readiness(fabric_service, fabric_options.scope_public_keys)
 
 dmr_tools.register(mcp, fabric_service, fabric_options.scope_public_keys)
+
+
+# ---------------------------------------------------------------------------
+# Resources (E5) - unlike tools, these are readable via the MCP protocol
+# itself (resources/list, resources/read), no separate HTTP call needed.
+# ---------------------------------------------------------------------------
+@mcp.resource(
+    "ariel://status",
+    name="status",
+    title="Ariel MCP server status",
+    description="Readiness, active analytics schema version, and registered DMR tools - no secrets or infra details (see health.status_resource).",
+    mime_type="application/json",
+)
+def status_resource() -> dict:
+    return health.status_resource(_readiness, config.analytics_schema_version(), dmr_tools.TOOL_NAMES)
 
 
 # ---------------------------------------------------------------------------

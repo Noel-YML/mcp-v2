@@ -60,7 +60,7 @@ from enum import StrEnum
 
 import jwt
 
-from scope_context import ScopeContext
+from scope.scope_context import ScopeContext
 
 
 class ScopeFailure(StrEnum):

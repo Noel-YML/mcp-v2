@@ -11,7 +11,7 @@ import pytest
 
 import audit
 from fabric_client.result import ErrorCode, FabricQueryResult
-from scope_context import ScopeContext
+from scope.scope_context import ScopeContext
 from tools import dmr_tools
 
 
@@ -79,6 +79,21 @@ def test_excessive_days_is_rejected_not_clamped_and_never_reaches_fabric():
     assert fake.called is False
 
 
+def test_revenue_snapshot_days_over_its_own_lower_ceiling_is_rejected():
+    """Revenue snapshot's ceiling (31) is lower than the generic MAX_DAYS
+    (92) - each of its "days" is a ~21-row group, not one value. A request
+    just over ITS ceiling must reject, not fall through to the generic one."""
+    scope = _scope()
+    fake = _FakeService(raise_if_called=True)
+
+    response = dmr_tools.get_dmr_revenue_snapshot(fake, scope, days=32)
+    parsed = json.loads(response)
+
+    assert parsed["status"] == "error"
+    assert parsed["code"] == ErrorCode.INVALID_REQUEST.value
+    assert fake.called is False
+
+
 def test_zero_days_is_rejected():
     scope = _scope()
     fake = _FakeService(raise_if_called=True)
@@ -89,6 +104,23 @@ def test_zero_days_is_rejected():
     assert parsed["status"] == "error"
     assert parsed["code"] == ErrorCode.INVALID_REQUEST.value
     assert fake.called is False
+
+
+def test_revenue_snapshot_successful_response_is_a_bare_array_of_type_rows():
+    scope = _scope()
+    rows = [
+        {"[Hotel_ID]": scope.hotel_id, "[Revenue_Group]": "ROOMS", "[Revenue_Type]": "Room Revenue", "[Current]": 91100.58},
+        {"[Hotel_ID]": scope.hotel_id, "[Revenue_Group]": "Total Revenue", "[Revenue_Type]": "Total Revenue", "[Current]": 118246.30},
+    ]
+    fake = _FakeService(result=FabricQueryResult.ok(rows))
+
+    response = dmr_tools.get_dmr_revenue_snapshot(fake, scope)
+    parsed = json.loads(response)
+
+    assert parsed == [
+        {"Revenue_Group": "ROOMS", "Revenue_Type": "Room Revenue", "Current": 91100.58},
+        {"Revenue_Group": "Total Revenue", "Revenue_Type": "Total Revenue", "Current": 118246.30},
+    ]
 
 
 def test_no_data_is_a_structured_empty_envelope_not_a_bare_string():

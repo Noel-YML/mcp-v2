@@ -12,8 +12,8 @@ import time
 import jwt
 import pytest
 
-import scope_token
-from scope_token import ScopeFailure
+from scope import scope_token
+from scope.scope_token import ScopeFailure
 
 KID = "test-kid-1"
 HOTEL_ID = 42

@@ -6,6 +6,7 @@ Never 200 with a "ready: false" body - either 200-and-ready, or 503."""
 import json
 
 import health
+from tools.dmr_tools import TOOL_NAMES
 
 
 class _FakeFabricService:
@@ -61,6 +62,36 @@ def test_readiness_cache_expires_after_the_window(monkeypatch):
     readiness.check()
 
     assert fake.check_count == 2
+
+
+def test_status_resource_reflects_readiness_and_omits_secrets():
+    ready = health.Readiness(_FakeFabricService(), public_keys={"k": "pem"})
+    payload = health.status_resource(ready, "v1", ("get_dmr_revenue_trend", "get_dmr_revenue_snapshot"))
+
+    assert payload["status"] == "ready"
+    assert payload["analyticsSchemaVersion"] == "v1"
+    assert payload["tools"] == ["get_dmr_revenue_trend", "get_dmr_revenue_snapshot"]
+    dumped = json.dumps(payload)
+    assert "pem" not in dumped
+    assert "k" not in payload
+
+
+def test_status_resource_reflects_not_ready():
+    not_ready = health.Readiness(_FakeFabricService(should_fail=True), public_keys={"k": "pem"})
+    payload = health.status_resource(not_ready, "legacy", ())
+
+    assert payload["status"] == "not_ready"
+
+
+def test_function_app_status_resource_matches_health_status_resource(monkeypatch):
+    import function_app
+
+    monkeypatch.setattr(function_app, "_readiness", health.Readiness(_FakeFabricService(), {"k": "pem"}))
+
+    body = json.loads(function_app.status_resource(None))
+
+    assert body["status"] == "ready"
+    assert body["tools"] == list(TOOL_NAMES)
 
 
 def test_function_app_health_live_returns_minimal_200():

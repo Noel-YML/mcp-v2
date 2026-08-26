@@ -27,11 +27,21 @@ HOLDINGS_TABLE = "'derived mart_dmr_holdings_matrix'"
 
 MEASURE_DEFINITIONS: dict[Measure, tuple[str, str]] = {
     Measure.REVENUE_CURRENT: ("Current", "[Matrix: Value (Current)]"),
+    Measure.REVENUE_LAST_YEAR: ("Last Year", "[Matrix: Value (Last Year)]"),
     Measure.REVENUE_MTD: ("MTD", "[Matrix: Value (MTD)]"),
-    Measure.REVENUE_YTD: ("YTD", "[Matrix: Value (YTD)]"),
+    Measure.REVENUE_LY_MTD: ("LY MTD", "[Matrix: Value (LY MTD)]"),
+    Measure.REVENUE_VS_LY_MTD: ("Vs LY MTD", "[Matrix: Value (Vs LY MTD)]"),
     Measure.REVENUE_BUDGET_MTD: ("Budget MTD", "[Matrix: Value (Budget MTD)]"),
     Measure.REVENUE_VS_BUDGET_MTD: ("Vs Budget MTD", "[Matrix: Value (Vs Budget MTD)]"),
+    Measure.REVENUE_YTD: ("YTD", "[Matrix: Value (YTD)]"),
+    Measure.REVENUE_LY_YTD: ("LY YTD", "[Matrix: Value (LY YTD)]"),
+    Measure.REVENUE_VS_LY_YTD: ("Vs LY YTD", "[Matrix: Value (Vs LY YTD)]"),
+    Measure.REVENUE_BUDGET_YTD: ("Budget YTD", "[Matrix: Value (Budget YTD)]"),
+    Measure.REVENUE_VS_BUDGET_YTD: ("Vs Budget YTD", "[Matrix: Value (Vs Budget YTD)]"),
     Measure.REVENUE_FORECAST_MTD: ("Forecast MTD", "[Matrix: Value (Forecast MTD)]"),
+    Measure.REVENUE_VS_FORECAST_MTD: ("Vs Forecast MTD", "[Matrix: Value (Vs Forecast MTD)]"),
+    Measure.REVENUE_FORECAST_YTD: ("Forecast YTD", "[Matrix: Value (Forecast YTD)]"),
+    Measure.REVENUE_VS_FORECAST_YTD: ("Vs Forecast YTD", "[Matrix: Value (Vs Forecast YTD)]"),
     Measure.SEGMENT_REVENUE_MTD: ("Revenue MTD", "[Segment: Revenue (MTD)]"),
     Measure.SEGMENT_ROOMS_OCCUPIED_MTD: ("Rooms Occupied MTD", "[Segment: Rooms Occupied (MTD)]"),
     Measure.SEGMENT_ADR_MTD: ("ADR MTD", "[Segment: ADR (MTD)]"),
@@ -63,6 +73,29 @@ REVENUE_MEASURES = [
     Measure.REVENUE_BUDGET_MTD,
     Measure.REVENUE_VS_BUDGET_MTD,
     Measure.REVENUE_FORECAST_MTD,
+]
+
+# All 16 "Matrix: Value (...)" measures, in the model's own display order.
+# Used by the revenue snapshot report - unlike the day-by-day trend above,
+# the snapshot is one row per Revenue_Type (see dax_query_builder.py), so
+# every variance/comparator the model exposes belongs on it.
+REVENUE_SNAPSHOT_MEASURES = [
+    Measure.REVENUE_CURRENT,
+    Measure.REVENUE_LAST_YEAR,
+    Measure.REVENUE_MTD,
+    Measure.REVENUE_LY_MTD,
+    Measure.REVENUE_VS_LY_MTD,
+    Measure.REVENUE_BUDGET_MTD,
+    Measure.REVENUE_VS_BUDGET_MTD,
+    Measure.REVENUE_YTD,
+    Measure.REVENUE_LY_YTD,
+    Measure.REVENUE_VS_LY_YTD,
+    Measure.REVENUE_BUDGET_YTD,
+    Measure.REVENUE_VS_BUDGET_YTD,
+    Measure.REVENUE_FORECAST_MTD,
+    Measure.REVENUE_VS_FORECAST_MTD,
+    Measure.REVENUE_FORECAST_YTD,
+    Measure.REVENUE_VS_FORECAST_YTD,
 ]
 
 SEGMENT_MEASURES = [

@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from dmr.hotel_lookup import HotelMetadata
 from dmr.reports import Report
 from fabric_client.service import IFabricQueryService
-from scope_context import ScopeContext
+from scope.scope_context import ScopeContext
 
 from . import columns as columns_module
 from .actions import revenue_trend_actions

@@ -13,16 +13,23 @@ import pytest
 
 from dmr import dax_query_builder
 from dmr.dax_query_builder import MAX_DAYS, QuerySpec
-from dmr.measures import FNB_MEASURES, HOLDINGS_MEASURES, MEASURE_DEFINITIONS, REVENUE_MEASURES, SEGMENT_MEASURES
+from dmr.measures import (
+    FNB_MEASURES,
+    HOLDINGS_MEASURES,
+    MEASURE_DEFINITIONS,
+    REVENUE_MEASURES,
+    REVENUE_SNAPSHOT_MEASURES,
+    SEGMENT_MEASURES,
+)
 from dmr.reports import Report
-from scope_context import ScopeContext
+from scope.scope_context import ScopeContext
 
 _SCOPE = ScopeContext(hotel_id=7, session_id="s", permissions=frozenset({"dmr:read"}), expires_at=datetime.now(timezone.utc))
 
 
 @pytest.mark.parametrize(
     "measures",
-    [REVENUE_MEASURES, SEGMENT_MEASURES, FNB_MEASURES, HOLDINGS_MEASURES],
+    [REVENUE_MEASURES, REVENUE_SNAPSHOT_MEASURES, SEGMENT_MEASURES, FNB_MEASURES, HOLDINGS_MEASURES],
 )
 def test_every_measure_resolves_in_definitions(measures):
     """An "unknown measure" is structurally impossible: every measure a
@@ -57,3 +64,61 @@ def test_build_produces_hotel_scoped_query_for_every_report():
     for report in Report:
         query = dax_query_builder.build(QuerySpec(report=report, days=5), _SCOPE)
         assert str(_SCOPE.hotel_id) in query
+
+
+def test_revenue_snapshot_puts_revenue_type_in_the_row_context():
+    """The Matrix measures have no metric filter of their own - they only
+    return the right number when Revenue_Type is grouped on. Unlike the
+    (currently unsafe) trend query, the snapshot must group by both
+    Revenue_Group and Revenue_Type, not just filter hotel/date."""
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_SNAPSHOT), _SCOPE)
+    assert "[Revenue_Group]" in query
+    assert "[Revenue_Type]" in query
+
+
+def test_revenue_snapshot_excludes_long_tail_line_items():
+    """Revenue_Type_Sort 99 marks hotel-specific long-tail rows - the
+    snapshot is canonical-rows-only (<=21) by design, not everything."""
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_SNAPSHOT), _SCOPE)
+    assert "[Revenue_Type_Sort] <= 21" in query
+
+
+def test_revenue_snapshot_orders_by_group_then_type_sort():
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_SNAPSHOT), _SCOPE)
+    assert "ORDER BY" in query
+    order_clause = query.split("ORDER BY", 1)[1]
+    assert "Revenue_Group_Sort" in order_clause
+    assert "Revenue_Type_Sort" in order_clause
+    assert order_clause.index("Revenue_Group_Sort") < order_clause.index("Revenue_Type_Sort")
+
+
+def test_revenue_snapshot_default_is_the_single_latest_day():
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_SNAPSHOT), _SCOPE)
+    assert "TOPN(1," in query
+    assert "__BoundaryDate" in query
+
+
+def test_revenue_snapshot_days_bounds_by_distinct_date_not_row_count():
+    """days=7 must bound to 7 distinct AuditDates, not 7 rows - each date
+    carries ~21 canonical type rows, so a row-count TOPN would cut a
+    boundary day's breakdown in half."""
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_SNAPSHOT, days=7), _SCOPE)
+    assert "TOPN(7," in query
+    assert "VALUES(" in query
+
+
+def test_revenue_snapshot_days_ceiling_is_lower_than_the_generic_max():
+    """Each snapshot 'day' is a ~21-row group, not 1 value - the generic
+    92-day ceiling would let a request return ~1,900 rows."""
+    assert dax_query_builder.max_days_for(Report.REVENUE_SNAPSHOT) < MAX_DAYS
+    assert dax_query_builder._clamp_days(500, Report.REVENUE_SNAPSHOT) == dax_query_builder.max_days_for(
+        Report.REVENUE_SNAPSHOT
+    )
+
+
+def test_revenue_trend_is_pinned_to_the_total_revenue_line_item():
+    """Without this filter, the trend sums every Revenue_Type row per day
+    together (Rooms + F&B + Other + Total Revenue + every canonical line
+    item) - confirmed against a live rendered report, not guessed."""
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_TREND, days=5), _SCOPE)
+    assert '[Revenue_Type] = "Total Revenue"' in query
