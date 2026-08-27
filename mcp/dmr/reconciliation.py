@@ -11,6 +11,24 @@ testable without a Fabric round-trip, the same separation-of-concerns this
 codebase already uses everywhere (dax_query_builder.py builds queries;
 analytics/facts.py computes facts from already-returned rows; this computes
 reconciliation from already-fetched values).
+
+Two separate things, deliberately not conflated:
+  - The RELATIONSHIP (is revenue.total_fnb expected to equal fnb.revenue at
+    all?) is part of the semantic contract - registered once in
+    dmr/semantics.py's reconciliation_target/reconciliation_expected fields,
+    the same registry that owns every other business-meaning fact about a
+    metric.
+  - The EXECUTION (actually comparing two real numbers from two real tool
+    calls and producing PASS/FAIL/NOT_APPLICABLE/INSUFFICIENT_DATA) is what
+    this module does, on values a caller already fetched.
+No `AnalyticsResult` (analytics/contract.py) carries a reconciliation verdict
+today - that would be a deliberate future contract addition, not something
+this module or its callers currently claim. The pattern that exists now
+(Segment/F&B live-acceptance scripts calling `reconcile()` against a
+separately-fetched Revenue Matrix control total - see
+scripts/live_acceptance_segment_mix.py and
+scripts/live_acceptance_fnb_performance.py) is a standalone verification
+step, not something embedded inside every analytics builder's own output.
 """
 
 from dataclasses import dataclass

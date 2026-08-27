@@ -78,16 +78,14 @@ from mcp.server.mcpserver import Context
 import audit
 import config
 from scope import scope_token
-from analytics import fnb_performance as analytics_fnb_performance
-from analytics import revenue_snapshot as analytics_revenue_snapshot
-from analytics import revenue_trend as analytics_revenue_trend
-from analytics import segment_mix as analytics_segment_mix
+from analytics.contract import AnalyticsContractViolation
 from dmr import dax_query_builder, hotel_lookup
 from dmr.dax_query_builder import QuerySpec
-from dmr.reports import Report
+from dmr.reports import Report, ReportDefinition
 from fabric_client.result import ErrorCode, ToolError, new_trace_id
 from fabric_client.service import IFabricQueryService
 from scope.scope_context import ScopeContext
+from tools.report_registry import REPORT_DEFINITIONS
 
 logger = logging.getLogger("ariel-mcp-server")
 
@@ -96,49 +94,12 @@ REQUIRED_PERMISSION = "dmr:read"
 # The single source of truth for "what tools does this server register" -
 # health.status_resource() (E5) reads this rather than keeping its own
 # hand-maintained copy that could drift from what's actually wired up below.
-TOOL_NAMES = (
-    "get_dmr_revenue_trend",
-    "get_dmr_revenue_snapshot",
-    "get_dmr_segment_mix",
-    "get_dmr_fnb_performance",
-    "get_dmr_holdings_outlook",
-)
+# Derived from REPORT_DEFINITIONS (tools/report_registry.py) - a report's
+# tool name is declared exactly once there, not redeclared here.
+TOOL_NAMES = tuple(REPORT_DEFINITIONS[report].tool_name for report in Report)
 
 _AUTHORIZATION_FAILED_MESSAGE = "The report request could not be authorized."
 _MISCONFIGURED_MESSAGE = "Server misconfiguration."
-
-_DAYS_DEFAULTS = {
-    Report.REVENUE_TREND: 30,
-    Report.REVENUE_SNAPSHOT: 1,
-    Report.HOLDINGS_OUTLOOK: 14,
-}
-
-# Cleaned-row key holding each report's date, for the audit trail's
-# best-effort `max_business_date` - see _extract_max_business_date. Reports
-# not listed here don't currently project a date column at all.
-_DATE_FIELD_BY_REPORT = {
-    Report.REVENUE_TREND: "Date",
-    Report.REVENUE_SNAPSHOT: "Date",
-    Report.HOLDINGS_OUTLOOK: "SelDate",
-}
-
-# Reports with an analytics-contract builder (analytics/) - checked in
-# _execute_report alongside config.analytics_schema_version(). holdings_outlook
-# isn't here yet - nothing built for it.
-_ANALYTICS_ENABLED_REPORTS = {
-    Report.REVENUE_TREND,
-    Report.REVENUE_SNAPSHOT,
-    Report.SEGMENT_MIX,
-    Report.FNB_PERFORMANCE,
-}
-
-_EMPTY_MESSAGES = {
-    Report.REVENUE_TREND: "No revenue history found for hotel_id={hotel_id}.",
-    Report.REVENUE_SNAPSHOT: "No revenue data found for hotel_id={hotel_id}.",
-    Report.SEGMENT_MIX: "No segment data found for hotel_id={hotel_id}.",
-    Report.FNB_PERFORMANCE: "No F&B data found for hotel_id={hotel_id}.",
-    Report.HOLDINGS_OUTLOOK: "No holdings/occupancy outlook found for hotel_id={hotel_id}.",
-}
 
 
 class _ScopeResolutionError(Exception):
@@ -243,29 +204,28 @@ def _verify_rows(rows: list[dict], scope: ScopeContext, tool: str, trace_id: str
     return None
 
 
-def _validate_days(report: Report, days: int | None) -> int:
+def _validate_days(definition: ReportDefinition, days: int | None) -> int:
     """Rejects - never silently clamps - an out-of-range `days`. A silent
     clamp from, say, 500 down to the report's ceiling would make a partial
     answer look like a complete one. `dax_query_builder._clamp_days` still
     exists as an internal belt-and-suspenders ceiling, but a value should
     never reach it out of range in normal operation now that this rejects
-    first. The ceiling itself is per-report (`max_days_for`) - revenue
+    first. The ceiling itself is per-report (`definition.max_days`) - revenue
     snapshot's is much lower than revenue trend's, since each of its "days"
     is a ~21-row group, not one value.
     """
-    value = _DAYS_DEFAULTS[report] if days is None else days
+    value = definition.default_days if days is None else days
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("days must be a whole number.")
     if value < 1:
         raise ValueError("days must be at least 1.")
-    ceiling = dax_query_builder.max_days_for(report)
-    if value > ceiling:
-        raise ValueError(f"days cannot exceed {ceiling}.")
+    if value > definition.max_days:
+        raise ValueError(f"days cannot exceed {definition.max_days}.")
     return value
 
 
-def _extract_max_business_date(cleaned_rows: list[dict], report: Report) -> str | None:
-    field = _DATE_FIELD_BY_REPORT.get(report)
+def _extract_max_business_date(cleaned_rows: list[dict], definition: ReportDefinition) -> str | None:
+    field = definition.business_date_field
     if field is None or not cleaned_rows:
         return None
     value = cleaned_rows[-1].get(field)
@@ -279,6 +239,7 @@ def _execute_report(
     report: Report,
     days: int | None,
 ) -> str:
+    definition = REPORT_DEFINITIONS[report]
     trace_id = new_trace_id()
     started = time.monotonic()
     outcome = "success"
@@ -289,7 +250,7 @@ def _execute_report(
 
     try:
         try:
-            validated_days = _validate_days(report, days) if report in _DAYS_DEFAULTS else None
+            validated_days = _validate_days(definition, days) if definition.default_days is not None else None
         except ValueError as exc:
             outcome = ErrorCode.INVALID_REQUEST.value
             error_code = ErrorCode.INVALID_REQUEST.value
@@ -308,7 +269,7 @@ def _execute_report(
         if not result.rows:
             outcome = "empty"
             error_code = ErrorCode.NO_DATA.value
-            message = _EMPTY_MESSAGES[report].format(hotel_id=scope.hotel_id)
+            message = definition.empty_message.format(hotel_id=scope.hotel_id)
             response = ToolError(ErrorCode.NO_DATA, message, trace_id).to_json()
             return response
 
@@ -321,33 +282,41 @@ def _execute_report(
 
         cleaned_rows = [_clean_row(row) for row in result.rows]
         row_count = len(cleaned_rows)
-        max_business_date = _extract_max_business_date(cleaned_rows, report)
+        max_business_date = _extract_max_business_date(cleaned_rows, definition)
 
-        if report in _ANALYTICS_ENABLED_REPORTS and config.analytics_schema_version() == "v1":
+        if definition.analytics_enabled and config.analytics_schema_version() == "v1":
             # Phase 3 (revenue_trend) + Aug 2026 (revenue_snapshot,
             # segment_mix, fnb_performance): the versioned analytics
             # contract - success only. Errors/empty results above already
             # returned via the Phase 2 ToolError envelope, unchanged,
             # regardless of this flag - see analytics/contract.py's module
-            # docstring. holdings_outlook isn't in _ANALYTICS_ENABLED_REPORTS
-            # yet - nothing to switch to there.
+            # docstring. holdings_outlook has no analytics_builder yet -
+            # analytics_enabled is False for it, so this branch never runs.
             metadata = hotel_lookup.resolve(service, scope.hotel_id)
-            if report is Report.REVENUE_TREND:
-                analytics_result = analytics_revenue_trend.build(
+            try:
+                analytics_result = definition.analytics_builder(
                     scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, requested_days=validated_days, trace_id=trace_id
                 )
-            elif report is Report.REVENUE_SNAPSHOT:
-                analytics_result = analytics_revenue_snapshot.build(
-                    scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, requested_days=validated_days, trace_id=trace_id
+            except AnalyticsContractViolation as exc:
+                # The builder refused to describe this data (today: a
+                # snapshot report whose rows carry more than one AuditDate -
+                # see analytics/contract.py). Same fail-closed treatment and
+                # same caller-visible envelope as a cross-hotel row in
+                # _verify_rows: the specifics go to the internal log only.
+                logger.error(
+                    json.dumps(
+                        {"event": "analytics_contract_violation", "tool": tool, "detail": str(exc), "traceId": trace_id},
+                        default=str,
+                    )
                 )
-            elif report is Report.SEGMENT_MIX:
-                analytics_result = analytics_segment_mix.build(
-                    scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, trace_id=trace_id
-                )
-            else:
-                analytics_result = analytics_fnb_performance.build(
-                    scope=scope, hotel_metadata=metadata, cleaned_rows=cleaned_rows, trace_id=trace_id
-                )
+                outcome = ErrorCode.INTERNAL_ERROR.value
+                error_code = ErrorCode.INTERNAL_ERROR.value
+                response = ToolError(
+                    ErrorCode.INTERNAL_ERROR,
+                    "A data-integrity check failed - refusing to return this result.",
+                    trace_id,
+                ).to_json()
+                return response
             response = analytics_result.to_json()
             return response
 

@@ -116,6 +116,19 @@ def test_revenue_snapshot_days_ceiling_is_lower_than_the_generic_max():
     )
 
 
+def test_segment_mix_query_projects_its_own_audit_date():
+    """Segment mix filters to the latest AuditDate internally, but the
+    analytics contract needs the actual date value back on the row - not
+    just a filter with no corresponding projection."""
+    query = dax_query_builder.build(QuerySpec(report=Report.SEGMENT_MIX), _SCOPE)
+    assert "[AuditDate]" in query
+
+
+def test_fnb_performance_query_projects_its_own_audit_date():
+    query = dax_query_builder.build(QuerySpec(report=Report.FNB_PERFORMANCE), _SCOPE)
+    assert "[AuditDate]" in query
+
+
 def test_revenue_trend_is_pinned_to_the_total_revenue_line_item():
     """Without this filter, the trend sums every Revenue_Type row per day
     together (Rooms + F&B + Other + Total Revenue + every canonical line

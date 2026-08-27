@@ -12,11 +12,14 @@ from dmr.reports import Report
 from scope.scope_context import ScopeContext
 
 from . import columns as columns_module
+from ._dates import resolve_snapshot_date
 from .actions import fnb_performance_actions
 from .contract import (
+    AnalyticsContractViolation,
     AnalyticsResult,
     BusinessDateCoverage,
     Dataset,
+    MISSING_SNAPSHOT_DATE_WARNING,
     PeriodRange,
     PresentationHints,
     Quality,
@@ -58,20 +61,35 @@ def build(
     if hotel_metadata.currency is None:
         warnings.append("Currency could not be determined for this hotel.")
 
+    # Always the latest audit date - projected directly from the query
+    # (dax_query_builder._build_fnb_performance_query) rather than inferred,
+    # so period/coverage reflect the real snapshot date returned, never today's.
+    snapshot = resolve_snapshot_date(contract_rows, "auditDate")
+    if snapshot.status == "inconsistent":
+        # Fail closed - see segment_mix.py's identical guard and
+        # AnalyticsContractViolation's docstring for why this isn't a new
+        # public error code.
+        raise AnalyticsContractViolation(
+            f"{REPORT_NAME}: expected exactly one snapshot AuditDate, got {list(snapshot.distinct_values)}."
+        )
+    if snapshot.status == "missing":
+        warnings.append(MISSING_SNAPSHOT_DATE_WARNING)
+    audit_date = snapshot.value or ""
+
     return AnalyticsResult(
         result_id=new_result_id(),
         trace_id=trace_id,
         report=REPORT_NAME,
         scope=ScopeInfo(hotel_display_name=hotel_metadata.display_name),
         context=ReportContext(
-            period=PeriodRange(start="", end=""),
+            period=PeriodRange(start=audit_date, end=audit_date),
             grain="snapshot",
             currency=hotel_metadata.currency,
             currency_source=hotel_metadata.currency_source,
             timezone=hotel_metadata.timezone,
             timezone_source=hotel_metadata.timezone_source,
             queried_at=datetime.now(timezone.utc).isoformat(),
-            business_date_coverage=BusinessDateCoverage(min="", max=""),
+            business_date_coverage=BusinessDateCoverage(min=audit_date, max=audit_date),
             semantic_model_refreshed_at=None,
             filters=[],
         ),

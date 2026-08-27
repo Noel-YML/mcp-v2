@@ -114,6 +114,15 @@ def max_days_for(report: Report) -> int:
     return _MAX_DAYS_OVERRIDE.get(report, MAX_DAYS)
 
 
+def default_days_for(report: Report) -> int | None:
+    """None for a report with no `days` concept at all (segment mix, F&B
+    performance - always the single latest snapshot). The single source
+    tools/report_registry.py's REPORT_DEFINITIONS reads from, so a report's
+    documented default can never drift from what `_clamp_days` actually
+    falls back to internally."""
+    return _DEFAULT_DAYS.get(report)
+
+
 @dataclass(frozen=True)
 class QuerySpec:
     report: Report
@@ -234,6 +243,7 @@ def _build_segment_mix_query(hotel_id: int) -> str:
     CALCULATETABLE(
         SUMMARIZECOLUMNS(
             {SEGMENT_TABLE}[Hotel_ID],
+            {SEGMENT_TABLE}[AuditDate],
             {SEGMENT_TABLE}[Main_Group],
             {SEGMENT_TABLE}[Market_Segmetation],
             {measure_columns}
@@ -258,6 +268,7 @@ def _build_fnb_performance_query(hotel_id: int) -> str:
     CALCULATETABLE(
         SUMMARIZECOLUMNS(
             {FNB_TABLE}[Hotel_ID],
+            {FNB_TABLE}[AuditDate],
             {FNB_TABLE}[Category],
             {FNB_TABLE}[Name],
             {measure_columns}

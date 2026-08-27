@@ -32,6 +32,31 @@ from pydantic import BaseModel, ConfigDict, Field
 SCHEMA_VERSION = "1.0"
 
 
+class AnalyticsContractViolation(Exception):
+    """The returned data cannot be honestly represented in this contract -
+    raised by a builder instead of emitting a result that would misdescribe
+    it. Today's only case: a `grain="snapshot"` report (segment mix, F&B
+    performance) whose rows carry more than one distinct AuditDate, which is
+    a date RANGE, not a snapshot.
+
+    Deliberately an internal exception, NOT a new public error code:
+    `tools/dmr_tools.py`'s `_execute_report` catches it and returns the
+    existing `ToolError(INTERNAL_ERROR, "A data-integrity check failed...")`
+    envelope - the same caller-visible shape `_verify_rows` already uses for
+    a cross-hotel row. The specific offending dates go to the internal log
+    only, never to the caller, and no raw exception ever escapes the tool
+    boundary. Adding a distinct public code would change the error contract
+    for a condition the existing one already describes correctly.
+    """
+
+
+# The one wording for "the model gave us no snapshot date", shared by every
+# snapshot report so a consumer can match on it rather than on two
+# near-identical per-report strings. Goes in `quality.warnings` (the existing
+# contract field) - deliberately not a parallel warnings channel of its own.
+MISSING_SNAPSHOT_DATE_WARNING = "The semantic model did not return a snapshot AuditDate for this report."
+
+
 def new_result_id() -> str:
     return f"res_{secrets.token_hex(8)}"
 

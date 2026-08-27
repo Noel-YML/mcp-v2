@@ -119,6 +119,7 @@ REVENUE_TREND_FIELD_MAP = {
 # ---------------------------------------------------------------------------
 
 SEGMENT_MIX_COLUMNS: list[ColumnDef] = [
+    ColumnDef(key="auditDate", label="As Of Date", role="dimension", semantic_type="date", granularity="day"),
     _dimension_col("mainGroup", "Segment Group"),
     _dimension_col("marketSegment", "Market Segment"),
     _measure_col("revenueMtd", "Revenue MTD", "segment.revenue.mtd"),
@@ -131,6 +132,7 @@ SEGMENT_MIX_COLUMNS: list[ColumnDef] = [
 ]
 
 SEGMENT_MIX_FIELD_MAP = {
+    "AuditDate": "auditDate",
     "Main_Group": "mainGroup",
     "Market_Segmetation": "marketSegment",
     "Revenue MTD": "revenueMtd",
@@ -149,6 +151,7 @@ SEGMENT_MIX_FIELD_MAP = {
 # ---------------------------------------------------------------------------
 
 FNB_PERFORMANCE_COLUMNS: list[ColumnDef] = [
+    ColumnDef(key="auditDate", label="As Of Date", role="dimension", semantic_type="date", granularity="day"),
     _dimension_col("category", "Category"),
     _dimension_col("outlet", "Outlet"),
     _measure_col("revenueMtd", "Revenue MTD", "fnb.revenue.mtd"),
@@ -162,6 +165,7 @@ FNB_PERFORMANCE_COLUMNS: list[ColumnDef] = [
 ]
 
 FNB_PERFORMANCE_FIELD_MAP = {
+    "AuditDate": "auditDate",
     "Category": "category",
     "Name": "outlet",
     "Revenue MTD": "revenueMtd",
@@ -253,10 +257,14 @@ def columns_for(report: Report, currency: str | None) -> list[ColumnDef]:
     return [col.model_copy(update={"currency": currency}) if col.semantic_type == "currency" else col for col in base]
 
 
+_DATE_VALUED_CONTRACT_KEYS = ("date", "auditDate")
+
+
 def to_contract_rows(report: Report, cleaned_rows: list[dict]) -> list[dict]:
     field_map = _FIELD_MAP_BY_REPORT[report]
     rows = [{field_map.get(key, key): value for key, value in row.items()} for row in cleaned_rows]
     for row in rows:
-        if row.get("date") is not None:
-            row["date"] = date_str(row["date"])
+        for date_key in _DATE_VALUED_CONTRACT_KEYS:
+            if row.get(date_key) is not None:
+                row[date_key] = date_str(row[date_key])
     return rows

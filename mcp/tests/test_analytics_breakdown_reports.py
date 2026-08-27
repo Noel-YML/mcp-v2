@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 import pytest
 
 from analytics.actions import ACTION_REGISTRY
+from analytics.contract import MISSING_SNAPSHOT_DATE_WARNING
 from dmr.hotel_lookup import HotelMetadata
-from fabric_client.result import FabricQueryResult
+from fabric_client.result import ErrorCode, FabricQueryResult
 from scope.scope_context import ScopeContext
 from tools import dmr_tools
 
@@ -42,9 +43,10 @@ def _enable_v1(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _segment_row(main_group, market_segment, revenue_mtd, last_year=0.0):
+def _segment_row(main_group, market_segment, revenue_mtd, last_year=0.0, audit_date="2026-08-26"):
     return {
         "[Hotel_ID]": HOTEL_ID,
+        "[AuditDate]": f"{audit_date}T00:00:00" if audit_date is not None else None,
         "[Main_Group]": main_group,
         "[Market_Segmetation]": market_segment,
         "[Revenue MTD]": revenue_mtd,
@@ -120,9 +122,10 @@ def test_segment_mix_legacy_flag_returns_bare_array_unchanged(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _fnb_row(category, name, revenue_mtd, vs_budget_mtd=0.0, last_year_month=0.0, budget=None):
+def _fnb_row(category, name, revenue_mtd, vs_budget_mtd=0.0, last_year_month=0.0, budget=None, audit_date="2026-08-26"):
     return {
         "[Hotel_ID]": HOTEL_ID,
+        "[AuditDate]": f"{audit_date}T00:00:00" if audit_date is not None else None,
         "[Category]": category,
         "[Name]": name,
         "[Revenue MTD]": revenue_mtd,
@@ -339,6 +342,226 @@ def test_revenue_snapshot_legacy_flag_returns_bare_array_unchanged(monkeypatch):
 # ---------------------------------------------------------------------------
 # Cross-cutting: every advertised action is real
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Snapshot AuditDate exposure (Revenue/Segment/F&B cleanup)
+# ---------------------------------------------------------------------------
+
+
+def test_segment_mix_exposes_its_real_snapshot_audit_date(monkeypatch):
+    _enable_v1(monkeypatch)
+    result = _call_segment_mix(monkeypatch, [_segment_row("Transient", "Public Indirect", 800_000.0, audit_date="2026-08-26")])
+    assert result["context"]["period"] == {"start": "2026-08-26", "end": "2026-08-26"}
+    assert result["context"]["businessDateCoverage"] == {"min": "2026-08-26", "max": "2026-08-26"}
+    assert result["context"]["grain"] == "snapshot"
+
+
+def test_fnb_performance_exposes_its_real_snapshot_audit_date(monkeypatch):
+    _enable_v1(monkeypatch)
+    result = _call_fnb(monkeypatch, [_fnb_row("Restaurant", "Restaurant", 102_700.0, audit_date="2026-08-26")])
+    assert result["context"]["period"] == {"start": "2026-08-26", "end": "2026-08-26"}
+    assert result["context"]["businessDateCoverage"] == {"min": "2026-08-26", "max": "2026-08-26"}
+    assert result["context"]["grain"] == "snapshot"
+
+
+def test_segment_mix_multiple_rows_all_use_the_same_expected_audit_date(monkeypatch):
+    """A real single-day snapshot: every row shares the same AuditDate, so
+    min == max == that one date, not a spurious range."""
+    _enable_v1(monkeypatch)
+    rows = [
+        _segment_row("Transient", "Public Indirect", 825_000.0, audit_date="2026-08-26"),
+        _segment_row("Transient", "Public Direct", 275_000.0, audit_date="2026-08-26"),
+        _segment_row("Crew", "Crew", 117_000.0, audit_date="2026-08-26"),
+    ]
+    result = _call_segment_mix(monkeypatch, rows)
+    assert result["context"]["businessDateCoverage"] == {"min": "2026-08-26", "max": "2026-08-26"}
+    for row in result["dataset"]["rows"]:
+        assert row["auditDate"] == "2026-08-26"
+
+
+def test_fnb_performance_multiple_rows_all_use_the_same_expected_audit_date(monkeypatch):
+    _enable_v1(monkeypatch)
+    rows = [
+        _fnb_row("Restaurant", "Restaurant", 102_700.0, audit_date="2026-08-26"),
+        _fnb_row("Bar", "Bar", 58_600.0, audit_date="2026-08-26"),
+    ]
+    result = _call_fnb(monkeypatch, rows)
+    assert result["context"]["businessDateCoverage"] == {"min": "2026-08-26", "max": "2026-08-26"}
+    for row in result["dataset"]["rows"]:
+        assert row["auditDate"] == "2026-08-26"
+
+
+def test_segment_mix_missing_audit_date_is_handled_explicitly_not_fabricated(monkeypatch):
+    """If, unexpectedly, no row carries a real AuditDate, the period/coverage
+    must stay explicitly empty - never silently filled in with today's date."""
+    _enable_v1(monkeypatch)
+    result = _call_segment_mix(monkeypatch, [_segment_row("Transient", "Public Indirect", 800_000.0, audit_date=None)])
+    assert result["context"]["period"] == {"start": "", "end": ""}
+    assert result["context"]["businessDateCoverage"] == {"min": "", "max": ""}
+    assert result["dataset"]["rows"][0]["auditDate"] is None
+
+
+def test_fnb_performance_missing_audit_date_is_handled_explicitly_not_fabricated(monkeypatch):
+    _enable_v1(monkeypatch)
+    result = _call_fnb(monkeypatch, [_fnb_row("Restaurant", "Restaurant", 102_700.0, audit_date=None)])
+    assert result["context"]["period"] == {"start": "", "end": ""}
+    assert result["context"]["businessDateCoverage"] == {"min": "", "max": ""}
+    assert result["dataset"]["rows"][0]["auditDate"] is None
+
+
+# ---------------------------------------------------------------------------
+# The single-snapshot invariant: exactly one AuditDate, or fail closed
+# ---------------------------------------------------------------------------
+
+
+def test_segment_mix_accepts_many_rows_sharing_one_audit_date(monkeypatch):
+    """The normal case - many segments, one snapshot date. Must produce a
+    valid packet with start == end, not be tripped by the mixed-date guard."""
+    _enable_v1(monkeypatch)
+    rows = [
+        _segment_row("Transient", "Public Indirect", 825_000.0, audit_date="2026-08-26"),
+        _segment_row("Transient", "Public Direct", 275_000.0, audit_date="2026-08-26"),
+        _segment_row("Crew", "Crew", 117_000.0, audit_date="2026-08-26"),
+        _segment_row("Group", "Corporate Group", 64_000.0, audit_date="2026-08-26"),
+    ]
+    result = _call_segment_mix(monkeypatch, rows)
+    assert result["status"] == "success"
+    assert result["context"]["period"] == {"start": "2026-08-26", "end": "2026-08-26"}
+    assert len(result["dataset"]["rows"]) == 4
+
+
+def test_fnb_performance_accepts_many_rows_sharing_one_audit_date(monkeypatch):
+    _enable_v1(monkeypatch)
+    rows = [
+        _fnb_row("Food", "Restaurant", 102_700.0, audit_date="2026-08-26"),
+        _fnb_row("Beverage", "Bar", 58_600.0, audit_date="2026-08-26"),
+        _fnb_row("Other", "Room Service", 4_100.0, audit_date="2026-08-26"),
+    ]
+    result = _call_fnb(monkeypatch, rows)
+    assert result["status"] == "success"
+    assert result["context"]["period"] == {"start": "2026-08-26", "end": "2026-08-26"}
+    assert len(result["dataset"]["rows"]) == 3
+
+
+def test_segment_mix_mixed_audit_dates_never_returns_a_snapshot_packet(monkeypatch):
+    """Two different AuditDates is a date RANGE, not a snapshot - reporting
+    it under grain="snapshot" with start != end would silently misdescribe
+    the data. Must fail closed via the existing error envelope instead."""
+    _enable_v1(monkeypatch)
+    rows = [
+        _segment_row("Transient", "Public Indirect", 825_000.0, audit_date="2026-08-25"),
+        _segment_row("Crew", "Crew", 117_000.0, audit_date="2026-08-26"),
+    ]
+    result = _call_segment_mix(monkeypatch, rows)
+    assert result["status"] == "error"
+    assert result["code"] == ErrorCode.INTERNAL_ERROR.value
+    assert "dataset" not in result
+    assert "context" not in result
+
+
+def test_fnb_performance_mixed_audit_dates_never_returns_a_snapshot_packet(monkeypatch):
+    _enable_v1(monkeypatch)
+    rows = [
+        _fnb_row("Food", "Restaurant", 102_700.0, audit_date="2026-08-25"),
+        _fnb_row("Beverage", "Bar", 58_600.0, audit_date="2026-08-26"),
+    ]
+    result = _call_fnb(monkeypatch, rows)
+    assert result["status"] == "error"
+    assert result["code"] == ErrorCode.INTERNAL_ERROR.value
+    assert "dataset" not in result
+    assert "context" not in result
+
+
+def test_mixed_audit_date_error_never_leaks_raw_exception_text_or_the_dates(monkeypatch):
+    """The offending dates are internal diagnostic detail - the caller gets
+    the same generic data-integrity message _verify_rows already uses, with
+    no exception class name, traceback, or date values in it."""
+    _enable_v1(monkeypatch)
+    rows = [
+        _segment_row("Transient", "Public Indirect", 825_000.0, audit_date="2026-08-25"),
+        _segment_row("Crew", "Crew", 117_000.0, audit_date="2026-08-26"),
+    ]
+    result = _call_segment_mix(monkeypatch, rows)
+    message = result["message"]
+    assert "2026-08-25" not in message
+    assert "2026-08-26" not in message
+    assert "AnalyticsContractViolation" not in message
+    assert "Traceback" not in message
+    assert message == "A data-integrity check failed - refusing to return this result."
+
+
+def test_mixed_audit_dates_still_emit_exactly_one_audit_event(monkeypatch):
+    """Fail-closed must go through the normal controlled return path, not an
+    escaping exception that skips/duplicates the audit trail."""
+    import audit
+
+    _enable_v1(monkeypatch)
+    events = []
+    monkeypatch.setattr(audit, "emit", lambda event: events.append(event))
+    rows = [
+        _segment_row("Transient", "Public Indirect", 825_000.0, audit_date="2026-08-25"),
+        _segment_row("Crew", "Crew", 117_000.0, audit_date="2026-08-26"),
+    ]
+    _call_segment_mix(monkeypatch, rows)
+    assert len(events) == 1
+    assert events[0].outcome == ErrorCode.INTERNAL_ERROR.value
+
+
+def test_snapshot_dates_are_never_inferred_from_today_or_query_time(monkeypatch):
+    """No code path substitutes date.today()/queriedAt for a real AuditDate:
+    with the model returning none, the period stays empty even though
+    queriedAt is populated on the very same context object."""
+    from datetime import date
+
+    _enable_v1(monkeypatch)
+    today = date.today().isoformat()
+    for result in (
+        _call_segment_mix(monkeypatch, [_segment_row("Transient", "Public Indirect", 800_000.0, audit_date=None)]),
+        _call_fnb(monkeypatch, [_fnb_row("Restaurant", "Restaurant", 102_700.0, audit_date=None)]),
+    ):
+        assert result["context"]["period"]["start"] == ""
+        assert result["context"]["businessDateCoverage"]["min"] == ""
+        assert result["context"]["queriedAt"]  # populated...
+        assert today not in json.dumps(result["context"]["period"])  # ...but never borrowed as the business date
+        assert today not in json.dumps(result["context"]["businessDateCoverage"])
+
+
+# ---------------------------------------------------------------------------
+# Missing AuditDate is explicit in quality.warnings, not just an empty string
+# ---------------------------------------------------------------------------
+
+
+def test_segment_mix_missing_audit_date_adds_an_explicit_quality_warning(monkeypatch):
+    _enable_v1(monkeypatch)
+    result = _call_segment_mix(monkeypatch, [_segment_row("Transient", "Public Indirect", 800_000.0, audit_date=None)])
+    assert MISSING_SNAPSHOT_DATE_WARNING in result["quality"]["warnings"]
+
+
+def test_fnb_performance_missing_audit_date_adds_an_explicit_quality_warning(monkeypatch):
+    _enable_v1(monkeypatch)
+    result = _call_fnb(monkeypatch, [_fnb_row("Restaurant", "Restaurant", 102_700.0, audit_date=None)])
+    assert MISSING_SNAPSHOT_DATE_WARNING in result["quality"]["warnings"]
+
+
+def test_a_valid_snapshot_does_not_get_the_missing_date_warning(monkeypatch):
+    """The warning must mean something - a normal result with a real
+    AuditDate must not carry it."""
+    _enable_v1(monkeypatch)
+    segment = _call_segment_mix(monkeypatch, [_segment_row("Transient", "Public Indirect", 800_000.0, audit_date="2026-08-26")])
+    fnb = _call_fnb(monkeypatch, [_fnb_row("Restaurant", "Restaurant", 102_700.0, audit_date="2026-08-26")])
+    for result in (segment, fnb):
+        assert MISSING_SNAPSHOT_DATE_WARNING not in result["quality"]["warnings"]
+
+
+def test_missing_snapshot_date_warning_uses_the_existing_quality_field_only(monkeypatch):
+    """No parallel warnings channel was introduced - the warning lives in
+    quality.warnings, the field the contract already had."""
+    _enable_v1(monkeypatch)
+    result = _call_segment_mix(monkeypatch, [_segment_row("Transient", "Public Indirect", 800_000.0, audit_date=None)])
+    assert set(result["quality"].keys()) == {"isPartial", "warnings"}
+    assert MISSING_SNAPSHOT_DATE_WARNING not in json.dumps(result["context"])
+    assert MISSING_SNAPSHOT_DATE_WARNING not in json.dumps(result["dataset"])
 
 
 def test_every_breakdown_report_action_resolves_in_the_action_registry(monkeypatch):

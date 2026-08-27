@@ -7,7 +7,9 @@ builder that accepts an arbitrary measure/dimension string, a hotel name,
 or raw DAX.
 """
 
+from dataclasses import dataclass
 from enum import Enum
+from typing import Callable, Optional
 
 
 class Report(Enum):
@@ -68,3 +70,52 @@ class Measure(Enum):
     HOLDINGS_PCT_OCCUPIED = "holdings_pct_occupied"
     HOLDINGS_ARRIVAL_ROOMS = "holdings_arrival_rooms"
     HOLDINGS_DEPARTURE_ROOMS = "holdings_departure_rooms"
+
+
+@dataclass(frozen=True)
+class ReportDefinition:
+    """The single per-report metadata record - what used to be five
+    separately-maintained, Report-keyed dicts scattered across
+    tools/dmr_tools.py (`_DAYS_DEFAULTS`, `_DATE_FIELD_BY_REPORT`,
+    `_EMPTY_MESSAGES`, `_ANALYTICS_ENABLED_REPORTS`) plus an if/elif chain
+    picking the right `analytics/*.py` builder. One `ReportDefinition` per
+    `Report` says everything the tool-execution boundary needs to know about
+    that report, without the tool layer having to know anything about the
+    report's actual business logic.
+
+    A pure structural type - lives in dmr core (this module) rather than the
+    tools layer that assembles concrete instances, since concrete instances
+    reference `analytics/*.py` builder functions and dmr core must never
+    import analytics (see test_dmr_semantics_module_never_imports_analytics
+    and this project's dependency-direction rule: dmr core <- analytics <-
+    tools). See tools/report_registry.py for the actual REPORT_DEFINITIONS
+    table built from this shape.
+    """
+
+    report: "Report"
+    tool_name: str
+    # DAY-WINDOW POLICY IS NOT OWNED HERE. `dmr/dax_query_builder.py` owns it
+    # (`_DEFAULT_DAYS`, `MAX_DAYS`/`_MAX_DAYS_OVERRIDE`) because it's
+    # executable policy - the ceiling exists to bound what a query may
+    # actually return, and `_clamp_days` enforces it internally regardless of
+    # what any other layer believes. These two fields only EXPOSE that policy
+    # to the tool boundary so `_execute_report`/`_validate_days` can reject an
+    # out-of-range request without importing query-building internals.
+    # tools/report_registry.py populates them by CALLING
+    # dax_query_builder.default_days_for()/max_days_for() - it must never
+    # redeclare a numeric limit of its own, or the registry and the executed
+    # query could disagree (see tests/test_report_registry.py).
+    default_days: Optional[int]
+    max_days: Optional[int]
+    business_date_field: Optional[str]
+    empty_message: str
+    # None for a report with no analytics-contract builder yet (holdings
+    # outlook). `analytics_enabled` is deliberately NOT a separate stored
+    # field - it's derived below so it can never drift from whether a
+    # builder actually exists (the exact class of bug a hand-set boolean
+    # next to a hand-set callable would risk).
+    analytics_builder: Optional[Callable[..., object]] = None
+
+    @property
+    def analytics_enabled(self) -> bool:
+        return self.analytics_builder is not None

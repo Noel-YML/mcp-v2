@@ -462,7 +462,12 @@ SEMANTICS["fnb.revenue.ly_mtd"] = MetricSemantics(
     key="fnb.revenue.ly_mtd",
     domain="fnb",
     business_name="F&B Revenue Last Year (Same Month)",
-    curated_measure="[FNB: Revenue (Last Year Month)]",
+    # Was "[FNB: Revenue (Last Year Month)]" - that name never existed in
+    # the live model and 400'd every get_dmr_fnb_performance call until
+    # measures.py was corrected (Aug 2026 UC3 live acceptance). This entry
+    # had drifted from that fix - see test_execution_semantics_consistency.py
+    # for the test that now prevents this class of drift.
+    curated_measure="[FNB: Revenue (LY MTD)]",
     lineage_state="DECLARED",
     queryability="SUPPORTED",
     source_table=FNB_TABLE,

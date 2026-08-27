@@ -2,6 +2,12 @@
 
 DMR (Daily Management Report) tools for Ask ARIEL, on the official [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk) v2. The earlier customer-facing product-automation tools (`get_product_automation_metrics`, `list_available_products`, `get_product_automation_trend`) and their two Agent Skills have been removed — this build is DMR-only now.
 
+> **Related documentation**
+> - [`docs/system-manifest.md`](../docs/system-manifest.md) — the whole-system reference: how `mcp/`, `webchat/`, and the Foundry agent fit together, the request flow, the security and semantic models, reconciliation, and what is deployed vs. built-but-not-deployed.
+> - [`docs/how-ariel-works.md`](../docs/how-ariel-works.md) — the same system explained for non-engineering readers.
+>
+> This README stays focused on working *inside* `mcp/`.
+
 ## Why DAX didn't work at first (and does now)
 
 The DMR Power BI semantic model initially returned `401 Unauthorized` for every query from this service principal, no matter what was granted:
@@ -65,9 +71,10 @@ mcp/
 │   ├── dax_query_builder.py       <- build(spec, scope) - the only entry point; requires a verified ScopeContext
 │   ├── measure_guard.py           <- scan for filter-removing DAX in measures (see caveat in that file - currently blocked on data access)
 │   ├── semantics.py               <- business-semantics registry (aggregation type, capabilities, lineage/queryability state, reconciliation relationships) - the single source of truth analytics/columns.py and analytics/facts.py consult, never re-declared
-│   └── reconciliation.py          <- reconcile() - compares two already-fetched values against a registered semantics.py relationship (PASS/FAIL/NOT_APPLICABLE/INSUFFICIENT_DATA)
+│   └── reconciliation.py          <- reconcile() - compares two already-fetched values against a registered semantics.py relationship (PASS/FAIL/NOT_APPLICABLE/INSUFFICIENT_DATA); the relationship itself lives in semantics.py, this module only ever executes an already-fetched comparison
 ├── tools/
-│   └── dmr_tools.py                <- the 5 DMR tools (no scope arg), one shared _execute_report path, result-row verification, TOOL_NAMES
+│   ├── report_registry.py         <- REPORT_DEFINITIONS: dict[Report, ReportDefinition] - the one place default/max days, the empty-result message, the business-date field, and the analytics builder are bound per report
+│   └── dmr_tools.py                <- the 5 DMR tools (no scope arg), one shared _execute_report path (reads REPORT_DEFINITIONS instead of report-specific branching), result-row verification, TOOL_NAMES (derived from the registry)
 ├── analytics/                      <- the versioned "rich answer" contract - 4 of 5 tools now (see below)
 │   ├── contract.py                 <- AnalyticsResult pydantic models (the versioned response shape, shared by every report)
 │   ├── columns.py                  <- per-column semantics: additive / non-additive / rate, currency, etc.
@@ -96,13 +103,14 @@ they can be tested against a hand-written fake instead of live Fabric.
 
 | Task | Files |
 |---|---|
-| **Change what an existing tool returns, or its `days` limits** | `tools/dmr_tools.py` (the tool function + `_execute_report`/`_validate_days`) and `dmr/dax_query_builder.py` (the actual query) |
-| **Add a brand-new tool** | 1) `dmr/reports.py` - add a `Report` enum value, and `Measure` values for any new metrics. 2) `dmr/measures.py` - map each new `Measure` to its real DAX expression (verified against the live model, never guessed). 3) `dmr/dax_query_builder.py` - add a `_build_..._query()` function and wire it into `build()`. 4) `tools/dmr_tools.py` - add the module-level function, an `_EMPTY_MESSAGES` entry, and register it in both `register()` (for `server.py`) and as an `@app.mcp_tool_trigger` (in `function_app.py`). 5) Add it to `TOOL_NAMES` in `tools/dmr_tools.py`. |
-| **Add a new table/measures to an existing tool** | `dmr/measures.py` (the table constant + measure DAX mappings) and `dmr/reports.py` (the `Measure` enum values) - never invent a measure name; it has to be confirmed against the real model first |
+| **Change a report's `days` default or ceiling** | `dmr/dax_query_builder.py` only — `_DEFAULT_DAYS` and `MAX_DAYS`/`_MAX_DAYS_OVERRIDE` own this policy. `tools/report_registry.py` copies the values via `default_days_for()`/`max_days_for()` and must never hard-code a number; `analytics/actions.py` resolves the same ceiling for its advertised `change_period`/`change_snapshot_window` maximum. Enforced by `tests/test_report_registry.py`. |
+| **Change what an existing tool returns (rows, message, date field)** | `tools/report_registry.py` (`empty_message`/`business_date_field` on that report's `ReportDefinition`), `tools/dmr_tools.py` (`_execute_report`, which just reads the definition), and `dmr/dax_query_builder.py` (the actual query) |
+| **Add a brand-new tool** | 1) `dmr/reports.py` - add a `Report` enum value, and `Measure` values for any new metrics. 2) `dmr/measures.py` - map each new `Measure` to its real DAX expression (verified against the live model, never guessed). 3) `dmr/dax_query_builder.py` - add a `_build_..._query()` function and wire it into `build()`. 4) `tools/report_registry.py` - add a `ReportDefinition` entry (tool name, default/max days, business-date field, empty message, analytics builder). 5) `tools/dmr_tools.py` - add the module-level function and register it in both `register()` (for `server.py`) and as an `@app.mcp_tool_trigger` (in `function_app.py`). `TOOL_NAMES` picks the new tool up automatically - it's derived from the registry, not separately maintained. |
+| **Add a new table/measures to an existing tool** | `dmr/measures.py` (the table constant + measure DAX mappings) and `dmr/reports.py` (the `Measure` enum values) - never invent a measure name; it has to be confirmed against the real model first, and must agree with any `dmr/semantics.py` entry that names the same curated measure (see `tests/test_execution_semantics_consistency.py`) |
 | **Change hotel-scope/security logic (the JWT itself)** | `scope/scope_token.py` (mint/verify) and `scope/scope_context.py` (the verified, frozen record) |
 | **Change how a tool's error/empty/success response is shaped** | `fabric_client/result.py` (`ErrorCode`, `ToolError`, `FabricQueryResult`) |
 | **Change Fabric connection behavior** (retries, timeouts, response-size caps) | `fabric_client/service.py` |
-| **Add the "rich answer" treatment (charts hints, facts, semantic columns) to a new tool** | `analytics/` - add a sibling to `revenue_trend.py`, plus columns/facts for that report; wire it into `tools/dmr_tools.py`'s `_execute_report` the same way `get_dmr_revenue_trend` is wired today |
+| **Add the "rich answer" treatment (charts hints, facts, semantic columns) to a new tool** | `analytics/` - add a sibling to `revenue_trend.py`, plus columns/facts for that report; add its `build` function to that report's `ReportDefinition` in `tools/report_registry.py` (`_execute_report` calls whichever builder the registry names - no per-report branching to edit) |
 | **Change health/status checks, or the `ariel://status` resource** | `health.py` (shared logic), then `server.py`'s `@mcp.resource` or `function_app.py`'s `@app.mcp_resource_trigger` |
 | **Change deployment/runtime config** (env vars, auth mode) | `config.py`, and `host.json`/`local.settings.json` for local dev |
 | **Add tests for any of the above** | `tests/` - flat folder, one file per source module regardless of that module's own folder (e.g. `tests/test_dax_query_builder.py` tests `dmr/dax_query_builder.py`) |
