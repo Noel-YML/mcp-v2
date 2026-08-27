@@ -44,7 +44,7 @@ import config  # noqa: E402
 from dmr import dax_query_builder  # noqa: E402
 from dmr.dax_query_builder import HoldingsPaceRequest  # noqa: E402
 from dmr.holdings_pace_reference import RawHoldingsRow, resolve_holdings_pace_same_point_last_year  # noqa: E402
-from dmr.measures import HOLDINGS_PACE_COLUMNS, HOLDINGS_TABLE  # noqa: E402
+from dmr.measures import HOLDINGS_TABLE  # noqa: E402
 from dmr.named_queries import QueryId  # noqa: E402
 from dmr.pace_dates import shift_one_year  # noqa: E402
 from fabric_client.service import FabricQueryService  # noqa: E402
@@ -88,11 +88,17 @@ def _parse_date(value) -> date:
 
 
 def _fetch_raw_holdings_rows(service: FabricQueryService, hotel_id: int, windows: list[tuple[date, date]]) -> list[RawHoldingsRow]:
-    """Deliberately independent of dax_query_builder.build_named() - a
-    plain, unfiltered-by-snapshot pull of raw mart rows, bounded only to the
-    SelDate ranges actually needed (current window + its calendar-shifted
-    same-point-last-year window) so this stays practical against a large
-    live table.
+    """Deliberately independent of dax_query_builder.build_named() - and
+    deliberately NOT SUMMARIZECOLUMNS. SUMMARIZECOLUMNS groups by
+    (Hotel_ID, AuditDate, SelDate) and SUMs within each group, which would
+    silently collapse two physical duplicate-grain rows into one summed
+    row - exactly the condition source_row_count > 1 exists to detect. A
+    "raw extraction" that itself de-duplicates could never prove that guard
+    works against real data. This instead SELECTCOLUMNS()'s a
+    CALCULATETABLE-filtered projection of the base table directly - one
+    output row per PHYSICAL mart row, no grouping/aggregation at all - so a
+    real duplicate at the same grain still appears as two separate rows
+    here, exactly as resolve_holdings_pace_same_point_last_year() expects.
     """
     conditions = " || ".join(
         f"({HOLDINGS_TABLE}[SelDate] >= DATE({s.year},{s.month},{s.day}) && "
@@ -101,21 +107,22 @@ def _fetch_raw_holdings_rows(service: FabricQueryService, hotel_id: int, windows
     )
     dax_query = f"""
     EVALUATE
-    CALCULATETABLE(
-        SUMMARIZECOLUMNS(
-            {HOLDINGS_TABLE}[Hotel_ID],
-            {HOLDINGS_TABLE}[AuditDate],
-            {HOLDINGS_TABLE}[SelDate],
-            "NoOfRooms", SUM({HOLDINGS_TABLE}[NoOfRooms]),
-            "RoomRevenue", SUM({HOLDINGS_TABLE}[Room_Revenue]),
-            "ArrivalRooms", SUM({HOLDINGS_TABLE}[ArrivalRooms]),
-            "DepartureRooms", SUM({HOLDINGS_TABLE}[DepartureRooms]),
-            "NoOfGuest", SUM({HOLDINGS_TABLE}[NoOfGuest]),
-            "RoomsAvailable", SUM({HOLDINGS_TABLE}[Rooms_Available])
+    SELECTCOLUMNS(
+        CALCULATETABLE(
+            {HOLDINGS_TABLE},
+            _Hotels[Hotel_ID] = {int(hotel_id)},
+            {HOLDINGS_TABLE}[Hotel_ID] = {int(hotel_id)},
+            FILTER({HOLDINGS_TABLE}, {conditions})
         ),
-        _Hotels[Hotel_ID] = {int(hotel_id)},
-        {HOLDINGS_TABLE}[Hotel_ID] = {int(hotel_id)},
-        FILTER({HOLDINGS_TABLE}, {conditions})
+        "Hotel_ID", {HOLDINGS_TABLE}[Hotel_ID],
+        "AuditDate", {HOLDINGS_TABLE}[AuditDate],
+        "SelDate", {HOLDINGS_TABLE}[SelDate],
+        "NoOfRooms", {HOLDINGS_TABLE}[NoOfRooms],
+        "RoomRevenue", {HOLDINGS_TABLE}[Room_Revenue],
+        "ArrivalRooms", {HOLDINGS_TABLE}[ArrivalRooms],
+        "DepartureRooms", {HOLDINGS_TABLE}[DepartureRooms],
+        "NoOfGuest", {HOLDINGS_TABLE}[NoOfGuest],
+        "RoomsAvailable", {HOLDINGS_TABLE}[Rooms_Available]
     )
     """
     result = service.run_query(dax_query)
@@ -141,11 +148,21 @@ def _fetch_raw_holdings_rows(service: FabricQueryService, hotel_id: int, windows
     return raw_rows
 
 
-def _parse_named_query_rows(rows: list[dict]) -> dict[tuple[str, int], dict]:
-    parsed = {}
+def _parse_named_query_rows(rows: list[dict], expected_keys: set[tuple[str, int]]) -> dict[tuple[str, int], dict]:
+    """Rejects - rather than silently overwriting - a duplicate (side,
+    stay_day_index) key, and rejects any key outside the exact set the
+    request should produce. A silent overwrite would hide the named query
+    itself returning a malformed/duplicated row set, which is exactly the
+    kind of contract violation this script exists to catch.
+    """
+    parsed: dict[tuple[str, int], dict] = {}
     for row in rows or []:
         cleaned = _clean(row)
         key = (cleaned["Side"], int(cleaned["StayDayIndex"]))
+        if key not in expected_keys:
+            raise SystemExit(f"Named query returned an unexpected (side, stay_day_index) key: {key!r}")
+        if key in parsed:
+            raise SystemExit(f"Named query returned MORE THAN ONE row for key {key!r} - refusing to silently pick one.")
         parsed[key] = cleaned
     return parsed
 
@@ -191,7 +208,9 @@ def main() -> None:
     if named_result.error is not None:
         print(f"Named query failed: {named_result.error.to_json()}")
         sys.exit(1)
-    named_rows = _parse_named_query_rows(named_result.rows)
+    window_length = (stay_end - stay_start).days + 1
+    expected_keys = {(side, index) for side in ("current", "comparator") for index in range(window_length)}
+    named_rows = _parse_named_query_rows(named_result.rows, expected_keys)
     print(json.dumps({f"{k[0]}/{k[1]}": v for k, v in named_rows.items()}, indent=2, default=str))
 
     print()
@@ -207,33 +226,58 @@ def main() -> None:
 
     print()
     print("=" * 80)
-    print("STEP 5: Field-by-field diff (named-query output vs. reference oracle)")
+    print("STEP 5: Full-contract field-by-field diff (named-query output vs. reference oracle)")
     print("=" * 80)
+    # (reference field name, named-query DAX alias, comparison kind) - covers
+    # every field in the v1 output contract, not just the numeric metrics.
+    # "date"/"date_or_none" fields go through _parse_date on both sides so a
+    # string-vs-date.date() type mismatch never masquerades as a real diff.
+    _FIELD_SPECS = [
+        ("stay_date", "StayDate", "date"),
+        ("requested_as_of_date", "RequestedAsOfDate", "date"),
+        ("effective_audit_date", "EffectiveAuditDate", "date_or_none"),
+        ("rooms", "Rooms", "value"),
+        ("room_revenue", "RoomRevenue", "value"),
+        ("arrival_rooms", "ArrivalRooms", "value"),
+        ("departure_rooms", "DepartureRooms", "value"),
+        ("guests", "Guests", "value"),
+        ("rooms_available", "RoomsAvailable", "value"),
+        ("source_row_count", "SourceRowCount", "value"),
+        ("hotel_id", "HotelId", "value"),
+    ]
+
+    def _normalize(value, kind):
+        if value is None:
+            return None
+        if kind in ("date", "date_or_none"):
+            return _parse_date(value)
+        return value
+
     mismatches = []
-    fields = ["rooms", "room_revenue", "arrival_rooms", "departure_rooms", "guests", "rooms_available", "source_row_count"]
-    named_field_map = {
-        "rooms": "Rooms", "room_revenue": "RoomRevenue", "arrival_rooms": "ArrivalRooms",
-        "departure_rooms": "DepartureRooms", "guests": "Guests", "rooms_available": "RoomsAvailable",
-        "source_row_count": "SourceRowCount",
-    }
+    unmatched_expected_keys = set(expected_keys)
     for ref_row in reference_rows:
         key = (ref_row.side, ref_row.stay_day_index)
+        unmatched_expected_keys.discard(key)
         named_row = named_rows.get(key)
         if named_row is None:
             mismatches.append(f"{key}: named query returned no row at all")
             continue
-        for field in fields:
-            expected = getattr(ref_row, field)
-            actual = named_row.get(named_field_map[field])
-            if expected != actual and not (expected is None and actual is None):
-                mismatches.append(f"{key}.{field}: reference={expected!r} named_query={actual!r}")
+        for ref_field, dax_alias, kind in _FIELD_SPECS:
+            expected = _normalize(getattr(ref_row, ref_field), kind)
+            actual = _normalize(named_row.get(dax_alias), kind)
+            if expected != actual:
+                mismatches.append(f"{key}.{ref_field}: reference={expected!r} named_query={actual!r}")
+
+    if unmatched_expected_keys:
+        mismatches.append(f"reference oracle produced no row at all for: {sorted(unmatched_expected_keys)}")
 
     if mismatches:
         print(f"{len(mismatches)} MISMATCH(ES):")
         for m in mismatches:
             print(f"  - {m}")
         sys.exit(1)
-    print("All fields match between the reference oracle and the live named-query output.")
+    print("All fields (including stay_date, requested_as_of_date, effective_audit_date, and hotel_id) "
+          "match between the reference oracle and the live named-query output.")
 
 
 if __name__ == "__main__":

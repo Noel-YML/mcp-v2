@@ -391,7 +391,25 @@ if {raw for raw, _ in _PACE_METRIC_COLUMNS} != set(HOLDINGS_PACE_COLUMNS):
     )
 
 
-def _pace_metric_column_blocks(stay_date_ref: str, effective_date_ref: str) -> str:
+# Fixed, non-metric column aliases the final SELECTCOLUMNS projects, in
+# order - defined once here so the SELECTCOLUMNS argument list (below) is
+# built from a single source instead of being hand-typed twice (once per
+# side), and so named_queries.py's OutputField.dax_alias entries can be
+# tested for agreement against this exact list rather than against a
+# hand-copied duplicate - see test_dax_query_builder.py::
+# test_output_field_dax_aliases_agree_with_the_generated_query.
+_PACE_LEADING_OUTPUT_ALIASES: tuple[str, ...] = ("Side", "StayDayIndex", "StayDate", "RequestedAsOfDate", "EffectiveAuditDate")
+_PACE_TRAILING_OUTPUT_ALIASES: tuple[str, ...] = ("SourceRowCount", "HotelId")
+_PACE_OUTPUT_COLUMN_ALIASES: tuple[str, ...] = (
+    _PACE_LEADING_OUTPUT_ALIASES + tuple(alias for _, alias in _PACE_METRIC_COLUMNS) + _PACE_TRAILING_OUTPUT_ALIASES
+)
+
+
+def _pace_select_columns_args() -> str:
+    return ",\n                ".join(f'"{alias}", [{alias}]' for alias in _PACE_OUTPUT_COLUMN_ALIASES)
+
+
+def _pace_metric_column_blocks(hotel_id: int, stay_date_ref: str, effective_date_ref: str) -> str:
     """One ADDCOLUMNS "Name", expr pair per raw column. Each block
     independently VAR-captures the stay date and resolved AuditDate from the
     OUTER (already-materialized) resolved-spine table columns named by
@@ -402,6 +420,16 @@ def _pace_metric_column_blocks(stay_date_ref: str, effective_date_ref: str) -> s
     metric block, even though all 6 are added in one ADDCOLUMNS call).
     Explicitly branches on ISBLANK(effective date) rather than relying on
     `AuditDate = BLANK()` filtering behavior to produce the null.
+
+    Every metric CALCULATE also filters `_Hotels[Hotel_ID]`/`Holdings[Hotel_ID]`
+    directly - the same "filter both, never rely on relationship propagation
+    alone" discipline every other query in this module already uses.
+    EffectiveAuditDate's own resolution (in the resolved-spine stage above)
+    is already hotel-scoped, but that does NOT make the aggregation stage
+    automatically hotel-scoped too: without this filter, a metric CALCULATE
+    would happily sum every hotel's rows that share this exact
+    (SelDate, AuditDate) pair - a real cross-hotel leak in the aggregate,
+    not just a row-count coincidence.
     """
     blocks = []
     for raw_column, alias in _PACE_METRIC_COLUMNS:
@@ -414,12 +442,40 @@ def _pace_metric_column_blocks(stay_date_ref: str, effective_date_ref: str) -> s
             f"                        BLANK(),\n"
             f"                        CALCULATE(\n"
             f"                            SUM({HOLDINGS_TABLE}[{raw_column}]),\n"
+            f"                            _Hotels[Hotel_ID] = {int(hotel_id)},\n"
+            f"                            {HOLDINGS_TABLE}[Hotel_ID] = {int(hotel_id)},\n"
             f"                            {HOLDINGS_TABLE}[SelDate] = __StayDate,\n"
             f"                            {HOLDINGS_TABLE}[AuditDate] = __EffectiveDate\n"
             f"                        )\n"
             f"                    )"
         )
     return ",\n                ".join(blocks)
+
+
+def _pace_source_row_count_block(hotel_id: int, stay_date_ref: str, effective_date_ref: str) -> str:
+    """The SourceRowCount column - same hotel-scoping requirement as every
+    metric block above, for the same reason: COUNTROWS() over an
+    un-hotel-filtered CALCULATE would count every hotel's rows at this
+    (SelDate, AuditDate), not just the authorized hotel's - which would make
+    the duplicate-grain quality signal (source_row_count > 1) meaningless
+    (or worse, falsely triggered by an entirely different hotel's row).
+    """
+    return (
+        '"SourceRowCount",\n'
+        f"                    VAR __StayDate = {stay_date_ref}\n"
+        f"                    VAR __EffectiveDate = {effective_date_ref}\n"
+        f"                    RETURN IF(\n"
+        f"                        ISBLANK(__EffectiveDate),\n"
+        f"                        0,\n"
+        f"                        CALCULATE(\n"
+        f"                            COUNTROWS({HOLDINGS_TABLE}),\n"
+        f"                            _Hotels[Hotel_ID] = {int(hotel_id)},\n"
+        f"                            {HOLDINGS_TABLE}[Hotel_ID] = {int(hotel_id)},\n"
+        f"                            {HOLDINGS_TABLE}[SelDate] = __StayDate,\n"
+        f"                            {HOLDINGS_TABLE}[AuditDate] = __EffectiveDate\n"
+        f"                        )\n"
+        f"                    )"
+    )
 
 
 def _build_holdings_pace_same_point_last_year_query(hotel_id: int, request: HoldingsPaceRequest) -> str:
@@ -455,8 +511,11 @@ def _build_holdings_pace_same_point_last_year_query(hotel_id: int, request: Hold
     stay_end = _dax_date_literal(request.stay_end)
     as_of = _dax_date_literal(request.as_of_date)
 
-    current_metrics = _pace_metric_column_blocks("[Date]", "[EffectiveAuditDate]")
-    comparator_metrics = _pace_metric_column_blocks("[ComparatorStayDate]", "[EffectiveAuditDate]")
+    current_metrics = _pace_metric_column_blocks(hotel_id, "[Date]", "[EffectiveAuditDate]")
+    comparator_metrics = _pace_metric_column_blocks(hotel_id, "[ComparatorStayDate]", "[EffectiveAuditDate]")
+    current_source_row_count = _pace_source_row_count_block(hotel_id, "[Date]", "[EffectiveAuditDate]")
+    comparator_source_row_count = _pace_source_row_count_block(hotel_id, "[ComparatorStayDate]", "[EffectiveAuditDate]")
+    select_columns_args = _pace_select_columns_args()
 
     return f"""
     DEFINE
@@ -503,18 +562,7 @@ def _build_holdings_pace_same_point_last_year_query(hotel_id: int, request: Hold
                 "StayDate", [Date],
                 "RequestedAsOfDate", {as_of},
                 {current_metrics},
-                "SourceRowCount",
-                    VAR __StayDate = [Date]
-                    VAR __EffectiveDate = [EffectiveAuditDate]
-                    RETURN IF(
-                        ISBLANK(__EffectiveDate),
-                        0,
-                        CALCULATE(
-                            COUNTROWS({HOLDINGS_TABLE}),
-                            {HOLDINGS_TABLE}[SelDate] = __StayDate,
-                            {HOLDINGS_TABLE}[AuditDate] = __EffectiveDate
-                        )
-                    ),
+                {current_source_row_count},
                 "HotelId", {int(hotel_id)}
             )
 
@@ -525,18 +573,7 @@ def _build_holdings_pace_same_point_last_year_query(hotel_id: int, request: Hold
                 "StayDate", [ComparatorStayDate],
                 "RequestedAsOfDate", EDATE({as_of}, -12),
                 {comparator_metrics},
-                "SourceRowCount",
-                    VAR __StayDate = [ComparatorStayDate]
-                    VAR __EffectiveDate = [EffectiveAuditDate]
-                    RETURN IF(
-                        ISBLANK(__EffectiveDate),
-                        0,
-                        CALCULATE(
-                            COUNTROWS({HOLDINGS_TABLE}),
-                            {HOLDINGS_TABLE}[SelDate] = __StayDate,
-                            {HOLDINGS_TABLE}[AuditDate] = __EffectiveDate
-                        )
-                    ),
+                {comparator_source_row_count},
                 "HotelId", {int(hotel_id)}
             )
 
@@ -544,19 +581,11 @@ def _build_holdings_pace_same_point_last_year_query(hotel_id: int, request: Hold
         UNION(
             SELECTCOLUMNS(
                 __CurrentRows,
-                "Side", [Side], "StayDayIndex", [StayDayIndex], "StayDate", [StayDate],
-                "RequestedAsOfDate", [RequestedAsOfDate], "EffectiveAuditDate", [EffectiveAuditDate],
-                "Rooms", [Rooms], "RoomRevenue", [RoomRevenue], "ArrivalRooms", [ArrivalRooms],
-                "DepartureRooms", [DepartureRooms], "Guests", [Guests], "RoomsAvailable", [RoomsAvailable],
-                "SourceRowCount", [SourceRowCount], "HotelId", [HotelId]
+                {select_columns_args}
             ),
             SELECTCOLUMNS(
                 __ComparatorRows,
-                "Side", [Side], "StayDayIndex", [StayDayIndex], "StayDate", [StayDate],
-                "RequestedAsOfDate", [RequestedAsOfDate], "EffectiveAuditDate", [EffectiveAuditDate],
-                "Rooms", [Rooms], "RoomRevenue", [RoomRevenue], "ArrivalRooms", [ArrivalRooms],
-                "DepartureRooms", [DepartureRooms], "Guests", [Guests], "RoomsAvailable", [RoomsAvailable],
-                "SourceRowCount", [SourceRowCount], "HotelId", [HotelId]
+                {select_columns_args}
             )
         )
     ORDER BY [Side] DESC, [StayDayIndex] ASC

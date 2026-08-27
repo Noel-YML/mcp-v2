@@ -260,6 +260,10 @@ def test_holdings_pace_query_explicitly_branches_on_isblank_rather_than_relying_
 
 
 def test_holdings_pace_query_projects_hotel_id_internally():
+    """The literal HotelId echo alone proves nothing about whether the
+    AGGREGATES were hotel-scoped - it's just a passthrough constant. This
+    only checks the echo column exists; the real scoping proof is the
+    per-block tests below."""
     query = dax_query_builder.build_named(QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1, _PACE_REQUEST, _SCOPE)
     assert f"{_SCOPE.hotel_id}" in query
     assert '"HotelId"' in query
@@ -277,3 +281,89 @@ def test_holdings_pace_query_pairs_sides_by_stay_day_index_not_row_order():
     assert '"Side"' in query
     assert '"current"' in query
     assert '"comparator"' in query
+
+
+# ---------------------------------------------------------------------------
+# Hotel scoping of the AGGREGATION stage - the critical correction. Snapshot
+# resolution (EffectiveAuditDate) was always hotel-scoped; the metric SUMs
+# and SourceRowCount COUNTROWS were not, which is a real cross-hotel leak in
+# the aggregate (two hotels sharing a (SelDate, AuditDate) pair would sum
+# together) even though the resolved date and the echoed HotelId both look
+# correct. These tests inspect each metric's own CALCULATE block, not just
+# "does the hotel id appear somewhere in the query text."
+# ---------------------------------------------------------------------------
+
+_PACE_METRIC_ALIASES = [alias for _, alias in dax_query_builder._PACE_METRIC_COLUMNS]  # Rooms, RoomRevenue, ...
+_PACE_ALIAS_SEQUENCE = _PACE_METRIC_ALIASES + ["SourceRowCount"]  # the fixed order each side's ADDCOLUMNS adds them in
+
+
+def _side_region(query: str, side_var: str, next_side_var: str | None) -> str:
+    start = query.index(f"VAR {side_var} =")
+    end = query.index(f"VAR {next_side_var} =", start) if next_side_var else len(query)
+    return query[start:end]
+
+
+def _own_block(side_region: str, alias: str) -> str:
+    """The text of exactly one column's own "Name", expr definition within
+    a side's ADDCOLUMNS call - bounded by the next column in the fixed
+    declaration order, so it can never accidentally include a sibling
+    block's filters."""
+    index_in_sequence = _PACE_ALIAS_SEQUENCE.index(alias)
+    start = side_region.index(f'"{alias}",')
+    if index_in_sequence + 1 < len(_PACE_ALIAS_SEQUENCE):
+        next_alias = _PACE_ALIAS_SEQUENCE[index_in_sequence + 1]
+        end = side_region.index(f'"{next_alias}",', start)
+    else:
+        end = side_region.index('"HotelId",', start)
+    return side_region[start:end]
+
+
+@pytest.mark.parametrize("alias", _PACE_METRIC_ALIASES)
+@pytest.mark.parametrize("side_var,next_side_var", [("__CurrentRows", "__ComparatorRows"), ("__ComparatorRows", None)])
+def test_every_holdings_pace_metric_aggregation_is_explicitly_hotel_filtered(side_var, next_side_var, alias):
+    """Every metric's own CALCULATE - not the query as a whole - must
+    filter both _Hotels[Hotel_ID] and the mart table's own Hotel_ID column,
+    exactly like every other report's aggregation in this module.
+    """
+    query = dax_query_builder.build_named(QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1, _PACE_REQUEST, _SCOPE)
+    block = _own_block(_side_region(query, side_var, next_side_var), alias)
+    assert f"_Hotels[Hotel_ID] = {_SCOPE.hotel_id}" in block, f"{side_var}.{alias} is missing the _Hotels hotel filter"
+    assert f"{dax_query_builder.HOLDINGS_TABLE}[Hotel_ID] = {_SCOPE.hotel_id}" in block, f"{side_var}.{alias} is missing the mart-table hotel filter"
+    assert "CALCULATE(" in block  # sanity check this is really the block, not an empty slice
+
+
+@pytest.mark.parametrize("side_var,next_side_var", [("__CurrentRows", "__ComparatorRows"), ("__ComparatorRows", None)])
+def test_source_row_count_is_explicitly_hotel_filtered(side_var, next_side_var):
+    """A COUNTROWS() without a hotel filter would count every hotel's rows
+    at this (SelDate, AuditDate) - making source_row_count > 1 meaningless
+    (it could fire for a different hotel's unrelated row, not a real
+    duplicate within the authorized hotel's own data).
+    """
+    query = dax_query_builder.build_named(QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1, _PACE_REQUEST, _SCOPE)
+    block = _own_block(_side_region(query, side_var, next_side_var), "SourceRowCount")
+    assert f"_Hotels[Hotel_ID] = {_SCOPE.hotel_id}" in block
+    assert f"{dax_query_builder.HOLDINGS_TABLE}[Hotel_ID] = {_SCOPE.hotel_id}" in block
+    assert "COUNTROWS(" in block
+
+
+def test_hotel_filter_occurrence_count_matches_every_aggregation_block_exactly():
+    """A precise cross-check on top of the per-block tests above: exactly
+    one (_Hotels[Hotel_ID] = X, Holdings[Hotel_ID] = X) filter pair per
+    snapshot-resolution CALCULATE (2, one per side) + per metric CALCULATE
+    (6 metrics x 2 sides = 12) + per SourceRowCount CALCULATE (2, one per
+    side) = 16 occurrences of each filter. A regression that drops the
+    filter from even one block would change this count.
+    """
+    query = dax_query_builder.build_named(QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1, _PACE_REQUEST, _SCOPE)
+    expected = 2 + (6 * 2) + 2
+    assert query.count(f"_Hotels[Hotel_ID] = {_SCOPE.hotel_id}") == expected
+    assert query.count(f"{dax_query_builder.HOLDINGS_TABLE}[Hotel_ID] = {_SCOPE.hotel_id}") == expected
+
+
+def test_output_field_dax_aliases_agree_with_the_generated_query():
+    """named_queries.py's contract must not silently drift from what the
+    DAX actually projects - each OutputField.dax_alias must be exactly one
+    of the aliases the generated query's own SELECTCOLUMNS list uses."""
+    definition = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1]
+    declared_aliases = {field.dax_alias for field in definition.output_fields}
+    assert declared_aliases == set(dax_query_builder._PACE_OUTPUT_COLUMN_ALIASES)

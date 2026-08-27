@@ -59,6 +59,15 @@ class OutputField:
     name: str
     type: Literal["string", "date", "int", "float"]
     description: str
+    # The literal DAX/wire alias this field is actually projected under in
+    # the generated query (dax_query_builder.py's SELECTCOLUMNS output) -
+    # e.g. name="stay_day_index" / dax_alias="StayDayIndex". This contract's
+    # `name` is the canonical snake_case field identity; `dax_alias` is the
+    # physical projection name, explicitly modeled rather than assumed
+    # identical - see
+    # test_dax_query_builder.py::test_output_field_dax_aliases_agree_with_the_generated_query,
+    # which proves this set matches dax_query_builder._PACE_OUTPUT_COLUMN_ALIASES exactly.
+    dax_alias: str
 
 
 @dataclass(frozen=True)
@@ -98,19 +107,21 @@ class QueryDefinition:
 
 
 _HOLDINGS_PACE_OUTPUT_FIELDS: tuple[OutputField, ...] = (
-    OutputField("side", "string", 'Which window this row belongs to: "current" or "comparator".'),
+    OutputField("side", "string", 'Which window this row belongs to: "current" or "comparator".', dax_alias="Side"),
     OutputField(
         "stay_day_index",
         "int",
         "0-based offset from stay_start. The pairing key between a current row and its "
         "same-point-last-year comparator row - never infer the pairing from row order.",
+        dax_alias="StayDayIndex",
     ),
-    OutputField("stay_date", "date", "The actual calendar stay date for this row's side."),
+    OutputField("stay_date", "date", "The actual calendar stay date for this row's side.", dax_alias="StayDate"),
     OutputField(
         "requested_as_of_date",
         "date",
         "current side: the literal requested as_of_date. comparator side: that date shifted "
         "back one calendar year (EDATE -12 months).",
+        dax_alias="RequestedAsOfDate",
     ),
     OutputField(
         "effective_audit_date",
@@ -118,25 +129,45 @@ _HOLDINGS_PACE_OUTPUT_FIELDS: tuple[OutputField, ...] = (
         "The resolved snapshot date for this stay date: MAX(AuditDate) where AuditDate <= the "
         "side's requested_as_of_date. Null means no eligible snapshot exists - an explicit "
         "unresolved row, never a silently dropped one.",
+        dax_alias="EffectiveAuditDate",
     ),
-    OutputField("rooms", "int", "SUM(NoOfRooms) at the resolved snapshot. Null when unresolved."),
-    OutputField("room_revenue", "float", "SUM(Room_Revenue) at the resolved snapshot. Null when unresolved."),
-    OutputField("arrival_rooms", "int", "SUM(ArrivalRooms) at the resolved snapshot. Null when unresolved."),
-    OutputField("departure_rooms", "int", "SUM(DepartureRooms) at the resolved snapshot. Null when unresolved."),
-    OutputField("guests", "int", "SUM(NoOfGuest) at the resolved snapshot. Null when unresolved."),
-    OutputField("rooms_available", "int", "SUM(Rooms_Available) at the resolved snapshot. Null when unresolved."),
+    OutputField("rooms", "int", "SUM(NoOfRooms) at the resolved snapshot, hotel-scoped. Null when unresolved.", dax_alias="Rooms"),
+    OutputField(
+        "room_revenue", "float", "SUM(Room_Revenue) at the resolved snapshot, hotel-scoped. Null when unresolved.", dax_alias="RoomRevenue"
+    ),
+    OutputField(
+        "arrival_rooms", "int", "SUM(ArrivalRooms) at the resolved snapshot, hotel-scoped. Null when unresolved.", dax_alias="ArrivalRooms"
+    ),
+    OutputField(
+        "departure_rooms",
+        "int",
+        "SUM(DepartureRooms) at the resolved snapshot, hotel-scoped. Null when unresolved.",
+        dax_alias="DepartureRooms",
+    ),
+    OutputField("guests", "int", "SUM(NoOfGuest) at the resolved snapshot, hotel-scoped. Null when unresolved.", dax_alias="Guests"),
+    OutputField(
+        "rooms_available",
+        "int",
+        "SUM(Rooms_Available) at the resolved snapshot, hotel-scoped. Null when unresolved. See the "
+        "missing_or_zero_rooms_available quality rule - this is the approved occupancy denominator.",
+        dax_alias="RoomsAvailable",
+    ),
     OutputField(
         "source_row_count",
         "int",
-        "Number of raw mart rows matched at the resolved (Hotel_ID, AuditDate, SelDate) grain. "
-        "0 when unresolved, 1 when clean, >1 flags a fail-closed data-quality condition.",
+        "Number of raw mart rows matched at the resolved (Hotel_ID, AuditDate, SelDate) grain, "
+        "hotel-scoped. 0 when unresolved, 1 when clean, >1 flags a fail-closed data-quality condition.",
+        dax_alias="SourceRowCount",
     ),
     OutputField(
         "hotel_id",
         "int",
         "Internal-only - present so a future response-boundary check can reuse the existing "
         "row-verification pattern. Never a model-visible parameter; must be stripped before any "
-        "model-facing result (Phase 3's job - Phase 1 has no response layer yet).",
+        "model-facing result (Phase 3's job - Phase 1 has no response layer yet). Never rely on "
+        "this literal echo alone as proof that a metric aggregation was hotel-scoped - each "
+        "metric's own CALCULATE filters _Hotels[Hotel_ID]/Holdings[Hotel_ID] directly.",
+        dax_alias="HotelId",
     ),
 )
 
@@ -151,6 +182,14 @@ _HOLDINGS_PACE_QUALITY_RULES: tuple[QualityRule, ...] = (
         "More than one raw mart row exists at the resolved (Hotel_ID, AuditDate, SelDate) grain - "
         "summing them overstates rooms/revenue/availability, not merely restates a correct total.",
         policy="block",
+    ),
+    QualityRule(
+        "missing_or_zero_rooms_available",
+        "rooms_available is null or zero for a resolved row - occupancy (SUM(rooms)/SUM(rooms_available)) "
+        "cannot be safely derived without an approved, non-zero denominator. A consuming layer must "
+        "never compute occupancy as 0 or any other fabricated value in that case; the occupancy metric "
+        "stays unresolved for that row even though rooms/revenue may still be valid.",
+        policy="surface_null",
     ),
 )
 

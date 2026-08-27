@@ -42,3 +42,18 @@ def test_duplicate_source_rows_quality_rule_is_a_blocking_policy():
     definition = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1]
     rule = next(r for r in definition.quality_rules if r.name == "duplicate_source_rows")
     assert rule.policy == "block"
+
+
+def test_missing_rooms_available_quality_rule_exists_and_never_fabricates_occupancy():
+    """Occupancy is SUM(rooms)/SUM(rooms_available) - without a real,
+    non-zero rooms_available this must never be computed as 0 or any other
+    fabricated value."""
+    definition = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1]
+    rule = next(r for r in definition.quality_rules if r.name == "missing_or_zero_rooms_available")
+    assert rule.policy == "surface_null"
+
+
+def test_every_output_field_declares_a_dax_alias():
+    definition = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1]
+    for field in definition.output_fields:
+        assert field.dax_alias, f"{field.name} has no dax_alias"
