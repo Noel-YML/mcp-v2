@@ -72,11 +72,13 @@ each day is a multi-row group rather than a single value - see
 """
 
 from dataclasses import dataclass
+from datetime import date
 
 from dmr.measures import (
     FNB_MEASURES,
     FNB_TABLE,
     HOLDINGS_MEASURES,
+    HOLDINGS_PACE_COLUMNS,
     HOLDINGS_TABLE,
     MEASURE_DEFINITIONS,
     REVENUE_MEASURES,
@@ -85,6 +87,7 @@ from dmr.measures import (
     SEGMENT_MEASURES,
     SEGMENT_TABLE,
 )
+from dmr.named_queries import NAMED_QUERY_DEFINITIONS, QueryId
 from dmr.reports import Measure, Report
 from scope.scope_context import ScopeContext
 
@@ -305,3 +308,268 @@ def _build_holdings_outlook_query(hotel_id: int, days: int) -> str:
     )
     ORDER BY {HOLDINGS_TABLE}[SelDate] ASC
     """
+
+
+# ---------------------------------------------------------------------------
+# Holdings pace (UC-01, Phase 1) - a separate, additive entry point.
+#
+# Deliberately NOT folded into build()/QuerySpec/REPORT_DEFINITIONS' shape:
+# HoldingsPaceRequest's fields (a stay window + an as-of date) are
+# meaningless to the 5 reports above, and this query's response is
+# unconditionally the future governed-result contract, not the legacy
+# bare-array/analytics_builder=None branching those 5 share. build() and
+# every _build_*_query function above this line are completely untouched.
+# ---------------------------------------------------------------------------
+
+
+def _require_scope(scope: ScopeContext) -> None:
+    """Only used by build_named() below - build() keeps its own inline
+    isinstance check unmodified, so build()'s already-tested body is not
+    touched at all by this addition.
+    """
+    if not isinstance(scope, ScopeContext):
+        raise ValueError("build_named() requires a verified ScopeContext - refusing to build a query without one.")
+
+
+def _dax_date_literal(d: date) -> str:
+    return f"DATE({d.year}, {d.month}, {d.day})"
+
+
+@dataclass(frozen=True)
+class HoldingsPaceRequest:
+    stay_start: date
+    stay_end: date
+    as_of_date: date
+
+
+def _validate_pace_window(query_id: QueryId, request: HoldingsPaceRequest) -> None:
+    """Rejects - never silently clamps - an invalid window, mirroring
+    _validate_days's discipline in tools/dmr_tools.py.
+
+    Deliberately has NO date.today()/timezone-dependent check: whether a
+    future as_of_date should be rejected, and by whose clock, is a policy
+    decision for the Phase 3 MCP capability boundary, not this deterministic
+    query-building layer. The one guarantee this layer owns - never
+    selecting a snapshot later than the requested as_of_date - is enforced
+    structurally inside the generated DAX's MAX(...) <= as_of filter, not by
+    a wall-clock check here.
+
+    max_stay_window_days is read from NAMED_QUERY_DEFINITIONS, never
+    hand-typed here - the same "one owner, everyone else reads" discipline
+    MAX_DAYS/_DEFAULT_DAYS above already use for the 5 existing reports.
+    """
+    if (
+        not isinstance(request.stay_start, date)
+        or not isinstance(request.stay_end, date)
+        or not isinstance(request.as_of_date, date)
+    ):
+        raise ValueError("stay_start, stay_end, and as_of_date must all be real date values.")
+    if request.stay_end < request.stay_start:
+        raise ValueError("stay_end must be on or after stay_start.")
+    max_days = NAMED_QUERY_DEFINITIONS[query_id].max_stay_window_days
+    window_length = (request.stay_end - request.stay_start).days + 1
+    if window_length > max_days:
+        raise ValueError(f"stay window cannot exceed {max_days} days, got {window_length}.")
+
+
+# (raw column, output alias) pairs - the only raw Holdings columns this
+# query may ever aggregate. Deliberately never the mart's own raw ADR
+# column (see holdings.md ADR in the Phase 1 plan: weighted ADR is
+# SUM(Room_Revenue)/SUM(NoOfRooms), never AVERAGE(ADR) - Phase 3's job once
+# an execution layer exists to compute it).
+_PACE_METRIC_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("NoOfRooms", "Rooms"),
+    ("Room_Revenue", "RoomRevenue"),
+    ("ArrivalRooms", "ArrivalRooms"),
+    ("DepartureRooms", "DepartureRooms"),
+    ("NoOfGuest", "Guests"),
+    ("Rooms_Available", "RoomsAvailable"),
+)
+if {raw for raw, _ in _PACE_METRIC_COLUMNS} != set(HOLDINGS_PACE_COLUMNS):
+    raise RuntimeError(
+        "dax_query_builder's Holdings-pace metric columns must match measures.HOLDINGS_PACE_COLUMNS exactly."
+    )
+
+
+def _pace_metric_column_blocks(stay_date_ref: str, effective_date_ref: str) -> str:
+    """One ADDCOLUMNS "Name", expr pair per raw column. Each block
+    independently VAR-captures the stay date and resolved AuditDate from the
+    OUTER (already-materialized) resolved-spine table columns named by
+    `stay_date_ref`/`effective_date_ref` - never a bare
+    `Holdings[SelDate] = [Date]`-style filter argument without going through
+    a VAR first, and never a reference to another column added in the SAME
+    ADDCOLUMNS call as this one (each block is independent of every other
+    metric block, even though all 6 are added in one ADDCOLUMNS call).
+    Explicitly branches on ISBLANK(effective date) rather than relying on
+    `AuditDate = BLANK()` filtering behavior to produce the null.
+    """
+    blocks = []
+    for raw_column, alias in _PACE_METRIC_COLUMNS:
+        blocks.append(
+            f'"{alias}",\n'
+            f"                    VAR __StayDate = {stay_date_ref}\n"
+            f"                    VAR __EffectiveDate = {effective_date_ref}\n"
+            f"                    RETURN IF(\n"
+            f"                        ISBLANK(__EffectiveDate),\n"
+            f"                        BLANK(),\n"
+            f"                        CALCULATE(\n"
+            f"                            SUM({HOLDINGS_TABLE}[{raw_column}]),\n"
+            f"                            {HOLDINGS_TABLE}[SelDate] = __StayDate,\n"
+            f"                            {HOLDINGS_TABLE}[AuditDate] = __EffectiveDate\n"
+            f"                        )\n"
+            f"                    )"
+        )
+    return ",\n                ".join(blocks)
+
+
+def _build_holdings_pace_same_point_last_year_query(hotel_id: int, request: HoldingsPaceRequest) -> str:
+    """The one Holdings-pace named query (holdings_pace_same_point_last_year_v1).
+
+    Two-stage shape, deliberately:
+      1. A "resolved spine" ADDCOLUMNS over a literal CALENDAR(stay_start,
+         stay_end) row source resolves EffectiveAuditDate per stay date.
+         ADDCOLUMNS never drops a row (unlike GENERATE, whose correlated
+         inner-table expansion silently drops an outer row when the inner
+         table is empty - exactly the "unresolved stay date vanishes"
+         failure this query must not reintroduce), so every requested stay
+         date survives to the output even when nothing resolves.
+      2. An outer ADDCOLUMNS aggregates the 6 raw mart columns at the
+         resolved snapshot, explicitly branching on
+         ISBLANK(EffectiveAuditDate) rather than relying on
+         `AuditDate = BLANK()` filtering behavior.
+
+    The comparator side reuses the identical two-stage shape with every
+    date passed through DAX's own EDATE(date, -12) - which shifts by whole
+    months and returns the last day of the target month when the source day
+    doesn't exist there (EDATE(DATE(2024,2,29), -12) = DATE(2023,2,28)) -
+    exactly the confirmed calendar-shift/leap-day-clamp rule, natively, so
+    this query and dmr/pace_dates.shift_one_year() can never disagree.
+
+    Hotel_ID is projected as an internal-only column (never a model-visible
+    parameter, exactly like every other report above) so a future
+    response-boundary check can reuse the existing row-verification pattern
+    once a tool/response layer exists (Phase 3) - it must be stripped before
+    any model-facing result.
+    """
+    stay_start = _dax_date_literal(request.stay_start)
+    stay_end = _dax_date_literal(request.stay_end)
+    as_of = _dax_date_literal(request.as_of_date)
+
+    current_metrics = _pace_metric_column_blocks("[Date]", "[EffectiveAuditDate]")
+    comparator_metrics = _pace_metric_column_blocks("[ComparatorStayDate]", "[EffectiveAuditDate]")
+
+    return f"""
+    DEFINE
+        VAR __Spine = CALENDAR({stay_start}, {stay_end})
+
+        VAR __ResolvedCurrent =
+            ADDCOLUMNS(
+                __Spine,
+                "StayDayIndex", INT([Date] - {stay_start}),
+                "EffectiveAuditDate",
+                    VAR __StayDate = [Date]
+                    RETURN
+                        CALCULATE(
+                            MAX({HOLDINGS_TABLE}[AuditDate]),
+                            _Hotels[Hotel_ID] = {int(hotel_id)},
+                            {HOLDINGS_TABLE}[Hotel_ID] = {int(hotel_id)},
+                            {HOLDINGS_TABLE}[SelDate] = __StayDate,
+                            {HOLDINGS_TABLE}[AuditDate] <= {as_of}
+                        )
+            )
+
+        VAR __ResolvedComparator =
+            ADDCOLUMNS(
+                __Spine,
+                "StayDayIndex", INT([Date] - {stay_start}),
+                "ComparatorStayDate", EDATE([Date], -12),
+                "EffectiveAuditDate",
+                    VAR __StayDate = EDATE([Date], -12)
+                    VAR __ComparatorAsOf = EDATE({as_of}, -12)
+                    RETURN
+                        CALCULATE(
+                            MAX({HOLDINGS_TABLE}[AuditDate]),
+                            _Hotels[Hotel_ID] = {int(hotel_id)},
+                            {HOLDINGS_TABLE}[Hotel_ID] = {int(hotel_id)},
+                            {HOLDINGS_TABLE}[SelDate] = __StayDate,
+                            {HOLDINGS_TABLE}[AuditDate] <= __ComparatorAsOf
+                        )
+            )
+
+        VAR __CurrentRows =
+            ADDCOLUMNS(
+                __ResolvedCurrent,
+                "Side", "current",
+                "StayDate", [Date],
+                "RequestedAsOfDate", {as_of},
+                {current_metrics},
+                "SourceRowCount",
+                    VAR __StayDate = [Date]
+                    VAR __EffectiveDate = [EffectiveAuditDate]
+                    RETURN IF(
+                        ISBLANK(__EffectiveDate),
+                        0,
+                        CALCULATE(
+                            COUNTROWS({HOLDINGS_TABLE}),
+                            {HOLDINGS_TABLE}[SelDate] = __StayDate,
+                            {HOLDINGS_TABLE}[AuditDate] = __EffectiveDate
+                        )
+                    ),
+                "HotelId", {int(hotel_id)}
+            )
+
+        VAR __ComparatorRows =
+            ADDCOLUMNS(
+                __ResolvedComparator,
+                "Side", "comparator",
+                "StayDate", [ComparatorStayDate],
+                "RequestedAsOfDate", EDATE({as_of}, -12),
+                {comparator_metrics},
+                "SourceRowCount",
+                    VAR __StayDate = [ComparatorStayDate]
+                    VAR __EffectiveDate = [EffectiveAuditDate]
+                    RETURN IF(
+                        ISBLANK(__EffectiveDate),
+                        0,
+                        CALCULATE(
+                            COUNTROWS({HOLDINGS_TABLE}),
+                            {HOLDINGS_TABLE}[SelDate] = __StayDate,
+                            {HOLDINGS_TABLE}[AuditDate] = __EffectiveDate
+                        )
+                    ),
+                "HotelId", {int(hotel_id)}
+            )
+
+    EVALUATE
+        UNION(
+            SELECTCOLUMNS(
+                __CurrentRows,
+                "Side", [Side], "StayDayIndex", [StayDayIndex], "StayDate", [StayDate],
+                "RequestedAsOfDate", [RequestedAsOfDate], "EffectiveAuditDate", [EffectiveAuditDate],
+                "Rooms", [Rooms], "RoomRevenue", [RoomRevenue], "ArrivalRooms", [ArrivalRooms],
+                "DepartureRooms", [DepartureRooms], "Guests", [Guests], "RoomsAvailable", [RoomsAvailable],
+                "SourceRowCount", [SourceRowCount], "HotelId", [HotelId]
+            ),
+            SELECTCOLUMNS(
+                __ComparatorRows,
+                "Side", [Side], "StayDayIndex", [StayDayIndex], "StayDate", [StayDate],
+                "RequestedAsOfDate", [RequestedAsOfDate], "EffectiveAuditDate", [EffectiveAuditDate],
+                "Rooms", [Rooms], "RoomRevenue", [RoomRevenue], "ArrivalRooms", [ArrivalRooms],
+                "DepartureRooms", [DepartureRooms], "Guests", [Guests], "RoomsAvailable", [RoomsAvailable],
+                "SourceRowCount", [SourceRowCount], "HotelId", [HotelId]
+            )
+        )
+    ORDER BY [Side] DESC, [StayDayIndex] ASC
+    """
+
+
+def build_named(query_id: QueryId, request: HoldingsPaceRequest, scope: ScopeContext) -> str:
+    """The named-query sibling to build() - see the module-section comment
+    above for why this is a separate entry point rather than folded into
+    build()/QuerySpec/REPORT_DEFINITIONS.
+    """
+    _require_scope(scope)
+    _validate_pace_window(query_id, request)
+    if query_id is QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1:
+        return _build_holdings_pace_same_point_last_year_query(scope.hotel_id, request)
+    raise ValueError(f"Unknown named query: {query_id}")

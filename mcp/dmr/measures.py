@@ -133,3 +133,25 @@ HOLDINGS_MEASURES = [
     Measure.HOLDINGS_ARRIVAL_ROOMS,
     Measure.HOLDINGS_DEPARTURE_ROOMS,
 ]
+
+# Raw mart columns aggregated directly (SUM only) by the Holdings-pace named
+# query (holdings_pace_same_point_last_year_v1, see dax_query_builder.py) -
+# deliberately NOT curated Matrix measures. Per-SelDate snapshot resolution
+# needs to evaluate these columns under a filter context (AuditDate resolved
+# independently per stay date, <= a requested as_of_date) that differs from
+# the filter context get_dmr_holdings_outlook's curated measures are
+# exercised under today. This codebase cannot inspect what filter-context
+# assumptions those curated measures' own DAX expressions encode -
+# measure_guard.py's INFO.VIEW.MEASURES() lookup returns blank for every
+# measure - so this is a documented, scoped architecture decision for this
+# one named query, not a claim that the curated measures are unsuitable.
+# The mart's own raw ADR column is deliberately excluded: weighted ADR is
+# SUM(Room_Revenue)/SUM(NoOfRooms), never AVERAGE(ADR).
+HOLDINGS_PACE_COLUMNS: tuple[str, ...] = (
+    "NoOfRooms",
+    "Room_Revenue",
+    "ArrivalRooms",
+    "DepartureRooms",
+    "NoOfGuest",
+    "Rooms_Available",
+)
