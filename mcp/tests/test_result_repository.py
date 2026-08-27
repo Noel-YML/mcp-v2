@@ -18,7 +18,7 @@ def _scope(hotel_id=39, session_id="sess-a"):
     return ScopeContext(hotel_id=hotel_id, session_id=session_id, permissions=frozenset({"dmr:read"}), expires_at=datetime.now(timezone.utc))
 
 
-def _stored(result_id="res_abc123", hotel_id=39, session_id="sess-a", ttl_seconds=300, created_at=None):
+def _stored(result_id="res_abc123", hotel_id=39, session_id="sess-a", ttl_seconds=300, created_at=None, result=None, evidence=None):
     from audit import hash_session_id
 
     if created_at is None:
@@ -31,8 +31,8 @@ def _stored(result_id="res_abc123", hotel_id=39, session_id="sess-a", ttl_second
         expires_at=created_at + timedelta(seconds=ttl_seconds),
         query_id="revenue_performance_digest_v1",
         query_version="1",
-        result={"payload": "result"},
-        evidence={"payload": "evidence"},
+        result=result if result is not None else {"payload": "result"},
+        evidence=evidence if evidence is not None else {"payload": "evidence"},
     )
 
 
@@ -201,3 +201,89 @@ def test_compute_expiry_signature_takes_only_ttl_seconds():
     could supply created_at/expires_at directly."""
     params = list(inspect.signature(compute_expiry).parameters)
     assert params == ["ttl_seconds"]
+
+
+# --- StoredResult JSON-compatibility invariants -------------------------------
+# result/evidence must be strictly JSON-compatible mappings - the same
+# payload domain both InMemoryResultRepository and CosmosResultRepository
+# operate over (enforced once, in StoredResult.__post_init__, not per-backend).
+
+
+def test_valid_nested_payload_passes():
+    payload = {"a": 1, "b": "two", "c": [1, 2, 3], "d": {"nested": True}, "e": None, "f": 3.14}
+    stored = _stored(result_id="res_valid", result=payload, evidence=payload)
+    assert stored.result == payload
+    assert stored.evidence == payload
+
+
+def test_nan_in_result_is_rejected():
+    with pytest.raises(ValueError):
+        _stored(result={"value": float("nan")})
+
+
+def test_positive_infinity_in_result_is_rejected():
+    with pytest.raises(ValueError):
+        _stored(result={"value": float("inf")})
+
+
+def test_negative_infinity_in_evidence_is_rejected():
+    with pytest.raises(ValueError):
+        _stored(evidence={"value": float("-inf")})
+
+
+def test_datetime_in_result_is_rejected():
+    with pytest.raises((TypeError, ValueError)):
+        _stored(result={"when": datetime.now(timezone.utc)})
+
+
+def test_arbitrary_object_in_result_is_rejected():
+    class _Unserializable:
+        pass
+
+    with pytest.raises((TypeError, ValueError)):
+        _stored(result={"thing": _Unserializable()})
+
+
+def test_set_in_result_is_rejected():
+    with pytest.raises((TypeError, ValueError)):
+        _stored(result={"tags": {"a", "b"}})
+
+
+def test_bytes_in_result_is_rejected():
+    with pytest.raises((TypeError, ValueError)):
+        _stored(result={"raw": b"binary"})
+
+
+def test_non_mapping_result_is_rejected():
+    with pytest.raises(TypeError):
+        _stored(result=["not", "a", "mapping"])
+
+
+def test_non_mapping_evidence_is_rejected():
+    with pytest.raises(TypeError):
+        _stored(evidence="not a mapping")
+
+
+def test_unsupported_payload_values_are_never_silently_stringified():
+    """A rejected payload must raise, not get coerced to a string
+    representation - proving there is no `default=str`-style escape hatch
+    anywhere in the validation path."""
+    with pytest.raises((TypeError, ValueError)):
+        _stored(result={"when": datetime.now(timezone.utc)})
+    # If it had been silently stringified instead of rejected, the above
+    # would not have raised at all - this test exists to make that failure
+    # mode explicit rather than merely implied by the exception assertion.
+
+
+def test_inmemory_repository_accepts_the_same_valid_payload_domain_as_cosmos():
+    """Both backends validate through the exact same
+    StoredResult.__post_init__ - this proves a complex-but-valid payload
+    round-trips through InMemoryResultRepository unchanged; see
+    test_cosmos_result_repository.py for the equivalent Cosmos-backed
+    proof over the identical payload."""
+    payload = {"a": 1, "b": "two", "c": [1, 2, 3], "d": {"nested": True}, "e": None, "f": 3.14}
+    repo = InMemoryResultRepository()
+    repo.put(_stored(result_id="res_domain", result=payload, evidence=payload))
+    fetched = repo.get("res_domain", _scope())
+    assert fetched.result == payload
+    assert fetched.evidence == payload

@@ -46,6 +46,25 @@ Security invariants:
     way in (`put`) and out (`get`) - a caller mutating a dict it passed in,
     or a dict it got back, can never corrupt the repository's own stored
     state.
+  - `result`/`evidence` must be strictly JSON-compatible mappings -
+    `StoredResult.__post_init__` validates this with `json.dumps(...,
+    allow_nan=False)`, so NaN/+-Infinity, datetimes, sets, bytes, or any
+    other non-JSON Python object is rejected at construction, never
+    silently stringified or pickled. This is what lets
+    `InMemoryResultRepository` and `CosmosResultRepository` operate over
+    exactly the same payload domain.
+  - a Cosmos infrastructure/network/auth failure (not a legitimate
+    not-found, not a legitimate create-conflict) always raises
+    `ResultRepositoryUnavailable` - it is never silently mapped to `None`,
+    which would be indistinguishable from "this result never existed" and
+    would make a real outage look like a data-integrity fact. This covers
+    the whole `azure.core.exceptions.AzureError` hierarchy (HTTP failures,
+    `ServiceRequestError`/`ServiceResponseError` transport failures,
+    `ClientAuthenticationError`), not just HTTP-shaped Cosmos errors.
+  - a point-read whose returned document's own `id`/`result_id` fields
+    don't match the `result_id` that was actually requested is treated as
+    a data-integrity failure (`ResultRepositoryUnavailable`), never trusted
+    and never treated as a plain not-found.
 
 `InMemoryResultRepository` is lost on restart, with no cross-instance
 sharing - usable directly in tests and for local/dev hosting.
@@ -58,13 +77,15 @@ that's R3B's job.
 
 import copy
 import dataclasses
+import json
 import logging
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol
 
-from azure.cosmos.exceptions import CosmosHttpResponseError, CosmosResourceExistsError, CosmosResourceNotFoundError
+from azure.core.exceptions import AzureError
+from azure.cosmos.exceptions import CosmosResourceExistsError, CosmosResourceNotFoundError
 
 from audit import hash_session_id
 from scope.scope_context import ScopeContext
@@ -79,6 +100,26 @@ def _require_utc(field_name: str, value: datetime) -> None:
         raise ValueError(f"{field_name} must be UTC, got an offset of {value.utcoffset()}.")
 
 
+def _require_json_compatible(field_name: str, value: Any) -> None:
+    """Strict, deterministic validation - not a stringify-and-hope check.
+    `Mapping` is required first (a bare list/string/number is not an
+    acceptable top-level payload here, even though it would be valid JSON
+    on its own). Then `json.dumps(..., allow_nan=False)` is used as the
+    validator itself, not just a serializer: `allow_nan=False` rejects
+    NaN/+-Infinity (which `json.dumps` would otherwise silently emit as the
+    non-standard `NaN`/`Infinity` tokens), and any non-JSON Python object
+    (datetime, set, bytes, a custom class instance, ...) raises `TypeError`
+    on its own, well before any `default=` stringification could hide it -
+    no `default=` is passed here, deliberately.
+    """
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be a mapping (dict), got {type(value).__name__}.")
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a JSON-compatible mapping: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class StoredResult:
     result_id: str
@@ -88,14 +129,16 @@ class StoredResult:
     expires_at: datetime
     query_id: str
     query_version: str
-    result: Mapping[str, Any]  # JSON-compatible only - see module docstring
-    evidence: Mapping[str, Any]  # JSON-compatible only - see module docstring
+    result: Mapping[str, Any]  # JSON-compatible only - enforced below, not just annotated
+    evidence: Mapping[str, Any]  # JSON-compatible only - enforced below, not just annotated
 
     def __post_init__(self) -> None:
         _require_utc("created_at", self.created_at)
         _require_utc("expires_at", self.expires_at)
         if self.expires_at <= self.created_at:
             raise ValueError("expires_at must be strictly after created_at.")
+        _require_json_compatible("result", self.result)
+        _require_json_compatible("evidence", self.evidence)
 
 
 def compute_expiry(ttl_seconds: float) -> tuple[datetime, datetime]:
@@ -276,7 +319,14 @@ class CosmosResultRepository:
                 f"result_id {stored_result.result_id!r} is already stored - "
                 "results are immutable, never overwritten."
             ) from exc
-        except CosmosHttpResponseError as exc:
+        except AzureError as exc:
+            # Every other Azure SDK failure - HTTP-shaped Cosmos errors
+            # (CosmosHttpResponseError), transport failures
+            # (ServiceRequestError/ServiceResponseError), auth failures
+            # (ClientAuthenticationError), and anything else deriving from
+            # the SDK's own common AzureError base. None of these are a
+            # legitimate not-found or a legitimate conflict, so none may
+            # ever surface as a raw SDK exception or as None.
             _log_cosmos_failure("results_cosmos_put_failed", stored_result.result_id, exc)
             raise ResultRepositoryUnavailable("The result store is temporarily unavailable.") from exc
 
@@ -285,9 +335,21 @@ class CosmosResultRepository:
             document = self._container.read_item(item=result_id, partition_key=scope.hotel_id)
         except CosmosResourceNotFoundError:
             return None
-        except CosmosHttpResponseError as exc:
+        except AzureError as exc:
+            # See put()'s comment - covers the full AzureError hierarchy,
+            # not just CosmosHttpResponseError.
             _log_cosmos_failure("results_cosmos_get_failed", result_id, exc)
             raise ResultRepositoryUnavailable("The result store is temporarily unavailable.") from exc
+
+        if document.get("id") != result_id or document.get("result_id") != result_id:
+            # A point read that returns a document whose own id/result_id
+            # don't match what was actually requested is an internal
+            # consistency failure, not a not-found - never trust it.
+            _log_cosmos_failure(
+                "results_cosmos_document_id_mismatch", result_id,
+                ValueError("returned document's id/result_id did not match the requested result_id"),
+            )
+            raise ResultRepositoryUnavailable("The result store returned a malformed record.")
 
         try:
             record = _from_document(document)
