@@ -274,3 +274,45 @@ def resolve_revenue_performance_digest(
             )
         )
     return resolved
+
+
+InferredMappingVerdict = Literal["confirmed", "inconclusive", "contradicted"]
+
+
+def validate_inferred_group_mapping(expected_group: str, live_groups: set[str]) -> tuple[InferredMappingVerdict, str]:
+    """Deterministic, pure verdict for one "inferred" Revenue_Group mapping
+    (see RevenueMetricMapping.group_mapping_state) against a live,
+    Revenue_Type-only probe's result. Never mutates the mapping itself -
+    scripts/live_acceptance_performance_digest.py calls this but the
+    governed mapping is never dynamically adjusted based on what Fabric
+    returns; a non-"confirmed" verdict always means either "check again
+    later" (inconclusive) or "a human needs to review
+    REVENUE_METRIC_MAPPINGS" (contradicted) - never something this function
+    or its caller resolves automatically.
+
+    Three distinct outcomes, deliberately not collapsed into a bool:
+
+    - "confirmed": `live_groups` is exactly the expected singleton group -
+      genuine, positive evidence the mapping is correct.
+    - "inconclusive": `live_groups` is EMPTY - this hotel/date has no rows
+      for this Revenue_Type at all, so it provides NO evidence either way.
+      This is still a BLOCKING acceptance condition (the mapping remains
+      unvalidated for this run), but it must never be reported as "the
+      governed mapping needs review" - there is nothing wrong with the
+      mapping, just nothing available today to check it against.
+    - "contradicted": `live_groups` is non-empty and is NOT exactly the
+      expected singleton group (a different group, or more than one group -
+      genuine ambiguity) - real evidence the governed mapping is wrong or
+      ambiguous. This DOES mean REVENUE_METRIC_MAPPINGS needs review.
+    """
+    if not live_groups:
+        return (
+            "inconclusive",
+            "the live probe returned no rows for this hotel/date - no evidence either way, not a mapping defect",
+        )
+    if live_groups == {expected_group}:
+        return "confirmed", "the live probe returned exactly the expected singleton group"
+    return (
+        "contradicted",
+        f"live data shows {sorted(live_groups)!r}, expected {{{expected_group!r}}} - REVENUE_METRIC_MAPPINGS needs review",
+    )

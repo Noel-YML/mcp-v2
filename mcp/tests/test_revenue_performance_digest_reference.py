@@ -25,6 +25,7 @@ from dmr.revenue_performance_digest_reference import (
     VIEW_METRICS,
     RawRevenueRow,
     resolve_revenue_performance_digest,
+    validate_inferred_group_mapping,
 )
 
 HOTEL_ID = 1
@@ -206,6 +207,38 @@ def test_room_revenue_maps_to_the_expected_internal_identity():
 
 
 # 16. stable labels are hand-authored, never parsed from MetricSemantics.business_name.
+# --- validate_inferred_group_mapping - the three-way live-acceptance verdict ---
+#
+# An empty probe result must NEVER read as success, and must NEVER be
+# reported as "the mapping needs review" either - it's a separate,
+# genuinely distinct outcome from a non-empty, wrong/ambiguous result.
+
+
+def test_confirmed_when_live_groups_is_exactly_the_expected_singleton():
+    verdict, reason = validate_inferred_group_mapping("ROOMS", {"ROOMS"})
+    assert verdict == "confirmed"
+    assert "needs review" not in reason
+
+
+def test_inconclusive_when_live_groups_is_empty_and_never_says_needs_review():
+    verdict, reason = validate_inferred_group_mapping("ROOMS", set())
+    assert verdict == "inconclusive"
+    assert "needs review" not in reason
+    assert "no evidence" in reason
+
+
+def test_contradicted_when_live_groups_is_a_different_non_empty_group():
+    verdict, reason = validate_inferred_group_mapping("ROOMS", {"F&B Revenue"})
+    assert verdict == "contradicted"
+    assert "needs review" in reason
+
+
+def test_contradicted_when_live_groups_is_ambiguous_across_multiple_groups():
+    verdict, reason = validate_inferred_group_mapping("ROOMS", {"ROOMS", "Other & Misc. Rev."})
+    assert verdict == "contradicted"
+    assert "needs review" in reason
+
+
 def test_labels_are_hand_authored_not_parsed_from_business_name():
     # dmr.semantics.MetricSemantics.business_name for these keys is suffixed
     # "(CURRENT)"/"(MTD)"/"(YTD)" by _revenue_metric_family - a naive strip

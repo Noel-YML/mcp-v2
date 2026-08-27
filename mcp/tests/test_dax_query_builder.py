@@ -536,6 +536,44 @@ def test_every_metrics_value_block_is_hotel_date_group_type_scoped(metric_id):
 
 
 @pytest.mark.parametrize("metric_id", _ALL_GOVERNED_METRIC_IDS)
+def test_every_metrics_source_row_count_uses_explicit_coalesce_zero_normalization(metric_id):
+    """SourceRowCount must never rely on COUNTROWS's own blank-vs-zero wire
+    behavior for an empty match - it must explicitly wrap the CALCULATE in
+    COALESCE(..., 0). Value/ComparisonValue/SourceVarianceValue are
+    deliberately NOT wrapped this way - those stay BLANK()/null when absent.
+    """
+    for comparator in ("none", "budget"):
+        timeframe = "mtd"
+        request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe=timeframe, view="headline", comparator=comparator)
+        block = dax_query_builder._revenue_digest_metric_row(_SCOPE.hotel_id, request, metric_id)
+        assert '"SourceRowCount", COALESCE(' in block
+        # exactly one CALCULATE is wrapped by COALESCE, and it ends ", 0)"
+        source_row_count_start = block.index('"SourceRowCount", COALESCE(')
+        source_row_count_block = block[source_row_count_start:]
+        assert "\n        0\n    )" in source_row_count_block
+        # Value/ComparisonValue/SourceVarianceValue must never be COALESCE-wrapped.
+        assert '"Value", COALESCE(' not in block
+        assert '"ComparisonValue", COALESCE(' not in block
+        assert '"SourceVarianceValue", COALESCE(' not in block
+
+
+def test_missing_metric_still_produces_its_own_row_in_generated_dax():
+    """Explicit, standalone proof of the core R1 invariant: a metric with
+    zero matching physical rows still gets its own ROW() in the generated
+    query - never a dropped row. There is no way to make this fail from the
+    DAX-generation side alone (the query is built from the governed metric
+    SET, not from physical data), but this test names the invariant
+    directly rather than leaving it only implied by the metric-count tests.
+    """
+    for view, expected_count in VIEW_METRICS.items():
+        request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view=view, comparator="none")
+        query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+        assert query.count("ROW(\n") == len(expected_count)
+        for metric_id in expected_count:
+            assert f'"MetricId", "{metric_id}"' in query
+
+
+@pytest.mark.parametrize("metric_id", _ALL_GOVERNED_METRIC_IDS)
 def test_every_metrics_source_row_count_block_is_scoped_even_with_no_comparator(metric_id):
     """comparator="none" -> ComparisonValue/SourceVarianceValue both become
     bare BLANK() (no CALCULATE at all) - Value and SourceRowCount are the

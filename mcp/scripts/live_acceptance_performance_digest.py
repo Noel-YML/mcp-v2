@@ -57,6 +57,7 @@ from dmr.revenue_performance_digest_reference import (  # noqa: E402
     VIEW_METRICS,
     RawRevenueRow,
     resolve_revenue_performance_digest,
+    validate_inferred_group_mapping,
 )
 from fabric_client.service import FabricQueryService  # noqa: E402
 from scope.scope_context import ScopeContext  # noqa: E402
@@ -301,37 +302,54 @@ def main() -> None:
     print("=" * 80)
     print("STEP 8: Validate every 'inferred' Revenue_Group mapping against live data")
     print("=" * 80)
-    inferred_mismatches = []
+    # Three distinct outcomes, deliberately not collapsed into a pass/fail
+    # bool - an empty probe result ("inconclusive") is a BLOCKING acceptance
+    # condition (this run provides no evidence the mapping is right), but it
+    # must never be reported as "the mapping needs review": there is
+    # nothing wrong with the mapping, just nothing to check it against
+    # today. Only "contradicted" (a non-empty, wrong/ambiguous result) means
+    # REVENUE_METRIC_MAPPINGS itself needs review. See
+    # dmr.revenue_performance_digest_reference.validate_inferred_group_mapping.
+    confirmed, inconclusive, contradicted = [], [], []
     for metric_id, mapping in REVENUE_METRIC_MAPPINGS.items():
         if mapping.group_mapping_state != "inferred":
             continue
         live_groups = _probe_live_revenue_group(service, hotel_id, business_date, mapping.revenue_type)
-        if live_groups and live_groups != {mapping.revenue_group}:
-            inferred_mismatches.append(
-                f"{metric_id} ({mapping.revenue_type!r}): assumed Revenue_Group={mapping.revenue_group!r}, "
-                f"live data shows {sorted(live_groups)!r} - REVENUE_METRIC_MAPPINGS needs review, "
-                "not a runtime substitution."
-            )
+        verdict, reason = validate_inferred_group_mapping(mapping.revenue_group, live_groups)
+        entry = f"{metric_id} ({mapping.revenue_type!r}): {reason}"
+        if verdict == "confirmed":
+            confirmed.append(entry)
+            print(f"CONFIRMED: {entry}")
+        elif verdict == "inconclusive":
+            inconclusive.append(entry)
+            print(f"INCONCLUSIVE: {entry}")
         else:
-            print(f"OK: {metric_id} ({mapping.revenue_type!r}) -> Revenue_Group={mapping.revenue_group!r} confirmed live.")
+            contradicted.append(entry)
+            print(f"CONTRADICTED: {entry}")
 
     if mismatches:
         print()
         print(f"{len(mismatches)} FIELD MISMATCH(ES):")
         for m in mismatches:
             print(f"  - {m}")
-    if inferred_mismatches:
+    if contradicted:
         print()
-        print(f"{len(inferred_mismatches)} INFERRED-MAPPING MISMATCH(ES) - BLOCKING:")
-        for m in inferred_mismatches:
+        print(f"{len(contradicted)} CONTRADICTED inferred mapping(s) - BLOCKING, REVENUE_METRIC_MAPPINGS needs review:")
+        for m in contradicted:
+            print(f"  - {m}")
+    if inconclusive:
+        print()
+        print(f"{len(inconclusive)} INCONCLUSIVE inferred mapping(s) - BLOCKING for this run, but NOT a mapping defect "
+              "(this hotel/date has no rows for that Revenue_Type at all):")
+        for m in inconclusive:
             print(f"  - {m}")
 
-    if mismatches or inferred_mismatches:
+    if mismatches or contradicted or inconclusive:
         sys.exit(1)
 
     print()
     print("All fields match between the reference oracle and the live named-query output, "
-          "and every inferred Revenue_Group mapping was confirmed against live data.")
+          "and every inferred Revenue_Group mapping was CONFIRMED (not merely inconclusive) against live data.")
 
 
 if __name__ == "__main__":

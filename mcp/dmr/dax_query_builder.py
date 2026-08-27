@@ -721,7 +721,20 @@ def _revenue_digest_metric_row(hotel_id: int, request: RevenueDigestRequest, met
         else "BLANK()"
     )
 
-    source_row_count_expr = f"CALCULATE(\n        COUNTROWS({REVENUE_TABLE}),\n        {governed_filters}\n    )"
+    # Explicit BLANK -> 0 normalization - never relies on COUNTROWS's own
+    # blank-vs-zero wire behavior for an empty filtered match. Value/
+    # ComparisonValue/SourceVarianceValue are deliberately NOT wrapped this
+    # way - those must stay BLANK()/null when source data is absent; only
+    # the row-count evidence field is guaranteed to be a concrete integer.
+    source_row_count_expr = (
+        "COALESCE(\n"
+        f"        CALCULATE(\n"
+        f"            COUNTROWS({REVENUE_TABLE}),\n"
+        f"            {governed_filters}\n"
+        f"        ),\n"
+        "        0\n"
+        "    )"
+    )
 
     return (
         "ROW(\n"
