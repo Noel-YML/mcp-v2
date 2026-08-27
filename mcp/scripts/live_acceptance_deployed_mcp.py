@@ -10,12 +10,17 @@ get_performance_digest/get_result_evidence.
 Uses the installed `mcp` SDK's own client machinery
 (mcp.client.streamable_http + mcp.ClientSession) - not a hand-rolled HTTP/
 JSON-RPC client - and prefers the modern `server/discover` (protocol
-2026-07-28) negotiation path, falling back to legacy `initialize()` only
-when the deployed server doesn't support `server/discover` at all. Which
-path was actually used is reported explicitly (see "MCP protocol
-negotiation" in the output) - if the deployed Azure Functions MCP extension
-can only serve a legacy path, that is itself an R3C finding, not something
-this script hides.
+2026-07-28) negotiation path, falling back to legacy `initialize()` ONLY
+when the server returns a JSON-RPC METHOD_NOT_FOUND for `server/discover`
+(i.e. it genuinely doesn't implement `server/discover` at all). Any other
+`server/discover` failure - authorization, invalid request, internal
+server error, or any other MCP application error - is treated as a real
+connection/negotiation failure, never as "this server is legacy." The
+"MCP protocol negotiation" gate in the output PASSes ONLY when the
+negotiated protocol is exactly 2026-07-28; a legitimate legacy fallback is
+reported honestly but still FAILs that gate - this harness never approves
+legacy-mode compatibility on its own, that would need a separate,
+explicit architecture exception.
 
 ============================================================================
 REQUIRED CONFIGURATION (all client-side; nothing is hardcoded or invented)
@@ -109,10 +114,15 @@ from dataclasses import dataclass
 from mcp import ClientSession
 from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
 from mcp.shared.exceptions import MCPError
+from mcp.types import METHOD_NOT_FOUND
 
 _STATUS_RESOURCE_URI = "ariel://status"
 _EXPECTED_DIGEST_PROPERTIES = {"date", "timeframe", "view", "comparator"}
 _EXPECTED_EVIDENCE_PROPERTIES = {"result_id"}
+
+# R3C targets this exact protocol - the modern-protocol gate (see
+# _negotiate/NegotiationResult) only ever PASSes at this version.
+_TARGET_PROTOCOL_VERSION = "2026-07-28"
 
 _FORBIDDEN_SCHEMA_FIELDS = (
     "hotel_id", "hotelid", "hotel_code", "hotel_name", "scope_token", "scopetoken",
@@ -121,6 +131,8 @@ _FORBIDDEN_SCHEMA_FIELDS = (
 _FORBIDDEN_OUTPUT_SUBSTRINGS = (
     "hotel_id", "hotelid", "session_id", "sessionidhash", "session_id_hash",
     "token", "jwt", "workspace", "dataset", "partition", "credential",
+    "dax", "sql", "cosmos", "partition_key", "partitionkey",
+    "workspace_id", "dataset_id", "documents.azure.com",
 )
 
 _RESULT_ID_PATTERN = re.compile(r"^res_[0-9a-f]{16}$")
@@ -229,22 +241,58 @@ def _build_headers(scope_token: str, function_key: str | None) -> dict[str, str]
     return headers
 
 
-async def _negotiate(session: ClientSession) -> str:
-    """Prefers `server/discover` (protocol 2026-07-28); falls back to the
-    legacy `initialize()` handshake ONLY when the deployed server doesn't
-    support `server/discover` at all (an MCPError, e.g. METHOD_NOT_FOUND) -
-    any other failure (network error, timeout, ...) propagates unchanged,
-    it is not treated as "this server is legacy."
+def _safe_exc(exc: Exception) -> str:
+    """Sanitized-only description for a connection/protocol-layer failure -
+    exception type, and for an MCPError its numeric JSON-RPC error code
+    only. Never the raw message/args/headers, which could carry deployment
+    or internal detail (see R3C harden-review item 5). Tool-facing
+    ToolError JSON - the actual public contract under acceptance - is
+    reported separately, from its own already-parsed status/code/message
+    fields, never through this helper.
+    """
+    if isinstance(exc, MCPError):
+        return f"MCPError code={exc.code}"
+    return type(exc).__name__
+
+
+@dataclass
+class NegotiationResult:
+    description: str  # safe to print - no raw MCPError message/args
+    is_modern: bool  # True only if server/discover succeeded AND negotiated == _TARGET_PROTOCOL_VERSION
+
+
+async def _negotiate(session: ClientSession) -> NegotiationResult:
+    """Prefers `server/discover` (protocol 2026-07-28). Falls back to the
+    legacy `initialize()` handshake ONLY when the server genuinely does not
+    support `server/discover` at all - a JSON-RPC METHOD_NOT_FOUND (-32601)
+    MCPError. Any OTHER MCPError (authorization failure, invalid request,
+    internal server error, an unsupported-protocol-version failure that
+    survived discover()'s own internal retry, or any other application
+    error) is NOT a "this server is legacy" signal - it is re-raised as a
+    genuine connection/negotiation failure, never silently downgraded to
+    the legacy path. Transport/network exceptions are not caught here at
+    all and propagate unchanged.
+
+    Never returns the raw MCPError message/args - only its numeric code,
+    which is a standard protocol constant, not deployment detail.
     """
     try:
         await session.discover()
-        return f"server/discover -> protocol {session.protocol_version}"
     except MCPError as exc:
+        if exc.code != METHOD_NOT_FOUND:
+            raise
         await session.initialize()
-        return (
-            f"legacy initialize() fallback -> protocol {session.protocol_version} "
-            f"(server/discover failed: code={exc.code}, message={exc.args[0] if exc.args else exc!r})"
+        return NegotiationResult(
+            description=(
+                f"legacy initialize() fallback -> protocol {session.protocol_version} "
+                f"(server/discover unsupported: code={exc.code})"
+            ),
+            is_modern=False,
         )
+    return NegotiationResult(
+        description=f"server/discover -> protocol {session.protocol_version}",
+        is_modern=session.protocol_version == _TARGET_PROTOCOL_VERSION,
+    )
 
 
 @asynccontextmanager
@@ -252,8 +300,8 @@ async def _connected_session(url: str, scope_token: str, function_key: str | Non
     async with create_mcp_http_client(headers=_build_headers(scope_token, function_key)) as http_client:
         async with streamable_http_client(url, http_client=http_client) as (read, write):
             async with ClientSession(read, write) as session:
-                protocol_path = await _negotiate(session)
-                yield session, protocol_path
+                negotiation = await _negotiate(session)
+                yield session, negotiation
 
 
 async def _call_digest(session: ClientSession, **arguments) -> dict:
@@ -279,7 +327,7 @@ async def _gate_discovery_and_schema(session: ClientSession, report: Report) -> 
     try:
         tools_result = await session.list_tools()
     except Exception as exc:  # noqa: BLE001 - reported as a gate failure, not a crash
-        report.record("MCP discovery (tools/list) exposes both new tools", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("MCP discovery (tools/list) exposes both new tools", "FAIL", _safe_exc(exc))
         return {}
 
     by_name = {t.name: t for t in tools_result.tools}
@@ -315,7 +363,7 @@ async def _gate_status_resource(session: ClientSession, report: Report) -> None:
     try:
         resources_result = await session.list_resources()
     except Exception as exc:  # noqa: BLE001
-        report.record("status resource listed (resources/list)", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("status resource listed (resources/list)", "FAIL", _safe_exc(exc))
         return
 
     uris = {str(r.uri) for r in resources_result.resources}
@@ -327,7 +375,7 @@ async def _gate_status_resource(session: ClientSession, report: Report) -> None:
     try:
         read_result = await session.read_resource(_STATUS_RESOURCE_URI)
     except Exception as exc:  # noqa: BLE001
-        report.record("status resource (resources/read) includes both new tool names", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("status resource (resources/read) includes both new tool names", "FAIL", _safe_exc(exc))
         return
 
     text_blocks = [c.text for c in read_result.contents if hasattr(c, "text")]
@@ -352,7 +400,7 @@ async def _gate_happy_path(session: ClientSession, report: Report) -> tuple[str 
     try:
         payload = await _call_digest(session, date=EXPECTED_BUSINESS_DATE, timeframe="day", view="headline", comparator="last_year")
     except Exception as exc:  # noqa: BLE001
-        report.record("day+headline+last_year happy path", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("day+headline+last_year happy path", "FAIL", _safe_exc(exc))
         return None, None
 
     if payload.get("status") != "success":
@@ -388,7 +436,7 @@ async def _gate_same_session_evidence(session: ClientSession, report: Report, re
     try:
         payload = await _call_evidence(session, result_id)
     except Exception as exc:  # noqa: BLE001
-        report.record("same-session get_result_evidence succeeds", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("same-session get_result_evidence succeeds", "FAIL", _safe_exc(exc))
         return None
 
     if payload.get("result_id") != result_id:
@@ -429,7 +477,7 @@ async def _gate_zero_preservation(session: ClientSession, report: Report) -> Non
     try:
         payload = await _call_digest(session, date=EXPECTED_BUSINESS_DATE, timeframe="mtd", view="headline", comparator="budget")
     except Exception as exc:  # noqa: BLE001
-        report.record("mtd+budget zero preservation", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("mtd+budget zero preservation", "FAIL", _safe_exc(exc))
         return
 
     if payload.get("status") != "success":
@@ -466,7 +514,7 @@ async def _gate_request_validation(session: ClientSession, report: Report) -> No
         try:
             payload = await _call_digest(session, **arguments)
         except Exception as exc:  # noqa: BLE001
-            report.record(label, "FAIL", f"{type(exc).__name__}: {exc}")
+            report.record(label, "FAIL", _safe_exc(exc))
             continue
         if payload.get("status") == "error" and payload.get("code") == "invalid_request":
             report.record(label, "PASS")
@@ -480,7 +528,7 @@ async def _gate_malformed_result_id(session: ClientSession, report: Report) -> N
         try:
             payload = await _call_evidence(session, bad_id)
         except Exception as exc:  # noqa: BLE001
-            report.record(label, "FAIL", f"{type(exc).__name__}: {exc}")
+            report.record(label, "FAIL", _safe_exc(exc))
             continue
         if payload.get("status") == "error" and payload.get("code") == "invalid_request":
             report.record(label, "PASS")
@@ -493,7 +541,7 @@ async def _gate_missing_id_anti_oracle(session: ClientSession, report: Report) -
     try:
         payload = await _call_evidence(session, fake_id)
     except Exception as exc:  # noqa: BLE001
-        report.record("missing-id anti-oracle (never-created id -> generic unavailable response)", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("missing-id anti-oracle (never-created id -> generic unavailable response)", "FAIL", _safe_exc(exc))
         return None
     if payload.get("status") == "success":
         report.record("missing-id anti-oracle (never-created id -> generic unavailable response)", "FAIL", "a never-created result_id returned success")
@@ -512,10 +560,10 @@ async def _gate_cross_scope_denial(url: str, function_key: str | None, label: st
         report.record(gate_name, "NOT EXECUTED", f"{env_var} not provided")
         return
     try:
-        async with _connected_session(url, token, function_key) as (other_session, _protocol_path):
+        async with _connected_session(url, token, function_key) as (other_session, _negotiation):
             payload = await _call_evidence(other_session, result_id)
     except Exception as exc:  # noqa: BLE001
-        report.record(gate_name, "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record(gate_name, "FAIL", _safe_exc(exc))
         return
     if payload.get("status") == "success":
         report.record(gate_name, "FAIL", "cross-scope call unexpectedly succeeded - possible authorization defect")
@@ -527,6 +575,13 @@ async def _gate_cross_scope_denial(url: str, function_key: str | None, label: st
 
 
 def _gate_output_security(report: Report, *payloads: dict | None) -> None:
+    """Scans the successful get_performance_digest response and the
+    successful get_result_evidence response (both passed by the caller) for
+    the full R3C forbidden-output contract - hotel/session identifiers,
+    scope token/JWT, DAX/SQL, Cosmos endpoint/partition key, Fabric
+    workspace/dataset ids, credentials. Case-insensitive, checked against
+    the serialized payload(s) together.
+    """
     present = [p for p in payloads if p is not None]
     if not present:
         report.record("public output contains no hotel/session/token/DAX/Cosmos detail", "NOT EXECUTED", "no successful response captured to inspect")
@@ -594,24 +649,30 @@ async def _run(args: argparse.Namespace) -> int:
 
     if args.evidence_only:
         try:
-            async with _connected_session(url, primary_token, function_key) as (session, protocol_path):
-                report.record("MCP protocol negotiation", "PASS", protocol_path)
+            async with _connected_session(url, primary_token, function_key) as (session, negotiation):
+                report.record("MCP protocol negotiation", "PASS" if negotiation.is_modern else "FAIL", negotiation.description)
                 await _gate_durability_reread(session, report, args.evidence_only)
         except Exception as exc:  # noqa: BLE001
-            report.record("MCP protocol negotiation", "FAIL", f"{type(exc).__name__}: {exc}")
+            report.record("MCP protocol negotiation", "FAIL", _safe_exc(exc))
         return _print_summary(report)
 
     result_id = None
+    digest_payload = None
     evidence_payload = None
     missing_payload = None
     try:
-        async with _connected_session(url, primary_token, function_key) as (session, protocol_path):
-            report.record("MCP protocol negotiation", "PASS", protocol_path)
+        async with _connected_session(url, primary_token, function_key) as (session, negotiation):
+            # PASS only when server/discover succeeded AND the negotiated
+            # protocol is exactly _TARGET_PROTOCOL_VERSION - a legitimate
+            # legacy initialize() fallback is reported honestly (see
+            # negotiation.description) but this gate still FAILs, so R3C
+            # never goes green on a legacy-mode connection by accident.
+            report.record("MCP protocol negotiation", "PASS" if negotiation.is_modern else "FAIL", negotiation.description)
 
             await _gate_discovery_and_schema(session, report)
             await _gate_status_resource(session, report)
 
-            result_id, _digest_payload = await _gate_happy_path(session, report)
+            result_id, digest_payload = await _gate_happy_path(session, report)
 
             if result_id:
                 evidence_payload = await _gate_same_session_evidence(session, report, result_id)
@@ -624,9 +685,9 @@ async def _run(args: argparse.Namespace) -> int:
             await _gate_zero_preservation(session, report)
             await _gate_request_validation(session, report)
 
-            _gate_output_security(report, evidence_payload, missing_payload)
+            _gate_output_security(report, digest_payload, evidence_payload)
     except Exception as exc:  # noqa: BLE001
-        report.record("MCP protocol negotiation", "FAIL", f"{type(exc).__name__}: {exc}")
+        report.record("MCP protocol negotiation", "FAIL", _safe_exc(exc))
         _print_operator_confirmation_checklist(report)
         return _print_summary(report)
 
