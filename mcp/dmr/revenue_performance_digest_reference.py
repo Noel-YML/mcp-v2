@@ -74,9 +74,17 @@ REVENUE_METRIC_MAPPINGS: dict[str, RevenueMetricMapping] = {
     "total_fnb": RevenueMetricMapping(
         "total_fnb", "revenue.total_fnb", "F&B Revenue", "Total F&B Revenue", "Total F&B Revenue", "confirmed"
     ),
+    # Revenue_Group corrected to "Other & Misc Rev." (no period after "Misc") -
+    # live acceptance against HB981 (Hotel_ID=39) on 2026-07-28 found the
+    # governed value was off by exactly that period; the live, non-empty,
+    # singleton Revenue_Type-only probe result directly contradicted "Other &
+    # Misc. Rev.". group_mapping_state is "confirmed", not "inferred", because
+    # this exact (Revenue_Type, Revenue_Group) pair has now actually been
+    # observed live, not merely inferred from the mart's documented 4-group
+    # enumeration - see test_total_other_misc_group_mapping_is_confirmed_by_live_acceptance.
     "total_other_misc": RevenueMetricMapping(
-        "total_other_misc", "revenue.total_other_misc", "Other & Misc. Rev.", "Total Other & Misc Rev.",
-        "Total Other & Misc. Revenue", "inferred",
+        "total_other_misc", "revenue.total_other_misc", "Other & Misc Rev.", "Total Other & Misc Rev.",
+        "Total Other & Misc. Revenue", "confirmed",
     ),
     "occupancy_pct": RevenueMetricMapping(
         "occupancy_pct", "revenue.occupancy_pct", "ROOMS", "Occupancy %", "Occupancy %", "inferred"

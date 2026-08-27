@@ -479,6 +479,19 @@ def test_other_view_has_exactly_the_one_approved_metric():
     assert VIEW_METRICS["other"] == ("total_other_misc",)
 
 
+def test_total_other_misc_generated_dax_uses_the_corrected_revenue_group():
+    """Live acceptance against HB981 (Hotel_ID=39) on 2026-07-28 found the
+    governed Revenue_Group for total_other_misc was "Other & Misc. Rev." -
+    off by exactly the trailing period after "Misc" - live data actually
+    carries "Other & Misc Rev.". The generated DAX must filter on the
+    corrected string and must never re-introduce the old, wrong one.
+    """
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="other", comparator="none")
+    query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+    assert f'{dax_query_builder.REVENUE_TABLE}[Revenue_Group] = "Other & Misc Rev."' in query
+    assert "Other & Misc. Rev." not in query
+
+
 def test_revenue_digest_query_touches_exactly_one_audit_date_literal():
     """Structural protection against summing cumulative MTD/YTD snapshots
     across dates: only one DATE(...) literal value should ever appear

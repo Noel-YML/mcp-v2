@@ -70,8 +70,12 @@ FIXTURE_ROWS = [
 
     # Total Other & Misc Rev. - DUPLICATED at the identical physical grain
     # (case 11): two rows, same Hotel_ID/AuditDate/Revenue_Group/Revenue_Type.
-    RawRevenueRow(HOTEL_ID, BUSINESS_DATE, "Other & Misc. Rev.", "Total Other & Misc Rev.", value_mtd=25000.00),
-    RawRevenueRow(HOTEL_ID, BUSINESS_DATE, "Other & Misc. Rev.", "Total Other & Misc Rev.", value_mtd=25000.00),
+    # Revenue_Group is "Other & Misc Rev." (no period after "Misc") - corrected
+    # per live acceptance against HB981 (Hotel_ID=39) on 2026-07-28, which
+    # found the previously-governed "Other & Misc. Rev." was off by exactly
+    # that period.
+    RawRevenueRow(HOTEL_ID, BUSINESS_DATE, "Other & Misc Rev.", "Total Other & Misc Rev.", value_mtd=25000.00),
+    RawRevenueRow(HOTEL_ID, BUSINESS_DATE, "Other & Misc Rev.", "Total Other & Misc Rev.", value_mtd=25000.00),
 ]
 
 
@@ -163,6 +167,26 @@ def test_duplicate_physical_grain_is_detectable_via_source_row_count():
     row = _resolved(resolved, "total_other_misc")
     assert row.source_row_count == 2
     assert row.value == 50000.00  # overstated (25000 + 25000) - detectable evidence, not asserted "correct"
+    assert row.revenue_group == "Other & Misc Rev."
+
+
+def test_total_other_misc_matches_only_the_corrected_revenue_group():
+    """Live acceptance against HB981 (Hotel_ID=39) on 2026-07-28 found the
+    governed mapping was off by exactly the trailing period after "Misc" -
+    the resolver must match rows using "Other & Misc Rev.", and a row still
+    carrying the old, wrong "Other & Misc. Rev." string must NOT match at all
+    (proving there's no lingering alias/fallback, per the requirement to
+    never accept both strings).
+    """
+    mapping = REVENUE_METRIC_MAPPINGS["total_other_misc"]
+    assert mapping.revenue_group == "Other & Misc Rev."
+    assert mapping.group_mapping_state == "confirmed"
+
+    stale_row = RawRevenueRow(HOTEL_ID, BUSINESS_DATE, "Other & Misc. Rev.", "Total Other & Misc Rev.", value_mtd=99999.00)
+    resolved = resolve_revenue_performance_digest([stale_row], HOTEL_ID, BUSINESS_DATE, "mtd", "other", "none")
+    row = _resolved(resolved, "total_other_misc")
+    assert row.value is None  # the old-group row never matches - no alias, no fallback
+    assert row.source_row_count == 0
 
 
 # 12. F&B components + Total F&B: total_fnb uses ONLY Total F&B Revenue, never group-sums.

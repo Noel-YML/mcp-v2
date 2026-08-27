@@ -85,12 +85,33 @@ def test_confirmed_group_mappings_match_direct_repository_evidence():
     """revenue.total_revenue's Revenue_Group is confirmed directly by
     dax_query_builder.py's own docstring; the 4 F&B metrics' Revenue_Group
     is confirmed directly by dmr/semantics.py's own registered
-    dimension_filter on the F&B group-subtotal guard entry. Every other
-    mapping is "inferred" - not independently confirmed - and must be
-    validated against live data by live_acceptance_performance_digest.py.
+    dimension_filter on the F&B group-subtotal guard entry; total_other_misc
+    was upgraded from "inferred" to "confirmed" after live acceptance against
+    HB981 (Hotel_ID=39) on 2026-07-28 directly observed its real Revenue_Group
+    (see test_total_other_misc_group_mapping_is_confirmed_by_live_acceptance).
+    Every other mapping remains "inferred" - not independently confirmed -
+    and must still be validated against live data by
+    live_acceptance_performance_digest.py.
     """
     confirmed = {mid for mid, m in REVENUE_METRIC_MAPPINGS.items() if m.group_mapping_state == "confirmed"}
-    assert confirmed == {"total_revenue", "food", "beverage", "other_fnb_income", "total_fnb"}
+    assert confirmed == {"total_revenue", "food", "beverage", "other_fnb_income", "total_fnb", "total_other_misc"}
+
+
+def test_total_other_misc_group_mapping_is_confirmed_by_live_acceptance():
+    """Live acceptance against HB981 (Hotel_ID=39) on 2026-07-28 ran the
+    Revenue_Type-only probe for "Total Other & Misc Rev." and got back a
+    non-empty singleton group that directly CONTRADICTED the
+    then-governed "Other & Misc. Rev." (off by exactly the trailing period
+    after "Misc"). That live evidence is what corrected the mapping to
+    "Other & Misc Rev." - and is exactly why group_mapping_state is now
+    "confirmed" rather than "inferred": this specific (Revenue_Type,
+    Revenue_Group) pair has actually been observed live, not merely
+    inferred from the mart's documented 4-group enumeration.
+    """
+    mapping = REVENUE_METRIC_MAPPINGS["total_other_misc"]
+    assert mapping.revenue_group == "Other & Misc Rev."
+    assert mapping.revenue_type == "Total Other & Misc Rev."
+    assert mapping.group_mapping_state == "confirmed"
 
 
 def test_room_density_average_spend_and_por_are_not_governed_in_r1():
