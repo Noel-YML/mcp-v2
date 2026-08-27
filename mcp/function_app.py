@@ -69,7 +69,9 @@ import config
 import health
 from config import FabricOptions
 from fabric_client.service import FabricQueryService
-from tools import dmr_tools
+from results.config import ResultsStoreOptions, require_cosmos_backend, result_ttl_seconds_from_env
+from results.factory import LazyResultRepository
+from tools import dmr_tools, revenue_digest_tools
 
 app = func.FunctionApp()
 
@@ -77,6 +79,27 @@ _fabric_options = FabricOptions.from_env()
 fabric_service = FabricQueryService(_fabric_options)
 _public_keys = _fabric_options.scope_public_keys
 _readiness = health.Readiness(fabric_service, _public_keys)
+
+# R3B - this deployed Azure Functions hosting MUST run on a durable,
+# cross-instance-shared result store: require_cosmos_backend() refuses to
+# start on in_memory (explicit or the config module's own default) - never
+# caught/substituted here, since that would recreate the exact
+# cross-instance result-loss defect R3A exists to prevent (see
+# results/config.py). result_repository is a single process-lifetime
+# LazyResultRepository - the same instance both get_performance_digest and
+# get_result_evidence use below, so a result_id created by one tool call can
+# be retrieved by a later one on this or any other instance. Its actual
+# Cosmos client/credential construction is deferred to first real use (see
+# results/factory.py) so importing this module never itself performs
+# network I/O.
+_results_store_options = ResultsStoreOptions.from_env()
+require_cosmos_backend(_results_store_options)
+result_repository = LazyResultRepository(_results_store_options)
+_result_ttl_seconds = result_ttl_seconds_from_env()
+
+# Combines the 5 legacy DMR tools with the 2 R3B governed capabilities, each
+# already declared exactly once in its own module - never redeclared here.
+_ALL_TOOL_NAMES = dmr_tools.TOOL_NAMES + revenue_digest_tools.TOOL_NAMES
 
 _SCOPE_HEADER = "x-ariel-scope"
 _ALLOWED_TRANSPORT = "http-streamable"
@@ -156,7 +179,7 @@ _REVENUE_SNAPSHOT_TOOL_PROPERTIES = json.dumps([_REVENUE_SNAPSHOT_DAYS_PROPERTY]
     mime_type="application/json",
 )
 def status_resource(context) -> str:
-    return json.dumps(health.status_resource(_readiness, config.analytics_schema_version(), dmr_tools.TOOL_NAMES))
+    return json.dumps(health.status_resource(_readiness, config.analytics_schema_version(), _ALL_TOOL_NAMES))
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +310,46 @@ def get_dmr_holdings_outlook(context) -> str:
     if error:
         return error
     return dmr_tools.get_dmr_holdings_outlook(fabric_service, scope, payload.get("arguments", {}).get("days"))
+
+
+# ---------------------------------------------------------------------------
+# R3B - the 2 governed Revenue Performance Digest result/evidence
+# capabilities. Scope resolution reuses the exact same _resolve_scope(payload,
+# tool) every DMR tool above already uses - transport.properties.headers
+# only, never payload["arguments"] - and the same strict
+# transport.name == "http-streamable" fail-closed check. result_repository
+# and _result_ttl_seconds are the single process-lifetime instances
+# constructed at module scope above - never rebuilt per call.
+# ---------------------------------------------------------------------------
+@app.mcp_tool_trigger(
+    arg_name="context",
+    tool_name="get_performance_digest",
+    description=revenue_digest_tools.GET_PERFORMANCE_DIGEST_DESCRIPTION,
+    tool_properties=revenue_digest_tools.GET_PERFORMANCE_DIGEST_TOOL_PROPERTIES,
+)
+def get_performance_digest(context) -> str:
+    payload = json.loads(context)
+    scope, error = _resolve_scope(payload, "get_performance_digest")
+    if error:
+        return error
+    arguments = payload.get("arguments", {})
+    return revenue_digest_tools.get_performance_digest(
+        fabric_service, scope, result_repository, _result_ttl_seconds,
+        arguments.get("date"), arguments.get("timeframe"), arguments.get("view"),
+        arguments.get("comparator", "none"),
+    )
+
+
+@app.mcp_tool_trigger(
+    arg_name="context",
+    tool_name="get_result_evidence",
+    description=revenue_digest_tools.GET_RESULT_EVIDENCE_DESCRIPTION,
+    tool_properties=revenue_digest_tools.GET_RESULT_EVIDENCE_TOOL_PROPERTIES,
+)
+def get_result_evidence(context) -> str:
+    payload = json.loads(context)
+    scope, error = _resolve_scope(payload, "get_result_evidence")
+    if error:
+        return error
+    arguments = payload.get("arguments", {})
+    return revenue_digest_tools.get_result_evidence(result_repository, scope, arguments.get("result_id"))

@@ -29,12 +29,18 @@ class ErrorCode(StrEnum):
     FABRIC_UNAVAILABLE = "fabric_unavailable"
     RESPONSE_SCHEMA_CHANGED = "response_schema_changed"
     INTERNAL_ERROR = "internal_error"
+    # R3B: a durable ResultRepository (results/repository.py's
+    # ResultRepositoryUnavailable) infrastructure failure - deliberately
+    # its own code, not a reuse of FABRIC_UNAVAILABLE, since it names a
+    # different backend (the result/evidence store, not Fabric) even though
+    # both are "the backend is temporarily unreachable."
+    RESULT_STORE_UNAVAILABLE = "result_store_unavailable"
 
 
 # Whether a caller could reasonably expect a retry to succeed. Never true for
 # anything caused by the request itself (bad input, denied permission) - only
 # for conditions that are plausibly transient on Fabric's/the network's side.
-_RETRYABLE_CODES = frozenset({ErrorCode.FABRIC_TIMEOUT, ErrorCode.FABRIC_UNAVAILABLE})
+_RETRYABLE_CODES = frozenset({ErrorCode.FABRIC_TIMEOUT, ErrorCode.FABRIC_UNAVAILABLE, ErrorCode.RESULT_STORE_UNAVAILABLE})
 
 
 def new_trace_id() -> str:

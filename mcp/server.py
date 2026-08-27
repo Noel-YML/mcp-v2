@@ -45,7 +45,9 @@ import config
 import health
 from config import FabricOptions
 from fabric_client.service import FabricQueryService
-from tools import dmr_tools
+from results.config import ResultsStoreOptions, result_ttl_seconds_from_env
+from results.factory import LazyResultRepository
+from tools import dmr_tools, revenue_digest_tools
 
 logging.basicConfig(level=logging.INFO)
 
@@ -60,6 +62,27 @@ _readiness = health.Readiness(fabric_service, fabric_options.scope_public_keys)
 
 dmr_tools.register(mcp, fabric_service, fabric_options.scope_public_keys)
 
+# R3B - the governed Revenue Performance Digest result/evidence
+# capabilities. This local/dev hosting MAY run on ARIEL_RESULTS_STORE_BACKEND
+# =in_memory (the default when unset) - unlike function_app.py's deployed
+# hosting, which requires ARIEL_RESULTS_COSMOS_* (see that module). Both the
+# repository and the TTL are process-lifetime singletons, constructed once
+# here - never per tool call. LazyResultRepository defers any real Cosmos
+# network I/O until first use, so importing this module (even with
+# backend=cosmos configured) never itself performs network I/O - see
+# results/factory.py.
+_results_store_options = ResultsStoreOptions.from_env()
+_result_repository = LazyResultRepository(_results_store_options)
+_result_ttl_seconds = result_ttl_seconds_from_env()
+
+revenue_digest_tools.register(mcp, fabric_service, _result_repository, fabric_options.scope_public_keys, _result_ttl_seconds)
+
+# The single source of truth for "what tools does this server register" -
+# combines the 5 legacy DMR tools with the 2 R3B governed capabilities, each
+# already declared exactly once in its own module (dmr_tools.TOOL_NAMES /
+# revenue_digest_tools.TOOL_NAMES) - never redeclared here.
+_ALL_TOOL_NAMES = dmr_tools.TOOL_NAMES + revenue_digest_tools.TOOL_NAMES
+
 
 # ---------------------------------------------------------------------------
 # Resources (E5) - unlike tools, these are readable via the MCP protocol
@@ -73,7 +96,7 @@ dmr_tools.register(mcp, fabric_service, fabric_options.scope_public_keys)
     mime_type="application/json",
 )
 def status_resource() -> dict:
-    return health.status_resource(_readiness, config.analytics_schema_version(), dmr_tools.TOOL_NAMES)
+    return health.status_resource(_readiness, config.analytics_schema_version(), _ALL_TOOL_NAMES)
 
 
 # ---------------------------------------------------------------------------

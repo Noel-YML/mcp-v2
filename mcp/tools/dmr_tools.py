@@ -162,6 +162,17 @@ def _resolve_scope_from_ctx(ctx: Context, public_keys: dict[str, str], tool: str
     return _resolve_scope(token, public_keys, tool)
 
 
+# Public aliases (R3B) - so tools/revenue_digest_tools.py's own SDK
+# registration can reuse this EXACT scope resolution (see its module
+# docstring: "DO NOT create a second implementation of JWT verification")
+# without reaching into this module's private names. Deliberately additive,
+# not a rename: the private names above are unchanged, and every existing
+# caller/test that references `_resolve_scope_from_ctx`/`_ScopeResolutionError`
+# directly keeps working exactly as before.
+resolve_scope_from_ctx = _resolve_scope_from_ctx
+ScopeResolutionError = _ScopeResolutionError
+
+
 def _clean_row(row: dict) -> dict:
     """DAX query results key rows by full column reference (`_Dates[Date]`,
     `'derived mart_dmr_segment_matrix'[Main_Group]`, or a bare `[Alias]` for

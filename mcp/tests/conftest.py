@@ -36,6 +36,23 @@ os.environ.setdefault("AR_FABRIC_CLIENT_ID", "test-client")
 os.environ.setdefault("AR_FABRIC_CLIENT_SECRET", "test-secret")
 os.environ.setdefault("ARIEL_SCOPE_PUBLIC_KEYS", "{}")
 
+# R3B: function_app.py's module-scope code REQUIRES ARIEL_RESULTS_STORE_BACKEND
+# =cosmos (require_cosmos_backend - see results/config.py) and
+# ARIEL_RESULTS_TTL_SECONDS, both validated at import time just like the
+# Fabric settings above. Dummy-but-well-formed values only: constructing a
+# LazyResultRepository never itself performs network I/O (see
+# results/factory.py) - the real azure.cosmos.CosmosClient(...) call it
+# would eventually make is deferred until first actual put()/get(), which no
+# test here triggers through this global instance (tests exercising Cosmos
+# behavior construct their own CosmosResultRepository directly with a fake
+# container instead - see test_cosmos_result_repository.py).
+os.environ.setdefault("ARIEL_RESULTS_STORE_BACKEND", "cosmos")
+os.environ.setdefault("ARIEL_RESULTS_COSMOS_ENDPOINT", "https://test-ariel-results.documents.azure.com:443/")
+os.environ.setdefault("ARIEL_RESULTS_COSMOS_DATABASE", "test-database")
+os.environ.setdefault("ARIEL_RESULTS_COSMOS_CONTAINER", "test-container")
+os.environ.setdefault("ARIEL_RESULTS_COSMOS_AUTH_MODE", "managed_identity")
+os.environ.setdefault("ARIEL_RESULTS_TTL_SECONDS", "300")
+
 
 @pytest.fixture(scope="session")
 def rsa_keypair():

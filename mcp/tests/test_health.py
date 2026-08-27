@@ -7,6 +7,7 @@ import json
 
 import health
 from tools.dmr_tools import TOOL_NAMES
+from tools.revenue_digest_tools import TOOL_NAMES as REVENUE_DIGEST_TOOL_NAMES
 
 
 class _FakeFabricService:
@@ -91,7 +92,9 @@ def test_function_app_status_resource_matches_health_status_resource(monkeypatch
     body = json.loads(function_app.status_resource(None))
 
     assert body["status"] == "ready"
-    assert body["tools"] == list(TOOL_NAMES)
+    # R3B: status now reflects the combined DMR + governed Revenue digest
+    # tool surface, not just the 5 legacy DMR tools.
+    assert body["tools"] == list(TOOL_NAMES) + list(REVENUE_DIGEST_TOOL_NAMES)
 
 
 def test_function_app_health_live_returns_minimal_200():

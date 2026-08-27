@@ -14,19 +14,32 @@ accidentally cross-wired.
 
 Backend selection defaults to `in_memory` - nothing existing sets
 `ARIEL_RESULTS_STORE_BACKEND`, so this module existing changes no current
-test or deployment's behavior. This is an R3A-only construction seam (see
-`results/factory.py`): nothing here is wired into `server.py`/
-`function_app.py` yet.
+test or deployment's behavior. This is a construction seam (see
+`results/factory.py`) for `server.py`/`function_app.py` (R3B) to use.
 
-IMPORTANT for R3B (not this phase): the deployed Azure Functions hosting
-MUST select `ARIEL_RESULTS_STORE_BACKEND=cosmos` explicitly and must NEVER
-silently fall back to `InMemoryResultRepository` if Cosmos configuration is
-missing or invalid - `from_env()` below already fails closed (raises
-`ResultsStoreConfigError`) rather than defaulting when `cosmos` is selected
-but incompletely configured; R3B's host wiring must preserve that failure
-rather than catching it and substituting the in-memory backend.
+`require_cosmos_backend()` (R3B) is the deployed Azure Functions hosting's
+own policy check: it MUST select `ARIEL_RESULTS_STORE_BACKEND=cosmos`
+explicitly and must NEVER silently fall back to `InMemoryResultRepository`
+if Cosmos configuration is missing or invalid - `from_env()` above already
+fails closed (raises `ResultsStoreConfigError`) rather than defaulting when
+`cosmos` is selected but incompletely configured; `require_cosmos_backend()`
+adds the further guard that `in_memory` (explicit or the unset default)
+itself is rejected outright for that hosting. `server.py`'s local/dev
+hosting does NOT call this - it may run on `in_memory`.
+
+`result_ttl_seconds_from_env()` (R3B) is the server-owned TTL every
+governed-result-producing tool call uses - see revenue_digest_execution.py's
+own `result_ttl_seconds` parameter, which has always been required, never
+defaulted, because no production TTL had been approved. It still hasn't
+been assigned one by fiat here either: this function requires
+`ARIEL_RESULTS_TTL_SECONDS` to be set explicitly and fails closed if it's
+missing/non-numeric/non-finite/<=0, exactly mirroring
+revenue_digest_execution.py's own runtime TTL validation, but at process
+startup instead of per-call - TTL is never a tool argument a model/caller
+can influence.
 """
 
+import math
 import os
 from dataclasses import dataclass
 from enum import StrEnum
@@ -154,3 +167,43 @@ class ResultsStoreOptions:
             client_secret=client_secret,
             managed_identity_client_id=managed_identity_client_id,
         )
+
+
+def require_cosmos_backend(options: ResultsStoreOptions) -> None:
+    """The deployed Azure Functions hosting's own host policy (R3B) - call
+    this right after `ResultsStoreOptions.from_env()`, before constructing
+    anything. Raises `ResultsStoreConfigError` unless `backend is COSMOS`,
+    so a Cosmos misconfiguration (or simply forgetting to set
+    `ARIEL_RESULTS_STORE_BACKEND=cosmos` at all) fails startup instead of
+    silently running that hosting on `InMemoryResultRepository` - which
+    would recreate the exact cross-instance result-loss defect R3A exists
+    to prevent. `server.py`'s local/dev hosting does not call this.
+    """
+    if options.backend is not ResultsStoreBackend.COSMOS:
+        raise ResultsStoreConfigError(
+            "This hosting requires ARIEL_RESULTS_STORE_BACKEND=cosmos - in_memory is not permitted "
+            "for the deployed Azure Functions hosting (it would lose results across instances/restarts)."
+        )
+
+
+def result_ttl_seconds_from_env() -> float:
+    """The server-owned TTL for every governed-result-producing tool call
+    (R3B) - `ARIEL_RESULTS_TTL_SECONDS`, required with no default (no
+    production TTL has been approved), validated eagerly here so a missing
+    or invalid setting fails at process startup rather than on the first
+    model call. Never a tool argument - see this module's docstring.
+    """
+    raw = os.environ.get("ARIEL_RESULTS_TTL_SECONDS")
+    if raw is None or raw == "":
+        raise ResultsStoreConfigError(
+            "ARIEL_RESULTS_TTL_SECONDS must be set - no production result TTL has been approved as a default."
+        )
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ResultsStoreConfigError(f"ARIEL_RESULTS_TTL_SECONDS must be a real number, got {raw!r}.") from None
+    if not math.isfinite(value):
+        raise ResultsStoreConfigError("ARIEL_RESULTS_TTL_SECONDS must be finite (not NaN or +/-infinity).")
+    if value <= 0:
+        raise ResultsStoreConfigError("ARIEL_RESULTS_TTL_SECONDS must be greater than 0.")
+    return value
