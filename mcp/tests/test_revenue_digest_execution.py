@@ -71,12 +71,12 @@ def _build_rows(view, timeframe, comparator, *, hotel_id=HOTEL_ID, business_date
     return rows
 
 
-def _run(rows, *, timeframe, view, comparator, hotel_id=HOTEL_ID, repository=None):
-    service = FakeFabricQueryService(rows=rows)
+def _run(rows, *, timeframe, view, comparator, hotel_id=HOTEL_ID, repository=None, ttl_seconds=300, service=None):
+    service = service or FakeFabricQueryService(rows=rows)
     scope = _scope(hotel_id=hotel_id)
     request = RevenueDigestRequest(date=BUSINESS_DATE, timeframe=timeframe, view=view, comparator=comparator)
     repository = repository or InMemoryResultRepository()
-    return rde.execute_revenue_performance_digest(service, scope, request, repository, result_ttl_seconds=300)
+    return rde.execute_revenue_performance_digest(service, scope, request, repository, result_ttl_seconds=ttl_seconds)
 
 
 # --- Happy paths (1-4) -------------------------------------------------------
@@ -434,3 +434,167 @@ def test_evidence_serialization_also_has_no_authorization_state():
     assert "token" not in lowered
     assert "EVALUATE" not in serialized.upper()
     assert "SUMMARIZECOLUMNS" not in serialized.upper()
+
+
+# ---------------------------------------------------------------------------
+# Hardening fix 1: result_ttl_seconds validated before any execution.
+# ---------------------------------------------------------------------------
+
+class _RecordingFabricQueryService:
+    """Proves Fabric was (or was not) actually called, independent of what
+    it would have returned."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.called = False
+
+    def run_query(self, dax_query: str) -> FabricQueryResult:
+        self.called = True
+        return FabricQueryResult.ok(self._rows)
+
+
+@pytest.mark.parametrize("ttl", [1, 300, 0.5, 86400.0])
+def test_valid_result_ttl_seconds_is_accepted(ttl):
+    rows = _build_rows("other", "mtd", "none")
+    result = _run(rows, timeframe="mtd", view="other", comparator="none", ttl_seconds=ttl)
+    assert result.status == "success"
+
+
+@pytest.mark.parametrize("bad_ttl", [0, -1, -300.0, float("nan"), float("inf"), float("-inf"), True, False, "300"])
+def test_invalid_result_ttl_seconds_is_rejected(bad_ttl):
+    rows = _build_rows("other", "mtd", "none")
+    with pytest.raises(rde.RevenueDigestExecutionError) as exc_info:
+        _run(rows, timeframe="mtd", view="other", comparator="none", ttl_seconds=bad_ttl)
+    assert exc_info.value.tool_error.code == ErrorCode.INVALID_REQUEST
+
+
+def test_invalid_result_ttl_seconds_never_calls_fabric():
+    rows = _build_rows("other", "mtd", "none")
+    recording_service = _RecordingFabricQueryService(rows)
+    with pytest.raises(rde.RevenueDigestExecutionError):
+        _run(rows, timeframe="mtd", view="other", comparator="none", ttl_seconds=0, service=recording_service)
+    assert recording_service.called is False
+
+
+def test_invalid_result_ttl_seconds_never_writes_repository_state():
+    rows = _build_rows("other", "mtd", "none")
+    repository = InMemoryResultRepository()
+    with pytest.raises(rde.RevenueDigestExecutionError):
+        _run(rows, timeframe="mtd", view="other", comparator="none", ttl_seconds=float("nan"), repository=repository)
+    assert repository._store == {}
+
+
+# ---------------------------------------------------------------------------
+# Hardening fix 2: malformed BusinessDate fails closed, never a raw
+# ValueError/TypeError.
+# ---------------------------------------------------------------------------
+
+def test_malformed_business_date_string_blocks_with_response_schema_changed():
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"BusinessDate": "not-a-date"}})
+    with pytest.raises(rde.RevenueDigestExecutionError) as exc_info:
+        _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert exc_info.value.tool_error.code == ErrorCode.RESPONSE_SCHEMA_CHANGED
+    assert exc_info.value.tool_error.message == rde._SCHEMA_VIOLATION_MESSAGE
+
+
+def test_malformed_business_date_never_leaks_a_raw_valueerror():
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"BusinessDate": "not-a-date"}})
+    try:
+        _run(rows, timeframe="mtd", view="other", comparator="none")
+        raise AssertionError("expected RevenueDigestExecutionError")
+    except rde.RevenueDigestExecutionError:
+        pass
+    except ValueError:
+        pytest.fail("a raw ValueError escaped execute_revenue_performance_digest")
+
+
+def test_null_business_date_blocks_as_response_schema_mismatch():
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"BusinessDate": None}})
+    with pytest.raises(rde.RevenueDigestExecutionError) as exc_info:
+        _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert exc_info.value.tool_error.code == ErrorCode.RESPONSE_SCHEMA_CHANGED
+
+
+def test_valid_iso_date_string_business_date_remains_accepted():
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"BusinessDate": BUSINESS_DATE.isoformat()}})
+    result = _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert result.status == "success"
+
+
+def test_valid_iso_datetime_string_business_date_remains_accepted():
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"BusinessDate": f"{BUSINESS_DATE.isoformat()}T00:00:00"}})
+    result = _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert result.status == "success"
+
+
+def test_python_date_object_business_date_remains_accepted():
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"BusinessDate": BUSINESS_DATE}})
+    result = _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert result.status == "success"
+
+
+def test_python_datetime_object_business_date_remains_accepted():
+    from datetime import datetime as _dt
+
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"BusinessDate": _dt(2026, 7, 28, 0, 0, 0)}})
+    result = _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert result.status == "success"
+
+
+# ---------------------------------------------------------------------------
+# Hardening fix 3: numeric wire fields (Value/ComparisonValue/
+# SourceVarianceValue) validated before arithmetic or persistence.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("field", ["Value", "ComparisonValue", "SourceVarianceValue"])
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf"), True, False, "100", [1, 2], {"a": 1}])
+def test_malformed_numeric_wire_field_blocks(field, bad_value):
+    rows = _build_rows("other", "mtd", "budget", per_metric={"total_other_misc": {field: bad_value}})
+    with pytest.raises(rde.RevenueDigestExecutionError) as exc_info:
+        _run(rows, timeframe="mtd", view="other", comparator="budget")
+    assert exc_info.value.tool_error.code == ErrorCode.RESPONSE_SCHEMA_CHANGED
+    assert exc_info.value.tool_error.message == rde._SCHEMA_VIOLATION_MESSAGE
+
+
+def test_valid_zero_numeric_field_stays_zero_not_rejected():
+    rows = _build_rows("other", "mtd", "budget", value=100.0, comparison_value=0.0, source_variance_value=100.0)
+    result = _run(rows, timeframe="mtd", view="other", comparator="budget")
+    m = result.metrics[0]
+    assert m.comparison_value == 0.0
+
+
+def test_negative_legitimate_numeric_value_remains_valid():
+    rows = _build_rows("other", "mtd", "budget", value=-500.0, comparison_value=-450.0, source_variance_value=-50.0)
+    result = _run(rows, timeframe="mtd", view="other", comparator="budget")
+    m = result.metrics[0]
+    assert m.value == -500.0
+    assert m.comparison_value == -450.0
+    assert m.source_variance_value == -50.0
+    assert m.computed_variance_value == pytest.approx(-50.0)
+
+
+def test_valid_integer_numeric_input_is_accepted_and_normalized_to_float():
+    rows = _build_rows("other", "mtd", "budget", value=100, comparison_value=90, source_variance_value=10)
+    result = _run(rows, timeframe="mtd", view="other", comparator="budget")
+    m = result.metrics[0]
+    assert m.value == 100.0
+    assert isinstance(m.value, float)
+    assert m.comparison_value == 90.0
+    assert m.source_variance_value == 10.0
+
+
+def test_comparator_none_still_validates_malformed_value():
+    """comparator="none" means no subtraction is ever performed, but a
+    malformed Value must still be rejected - it must not slip through
+    merely because arithmetic never touches it."""
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"Value": float("nan")}})
+    with pytest.raises(rde.RevenueDigestExecutionError) as exc_info:
+        _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert exc_info.value.tool_error.code == ErrorCode.RESPONSE_SCHEMA_CHANGED
+
+
+def test_comparator_none_still_validates_malformed_comparison_value_even_though_unused():
+    rows = _build_rows("other", "mtd", "none", per_metric={"total_other_misc": {"ComparisonValue": "not-a-number"}})
+    with pytest.raises(rde.RevenueDigestExecutionError) as exc_info:
+        _run(rows, timeframe="mtd", view="other", comparator="none")
+    assert exc_info.value.tool_error.code == ErrorCode.RESPONSE_SCHEMA_CHANGED

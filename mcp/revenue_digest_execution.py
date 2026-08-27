@@ -38,6 +38,7 @@ this module is deliberately upstream of all of them.
 import dataclasses
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -188,10 +189,64 @@ def _clean_row(row: dict) -> dict:
     return {key.split("[")[-1].rstrip("]"): value for key, value in row.items()}
 
 
-def _parse_date(value: Any) -> date:
+def _parse_business_date(value: Any) -> date | None:
+    """Never raises - returns `None` for anything that can't be parsed as a
+    date (including `None` itself), so a malformed or missing `BusinessDate`
+    from Fabric is reported through the SAME echo-mismatch path every other
+    wrong echo field already uses (`row_business_date != request.date`),
+    rather than letting a raw `ValueError`/`TypeError` escape
+    `execute_revenue_performance_digest`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        # datetime IS a date subclass, but date/datetime instances at the
+        # same calendar day are never `==` in Python - checked first and
+        # explicitly narrowed via `.date()`, or a real `datetime` would
+        # never equal `request.date` even when it should.
+        return value.date()
     if isinstance(value, date):
         return value
-    return datetime.fromisoformat(str(value)[:10]).date()
+    try:
+        return datetime.fromisoformat(str(value)[:10]).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _validate_result_ttl_seconds(value: Any) -> float:
+    """Pure validator - rejects, never coerces or defaults, an unsafe TTL.
+    `bool` is a Python `int` subclass and would otherwise pass a bare
+    `isinstance(value, (int, float))` check, so it is rejected explicitly
+    first. `NaN`/`+-Infinity` both pass that same numeric-type check yet
+    make `now + value` either meaningless (`NaN`) or unboundedly far in the
+    future (`inf`) - `math.isfinite()` is required, not just a type check.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("result_ttl_seconds must be a real number, not a bool or non-numeric value.")
+    if not math.isfinite(value):
+        raise ValueError("result_ttl_seconds must be finite (not NaN or +/-infinity).")
+    if value <= 0:
+        raise ValueError("result_ttl_seconds must be greater than 0.")
+    return float(value)
+
+
+def _validate_numeric_field(value: Any) -> float | None:
+    """Pure validator for the Value/ComparisonValue/SourceVarianceValue wire
+    fields. `None` passes through unchanged (a legitimately unresolved
+    metric). `bool` is explicitly rejected (an `int` subclass). `NaN`/
+    `+-Infinity` are rejected - a value that can't be meaningfully compared
+    or subtracted must never silently flow into deterministic arithmetic or
+    persistence. Raises `ValueError` on rejection - the caller translates
+    that into the standard response-schema failure, never a raw
+    TypeError/ValueError escaping the execution boundary.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("expected a finite numeric value or null.")
+    if not math.isfinite(value):
+        raise ValueError("expected a finite numeric value or null.")
+    return float(value)
 
 
 def _log_error(event: str, trace_id: str, detail: dict) -> None:
@@ -232,6 +287,13 @@ def execute_revenue_performance_digest(
     guessed result.
     """
     trace_id = new_trace_id()
+
+    try:
+        validated_ttl_seconds = _validate_result_ttl_seconds(result_ttl_seconds)
+    except ValueError as exc:
+        raise RevenueDigestExecutionError(
+            ToolError(ErrorCode.INVALID_REQUEST, f"revenue performance digest request was rejected: {exc}", trace_id)
+        ) from exc
 
     try:
         dax_query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, scope)
@@ -308,7 +370,7 @@ def execute_revenue_performance_digest(
             raise RevenueDigestExecutionError(ToolError(ErrorCode.INTERNAL_ERROR, _DATA_INTEGRITY_MESSAGE, trace_id))
 
         # --- D. Request echoes. ---
-        row_business_date = _parse_date(row.get("BusinessDate")) if row.get("BusinessDate") is not None else None
+        row_business_date = _parse_business_date(row.get("BusinessDate"))
         echoes = {
             "BusinessDate": (row_business_date, request.date),
             "Timeframe": (row.get("Timeframe"), request.timeframe),
@@ -353,9 +415,19 @@ def execute_revenue_performance_digest(
             _log_error("revenue_digest_duplicate_physical_grain", trace_id, {"metricId": metric_id, "sourceRowCount": source_row_count})
             raise RevenueDigestExecutionError(ToolError(ErrorCode.INTERNAL_ERROR, _DATA_INTEGRITY_MESSAGE, trace_id))
 
-        value = row.get("Value")
-        comparison_value = row.get("ComparisonValue")
-        source_variance_value = row.get("SourceVarianceValue")
+        # Numeric wire-field validation - applies unconditionally to all 3
+        # fields regardless of comparator, so a malformed Value can never
+        # slip through under comparator="none" just because no subtraction
+        # is performed on it.
+        try:
+            value = _validate_numeric_field(row.get("Value"))
+            comparison_value = _validate_numeric_field(row.get("ComparisonValue"))
+            source_variance_value = _validate_numeric_field(row.get("SourceVarianceValue"))
+        except ValueError as exc:
+            raise _fail(
+                trace_id, ErrorCode.RESPONSE_SCHEMA_CHANGED, _SCHEMA_VIOLATION_MESSAGE,
+                log_event="revenue_digest_invalid_numeric_field", log_detail={"metric_id": metric_id},
+            ) from exc
 
         if source_row_count == 0:
             # DO NOT drop the metric, and DO NOT trust any of these being
@@ -457,7 +529,7 @@ def execute_revenue_performance_digest(
             hotel_id=scope.hotel_id,
             session_id_hash=hash_session_id(scope.session_id),
             created_at=now,
-            expires_at=now + result_ttl_seconds,
+            expires_at=now + validated_ttl_seconds,
             query_id=QueryId.REVENUE_PERFORMANCE_DIGEST_V1.value,
             query_version=_QUERY_DEFINITION.version,
             result=result,
