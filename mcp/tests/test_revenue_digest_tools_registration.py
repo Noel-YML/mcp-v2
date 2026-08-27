@@ -1,23 +1,37 @@
-"""Tests for the R3B MCP host wiring itself - the actual registered SDK
-tool schema (server.py) and the explicit Azure Functions property schema
-(function_app.py/tools/revenue_digest_tools.py), plus that both hostings'
-scope resolution continues to come only from transport headers, never from
+"""Tests for the R3B/R3D MCP tool wiring itself - the actual registered SDK
+tool schema (server.mcp, and a freshly-built hosting.build_ariel_mcp_server
+server used for the deployed-adapter equivalence checks), plus that scope
+resolution continues to come only from transport headers, never from
 `arguments`.
+
+R3D replaced the deployed Azure Functions hosting's native
+`@app.mcp_tool_trigger` extension (and its hand-written Azure property-schema
+constants) with the official MCP SDK's ASGI hosting via
+`hosting.build_capability_honest_lowlevel_server` - see hosting.py's module
+docstring. There is no longer a second, independently-declared schema to test
+here: the adapter performs zero transformation on tool/resource objects, so
+"the Azure Functions schema" and "the SDK schema" are now the same objects
+served through two different transports. What this file proves instead is
+that the *wire* schema returned through the adapter (a real ClientSession
+tools/list call over a real local server) matches the direct high-level
+server's schema exactly - not just that a Python object equals itself.
 """
 
 import asyncio
 import json
-from datetime import date, datetime, timezone
+from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
-import function_app
+import hosting
 import server
 from dmr import semantics
 from dmr.revenue_performance_digest_reference import REVENUE_METRIC_MAPPINGS, VIEW_METRICS
 from fabric_client.result import FabricQueryResult
-from results.repository import InMemoryResultRepository
+from mcp.server.mcpserver import Context
 from scope import scope_token
+from uvicorn_test_server import UvicornTestServer, adapter_client_session
 
 HOTEL_ID = 39
 BUSINESS_DATE = date(2026, 7, 28)
@@ -57,6 +71,18 @@ def _build_rows(view, timeframe, comparator, hotel_id=HOTEL_ID, business_date=BU
         _build_row(metric_id, hotel_id=hotel_id, business_date=business_date, timeframe=timeframe, view=view, comparator=comparator)
         for metric_id in VIEW_METRICS[view]
     ]
+
+
+def _fake_ctx(mcp, headers):
+    """A minimal duck-typed request context exposing just `.request.headers`
+    - the only thing `Context.headers` (mcp/server/mcpserver/context.py)
+    actually reads (`getattr(self.request_context.request, "headers", None)`).
+    No SDK internals are touched; this is the same pattern
+    test_tool_scope_enforcement.py's `_FakeCtx` already uses one level lower
+    (directly against `dmr_tools._resolve_scope_from_ctx`), just wrapped in a
+    real public `Context` here since these tests go through `mcp.call_tool`.
+    """
+    return Context(request_context=SimpleNamespace(request=SimpleNamespace(headers=headers)), mcp_server=mcp)
 
 
 # =============================================================================
@@ -128,156 +154,121 @@ def test_get_performance_digest_date_field_has_no_enum_or_special_format():
 
 
 # =============================================================================
-# Azure Functions explicit property schema (function_app.py wiring, backed
-# by tools/revenue_digest_tools.py's centralized property constants)
+# R3D: schema equivalence through the ACTUAL capability-honest low-level
+# adapter, over a real local server and a real MCP ClientSession - not a
+# same-object comparison. Proves the wire boundary being deployed, not just
+# that the adapter's Python composition performs zero transformation.
 # =============================================================================
 
 
-def test_get_performance_digest_azure_properties_exact_names_and_required():
-    props = json.loads(function_app.revenue_digest_tools.GET_PERFORMANCE_DIGEST_TOOL_PROPERTIES)
-    by_name = {p["propertyName"]: p for p in props}
-    assert set(by_name) == {"date", "timeframe", "view", "comparator"}
-    assert by_name["date"]["isRequired"] is True
-    assert by_name["timeframe"]["isRequired"] is True
-    assert by_name["view"]["isRequired"] is True
-    assert by_name["comparator"]["isRequired"] is False
-    assert all(p["propertyType"] == "string" for p in props)
+def test_adapter_wire_schema_matches_the_direct_high_level_server_for_all_tools():
+    mcp2, _fabric, _readiness = hosting.build_ariel_mcp_server(require_cosmos=False)
+    direct_tools = {t.name: t for t in asyncio.run(mcp2.list_tools())}
+    assert direct_tools, "expected at least one directly-registered tool to compare against"
 
+    lowlevel = hosting.build_capability_honest_lowlevel_server(mcp2)
+    app = lowlevel.streamable_http_app(streamable_http_path="/mcp", json_response=True, stateless_http=True)
 
-def test_get_result_evidence_azure_properties_exact_names_and_required():
-    props = json.loads(function_app.revenue_digest_tools.GET_RESULT_EVIDENCE_TOOL_PROPERTIES)
-    assert len(props) == 1
-    assert props[0]["propertyName"] == "result_id"
-    assert props[0]["isRequired"] is True
-    assert props[0]["propertyType"] == "string"
+    async def _scenario():
+        async with UvicornTestServer(app) as base_url:
+            async with adapter_client_session(base_url) as session:
+                await session.initialize()
+                wire_tools = {t.name: t for t in (await session.list_tools()).tools}
+        assert set(wire_tools) == set(direct_tools)
+        for name, direct_tool in direct_tools.items():
+            wire_tool = wire_tools[name]
+            assert wire_tool.input_schema == direct_tool.input_schema, f"{name}: adapter wire schema diverged from the direct high-level server schema"
+            assert wire_tool.title == direct_tool.title
+            assert wire_tool.description == direct_tool.description
 
-
-@pytest.mark.parametrize("props_json", [
-    function_app.revenue_digest_tools.GET_PERFORMANCE_DIGEST_TOOL_PROPERTIES,
-    function_app.revenue_digest_tools.GET_RESULT_EVIDENCE_TOOL_PROPERTIES,
-])
-def test_azure_properties_never_expose_forbidden_fields(props_json):
-    props = json.loads(props_json)
-    names = {p["propertyName"].lower() for p in props}
-    for forbidden in _FORBIDDEN_SCHEMA_FIELDS:
-        assert forbidden not in names
-
-
-def test_azure_properties_never_declare_a_scope_or_hidden_security_field():
-    for props_json in (function_app.revenue_digest_tools.GET_PERFORMANCE_DIGEST_TOOL_PROPERTIES, function_app.revenue_digest_tools.GET_RESULT_EVIDENCE_TOOL_PROPERTIES):
-        serialized = props_json.lower()
-        assert "scope" not in serialized
-        assert "header" not in serialized
+    asyncio.run(_scenario())
 
 
 # =============================================================================
-# Azure Functions - the 2 new tools are discoverable as real mcp_tool_trigger
-# functions, alongside the existing 5 DMR tools.
+# Scope resolution: headers only, never `arguments` - proven directly through
+# the SDK's own call_tool(), the real entry point both hostings' transports
+# ultimately invoke (server.py directly, function_app.py via the
+# capability-honest adapter's on_call_tool - see hosting.py). No native
+# Azure Functions trigger/payload-string calling convention exists any more.
 # =============================================================================
 
 
-def test_get_performance_digest_is_registered_as_an_mcp_tool_trigger():
-    """`function_app.app.get_functions()` re-validates function-name
-    uniqueness against accumulated internal state on every call and raises
-    on a second call within the same process (see
-    test_tool_scope_enforcement.py's `_discover_mcp_tool_functions` -
-    that's why it's `functools.cache`d there) - reuse that SAME cached
-    discovery here rather than calling `get_functions()` independently a
-    second time."""
-    from test_tool_scope_enforcement import _discover_mcp_tool_functions
-
-    names = {fn.get_user_function().__name__ for fn in _discover_mcp_tool_functions()}
-    assert "get_performance_digest" in names
-    assert "get_result_evidence" in names
-
-
-# =============================================================================
-# Azure Functions scope resolution: headers only, never `arguments`; strict
-# transport rejection preserved - both reuse _resolve_scope(payload, tool)
-# exactly as every DMR tool already does.
-# =============================================================================
-
-
-def _context_payload(*, transport_name="http-streamable", headers=None, arguments=None):
-    return json.dumps({
-        "transport": {"name": transport_name, "properties": {"headers": headers or {}}},
-        "arguments": arguments or {},
-    })
-
-
-def test_get_performance_digest_rejects_non_http_streamable_transport():
-    """Rejected before scope verification is even attempted - the same
-    plain (non-JSON) message every DMR tool's _resolve_scope already
-    returns for this exact condition, not a ToolError envelope."""
-    payload = _context_payload(transport_name="sse", headers={"x-ariel-scope": "whatever"})
-    result = function_app.get_performance_digest(payload)
-    assert "http-streamable" in result
-    assert "sse" in result
-
-
-def test_get_result_evidence_rejects_non_http_streamable_transport():
-    payload = _context_payload(transport_name="sse", headers={"x-ariel-scope": "whatever"})
-    result = function_app.get_result_evidence(payload)
-    assert "http-streamable" in result
-    assert "sse" in result
-
-
-def test_get_performance_digest_rejects_unknown_transport():
-    payload = _context_payload(transport_name="unknown", headers={"x-ariel-scope": "whatever"})
-    result = function_app.get_performance_digest(payload)
-    assert "http-streamable" in result
-
-
-def test_get_performance_digest_ignores_a_scope_shaped_value_in_arguments(monkeypatch):
+def test_get_performance_digest_ignores_a_scope_shaped_value_in_arguments(monkeypatch, rsa_keypair):
     """No X-Ariel-Scope header at all - scope resolution must fail
     regardless of anything scope-shaped placed in `arguments`, proving
     `arguments` is never consulted for scope. A dummy public key is
-    registered so resolution proceeds past 'no keys configured at all'
+    registered (via ARIEL_SCOPE_PUBLIC_KEYS, parsed at server-construction
+    time) so resolution proceeds past 'no keys configured at all'
     (INTERNAL_ERROR) to the actual missing-token classification
     (PERMISSION_DENIED) - the case this test is really about."""
-    monkeypatch.setitem(function_app._public_keys, "test-kid", "dummy-pem-not-used-since-token-is-absent")
-    payload = _context_payload(headers={}, arguments={
+    _private_pem, public_pem = rsa_keypair
+    monkeypatch.setenv("ARIEL_SCOPE_PUBLIC_KEYS", json.dumps({"test-kid": public_pem}))
+    mcp2, _fabric, _readiness = hosting.build_ariel_mcp_server(require_cosmos=False)
+
+    ctx = _fake_ctx(mcp2, headers={})
+    arguments = {
         "date": "2026-07-28", "timeframe": "mtd", "view": "other", "comparator": "none",
         "x-ariel-scope": "not-a-real-token", "scope_token": "not-a-real-token", "hotel_id": 39,
-    })
-    parsed = json.loads(function_app.get_performance_digest(payload))
+    }
+    result = asyncio.run(mcp2.call_tool("get_performance_digest", arguments, context=ctx))
+    parsed = json.loads(result.content[0].text)
     assert parsed["status"] == "error"
     assert parsed["code"] == "permission_denied"
 
 
-def test_get_result_evidence_ignores_a_scope_shaped_value_in_arguments(monkeypatch):
-    monkeypatch.setitem(function_app._public_keys, "test-kid", "dummy-pem-not-used-since-token-is-absent")
-    payload = _context_payload(headers={}, arguments={"result_id": "res_" + "a" * 16, "x-ariel-scope": "not-a-real-token"})
-    parsed = json.loads(function_app.get_result_evidence(payload))
+def test_get_result_evidence_ignores_a_scope_shaped_value_in_arguments(monkeypatch, rsa_keypair):
+    _private_pem, public_pem = rsa_keypair
+    monkeypatch.setenv("ARIEL_SCOPE_PUBLIC_KEYS", json.dumps({"test-kid": public_pem}))
+    mcp2, _fabric, _readiness = hosting.build_ariel_mcp_server(require_cosmos=False)
+
+    ctx = _fake_ctx(mcp2, headers={})
+    arguments = {"result_id": "res_" + "a" * 16, "x-ariel-scope": "not-a-real-token"}
+    result = asyncio.run(mcp2.call_tool("get_result_evidence", arguments, context=ctx))
+    parsed = json.loads(result.content[0].text)
     assert parsed["status"] == "error"
     assert parsed["code"] == "permission_denied"
 
 
 def test_get_performance_digest_scope_comes_from_header_not_from_arguments_hotel_id(monkeypatch, rsa_keypair):
     """A real, verified scope for hotel 39, but `arguments` claims hotel_id
-    999. If the implementation ever read hotel_id from `arguments` instead
-    of the verified token, the rows below (built for hotel 39) would look
-    like a cross-hotel response relative to a hotel-999 scope and
-    execute_revenue_performance_digest's own integrity check would reject
-    it - so success here is a genuine proof the header-derived scope won,
-    not the arguments-supplied value."""
+    999. hotel_id is not a declared tool argument at all (see the SDK-schema
+    tests above) - the SDK does not enforce additionalProperties:false on
+    this schema, so an unexpected hotel_id passes straight through to the
+    registered closure unchanged (confirmed empirically), which is exactly
+    why this test matters: if the implementation ever read hotel_id from
+    `arguments` instead of the verified token, the rows below (built for
+    hotel 39) would look like a cross-hotel response relative to a hotel-999
+    scope and execute_revenue_performance_digest's own integrity check would
+    reject it - so success here is a genuine proof the header-derived scope
+    won, not the arguments-supplied value."""
     private_pem, public_pem = rsa_keypair
-    monkeypatch.setitem(function_app._public_keys, "test-kid", public_pem)
+    monkeypatch.setenv("ARIEL_SCOPE_PUBLIC_KEYS", json.dumps({"test-kid": public_pem}))
+    # conftest.py's session-wide default is ARIEL_RESULTS_STORE_BACKEND=cosmos
+    # (so function_app.py's own require_cosmos=True import-time check has
+    # something real to see) - override to in_memory here so this
+    # require_cosmos=False server doesn't attempt a real Cosmos credential
+    # lookup just to store this test's result.
+    monkeypatch.setenv("ARIEL_RESULTS_STORE_BACKEND", "in_memory")
+    mcp2, fabric_service, _readiness = hosting.build_ariel_mcp_server(require_cosmos=False)
+
     token = scope_token.mint(hotel_id=HOTEL_ID, session_id="sess-a", permissions=frozenset({"dmr:read"}), private_key_pem=private_pem, kid="test-kid")
-
     rows = _build_rows("other", "mtd", "none", hotel_id=HOTEL_ID)
-    monkeypatch.setattr(function_app, "fabric_service", FakeFabricQueryService(rows=rows))
-    monkeypatch.setattr(function_app, "result_repository", InMemoryResultRepository())
+    monkeypatch.setattr(fabric_service, "run_query", FakeFabricQueryService(rows=rows).run_query)
 
-    payload = _context_payload(headers={"x-ariel-scope": token}, arguments={
-        "date": "2026-07-28", "timeframe": "mtd", "view": "other", "comparator": "none", "hotel_id": 999,
-    })
-    parsed = json.loads(function_app.get_performance_digest(payload))
+    ctx = _fake_ctx(mcp2, headers={"X-Ariel-Scope": token})
+    arguments = {"date": "2026-07-28", "timeframe": "mtd", "view": "other", "comparator": "none", "hotel_id": 999}
+    result = asyncio.run(mcp2.call_tool("get_performance_digest", arguments, context=ctx))
+    parsed = json.loads(result.content[0].text)
     assert parsed["status"] == "success"
 
 
 def test_headerless_get_performance_digest_and_get_result_evidence_reject_cleanly():
-    for handler in (function_app.get_performance_digest, function_app.get_result_evidence):
-        payload = _context_payload(headers={})
-        parsed = json.loads(handler(payload))
+    mcp2, _fabric, _readiness = hosting.build_ariel_mcp_server(require_cosmos=False)
+    ctx = _fake_ctx(mcp2, headers={})
+    for name, arguments in (
+        ("get_performance_digest", {"date": "2026-07-28", "timeframe": "day", "view": "headline", "comparator": "none"}),
+        ("get_result_evidence", {"result_id": "res_" + "a" * 16}),
+    ):
+        result = asyncio.run(mcp2.call_tool(name, arguments, context=ctx))
+        parsed = json.loads(result.content[0].text)
         assert parsed["status"] == "error"

@@ -85,11 +85,28 @@ def test_status_resource_reflects_not_ready():
 
 
 def test_function_app_status_resource_matches_health_status_resource(monkeypatch):
+    """R3D: `ariel://status` is registered as a closure inside
+    hosting.build_ariel_mcp_server, capturing the Readiness OBJECT built
+    during server construction - there is no longer a standalone
+    `function_app.status_resource()` function to call directly.
+    `monkeypatch.setattr(function_app, "_readiness", ...)` would NOT reach
+    the closure (it replaces the module attribute, not what the closure
+    already captured), so this patches the credential-check dependency on
+    the already-captured `function_app._readiness` object itself instead,
+    then resets its cache so the patched dependency is actually consulted
+    (mirrors test_readiness_cache_expires_after_the_window's own
+    `_cached_at` manipulation above), and reads the resource through the
+    real `function_app.mcp` the deployed adapter serves."""
+    import asyncio
+
     import function_app
 
-    monkeypatch.setattr(function_app, "_readiness", health.Readiness(_FakeFabricService(), {"k": "pem"}))
+    monkeypatch.setattr(function_app._readiness, "_fabric_service", _FakeFabricService())
+    monkeypatch.setattr(function_app._readiness, "_public_keys", {"k": "pem"})
+    function_app._readiness._cached_at -= health.READINESS_CACHE_SECONDS + 1
 
-    body = json.loads(function_app.status_resource(None))
+    result = asyncio.run(function_app.mcp.read_resource("ariel://status"))
+    body = json.loads(result[0].content)
 
     assert body["status"] == "ready"
     # R3B: status now reflects the combined DMR + governed Revenue digest

@@ -12,12 +12,5 @@
   "extensionBundle": {
     "id": "Microsoft.Azure.Functions.ExtensionBundle",
     "version": "[4.*, 5.0.0)"
-  },
-  "extensions": {
-    "mcp": {
-      "instructions": "Remote MCP server for Ask ARIEL - DMR (Daily Management Report) data.",
-      "serverName": "ariel-mcp-v2",
-      "serverVersion": "2.0.0"
-    }
   }
 }
