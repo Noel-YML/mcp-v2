@@ -18,14 +18,24 @@ already exist; `get_database_client`/`get_container_client` only resolve
 handles to them.
 """
 
+import logging
 import threading
 
+from azure.core.exceptions import AzureError
 from azure.cosmos import CosmosClient
 from azure.identity import ClientSecretCredential, ManagedIdentityCredential
 
 from results.config import ResultsStoreAuthMode, ResultsStoreBackend, ResultsStoreConfigError, ResultsStoreOptions
-from results.repository import CosmosResultRepository, InMemoryResultRepository, ResultRepository, StoredResult
+from results.repository import (
+    CosmosResultRepository,
+    InMemoryResultRepository,
+    ResultRepository,
+    ResultRepositoryUnavailable,
+    StoredResult,
+)
 from scope.scope_context import ScopeContext
+
+logger = logging.getLogger("ariel-mcp-server")
 
 
 def _build_credential(options: ResultsStoreOptions):
@@ -46,6 +56,20 @@ def _build_credential(options: ResultsStoreOptions):
     if options.managed_identity_client_id:
         return ManagedIdentityCredential(client_id=options.managed_identity_client_id)
     return ManagedIdentityCredential()
+
+
+def _log_construction_failure(event: str, exc: Exception) -> None:
+    """Sanitized only - exception type and, when present, the SDK's own
+    HTTP status code - never the exception's raw message/args, which can
+    carry Cosmos endpoint/account detail. Mirrors
+    results/repository.py's own _log_cosmos_failure for the identical
+    reason.
+    """
+    status_code = getattr(exc, "status_code", None)
+    logger.error(
+        '{"event": %s, "exceptionType": %s, "statusCode": %s}',
+        event.__repr__(), type(exc).__name__.__repr__(), status_code,
+    )
 
 
 def build_result_repository(options: ResultsStoreOptions) -> ResultRepository:
@@ -78,6 +102,19 @@ class LazyResultRepository:
     real underlying repository (in-memory or Cosmos) is built at most once,
     on whichever of `put()`/`get()` is called first, and reused for every
     call after that - never rebuilt per call.
+
+    A failure DURING that first construction (a real Azure SDK network/
+    transport/auth failure - `azure.core.exceptions.AzureError` and its
+    subclasses) is caught here and re-raised as the same
+    `ResultRepositoryUnavailable` `CosmosResultRepository.put()`/`get()`
+    themselves raise for a post-construction failure - callers see one
+    uniform failure contract regardless of which side of construction the
+    failure happened on. The failed attempt is never cached: `_repository`
+    stays `None`, so the next call retries construction, since a transient
+    failure may have recovered by then. A `ResultsStoreConfigError` (bad/
+    incomplete config, not an `AzureError`) is a configuration/startup
+    defect and is never caught or disguised as `ResultRepositoryUnavailable`
+    - and this never falls back to `InMemoryResultRepository` either way.
     """
 
     def __init__(self, options: ResultsStoreOptions) -> None:
@@ -89,7 +126,19 @@ class LazyResultRepository:
         if self._repository is None:
             with self._lock:
                 if self._repository is None:
-                    self._repository = build_result_repository(self._options)
+                    try:
+                        self._repository = build_result_repository(self._options)
+                    except AzureError as exc:
+                        # A ResultsStoreConfigError (a ValueError subclass,
+                        # never an AzureError) is NOT caught here - it's a
+                        # configuration/startup defect, not a transient
+                        # infrastructure failure, and must propagate
+                        # unchanged. self._repository is deliberately left
+                        # None on this path - a later call retries
+                        # construction from scratch, since the underlying
+                        # network/auth failure may have recovered by then.
+                        _log_construction_failure("results_lazy_repository_construction_failed", exc)
+                        raise ResultRepositoryUnavailable("The result store is temporarily unavailable.") from exc
         return self._repository
 
     def put(self, stored_result: StoredResult) -> None:

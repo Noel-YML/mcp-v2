@@ -269,7 +269,11 @@ def get_performance_digest(
         response = result.to_json()
         return response
     except Exception as exc:  # noqa: BLE001 - last-resort safety net, never re-raised
-        logger.exception("Unhandled error in get_performance_digest (trace_id=%s)", trace_id)
+        # Sanitized only - exception type, never the raw message/args,
+        # which could carry backend detail from an unexpected dependency
+        # failure (same posture _log_error already uses for the
+        # ResultRepositoryUnavailable/collision paths above).
+        _log_error("get_performance_digest_unexpected_error", trace_id, {"exceptionType": type(exc).__name__})
         outcome = error_code = ErrorCode.INTERNAL_ERROR.value
         response = ToolError(ErrorCode.INTERNAL_ERROR, _INTERNAL_ERROR_MESSAGE, trace_id).to_json()
         return response
@@ -332,7 +336,7 @@ def get_result_evidence(
         response = json.dumps(stored.evidence, default=str)
         return response
     except Exception as exc:  # noqa: BLE001 - last-resort safety net, never re-raised
-        logger.exception("Unhandled error in get_result_evidence (trace_id=%s)", trace_id)
+        _log_error("get_result_evidence_unexpected_error", trace_id, {"exceptionType": type(exc).__name__})
         outcome = error_code = ErrorCode.INTERNAL_ERROR.value
         response = ToolError(ErrorCode.INTERNAL_ERROR, _INTERNAL_ERROR_MESSAGE, trace_id).to_json()
         return response

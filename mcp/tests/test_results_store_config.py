@@ -5,7 +5,10 @@ FabricOptions.from_env() validation posture: eager, fail-closed, never
 naming a secret value.
 """
 
+from datetime import datetime, timezone
+
 import pytest
+from azure.core.exceptions import ClientAuthenticationError, ServiceRequestError, ServiceResponseError
 from azure.identity import ClientSecretCredential, ManagedIdentityCredential
 
 from results.config import (
@@ -17,7 +20,21 @@ from results.config import (
     result_ttl_seconds_from_env,
 )
 from results.factory import LazyResultRepository, build_result_repository
-from results.repository import CosmosResultRepository, InMemoryResultRepository
+from results.repository import CosmosResultRepository, InMemoryResultRepository, ResultRepositoryUnavailable, StoredResult, compute_expiry
+from scope.scope_context import ScopeContext
+
+
+def _lazy_test_scope(hotel_id=39, session_id="sess-a"):
+    return ScopeContext(hotel_id=hotel_id, session_id=session_id, permissions=frozenset({"dmr:read"}), expires_at=datetime.now(timezone.utc))
+
+
+def _lazy_test_stored(result_id="res_lazytest0000"):
+    created_at, expires_at = compute_expiry(300)
+    return StoredResult(
+        result_id=result_id, hotel_id=39, session_id_hash="h",
+        created_at=created_at, expires_at=expires_at,
+        query_id="q", query_version="1", result={}, evidence={},
+    )
 
 _ALL_RESULTS_STORE_ENV_VARS = (
     "ARIEL_RESULTS_STORE_BACKEND",
@@ -483,3 +500,144 @@ def test_lazy_result_repository_in_memory_works_without_any_cosmos_config():
     fetched = lazy.get("res_in_memory", scope)
     assert fetched is not None
     assert fetched.result == {"a": 1}
+
+
+# =============================================================================
+# Corrective R3B: LazyResultRepository construction FAILURES (not just
+# construction succeeding) must map to ResultRepositoryUnavailable, not
+# escape as a raw Azure SDK exception - the whole reason LazyResultRepository
+# exists is that CosmosClient(...) does real network I/O, and that call can
+# fail before any CosmosResultRepository (with its own exception mapping)
+# even exists.
+# =============================================================================
+
+
+def _cosmos_options(monkeypatch):
+    _set_cosmos_core_env(monkeypatch)
+    monkeypatch.setenv("ARIEL_RESULTS_COSMOS_AUTH_MODE", "managed_identity")
+    return ResultsStoreOptions.from_env()
+
+
+def test_lazy_result_repository_put_construction_failure_maps_to_repository_unavailable(monkeypatch):
+    class _ExplodingCosmosClient:
+        def __init__(self, url, credential):
+            raise ServiceRequestError(message="DNS resolution failed - must never leak.")
+
+    monkeypatch.setattr("results.factory.CosmosClient", _ExplodingCosmosClient)
+    lazy = LazyResultRepository(_cosmos_options(monkeypatch))
+
+    with pytest.raises(ResultRepositoryUnavailable):
+        lazy.put(_lazy_test_stored())
+
+
+def test_lazy_result_repository_get_construction_failure_maps_to_repository_unavailable(monkeypatch):
+    class _ExplodingCosmosClient:
+        def __init__(self, url, credential):
+            raise ServiceRequestError(message="DNS resolution failed - must never leak.")
+
+    monkeypatch.setattr("results.factory.CosmosClient", _ExplodingCosmosClient)
+    lazy = LazyResultRepository(_cosmos_options(monkeypatch))
+
+    with pytest.raises(ResultRepositoryUnavailable):
+        lazy.get("res_x", _lazy_test_scope())
+
+
+@pytest.mark.parametrize("exc_cls,message", [
+    (ServiceRequestError, "connection refused - must never leak"),
+    (ServiceResponseError, "connection reset - must never leak"),
+    (ClientAuthenticationError, "token acquisition failed - must never leak"),
+])
+def test_lazy_result_repository_construction_azure_error_hierarchy_maps_to_repository_unavailable(monkeypatch, exc_cls, message):
+    """Not just CosmosHttpResponseError - the whole azure.core.exceptions.AzureError
+    hierarchy (transport failures, auth failures) that can occur while
+    CosmosClient(...) itself is being constructed."""
+    class _ExplodingCosmosClient:
+        def __init__(self, url, credential):
+            raise exc_cls(message=message)
+
+    monkeypatch.setattr("results.factory.CosmosClient", _ExplodingCosmosClient)
+    lazy = LazyResultRepository(_cosmos_options(monkeypatch))
+
+    with pytest.raises(ResultRepositoryUnavailable):
+        lazy.get("res_x", _lazy_test_scope())
+
+
+def test_lazy_result_repository_construction_failure_message_is_sanitized(monkeypatch):
+    class _ExplodingCosmosClient:
+        def __init__(self, url, credential):
+            raise ServiceRequestError(message="super-secret-endpoint-detail-12345")
+
+    monkeypatch.setattr("results.factory.CosmosClient", _ExplodingCosmosClient)
+    lazy = LazyResultRepository(_cosmos_options(monkeypatch))
+
+    with pytest.raises(ResultRepositoryUnavailable) as exc_info:
+        lazy.get("res_x", _lazy_test_scope())
+    assert "super-secret-endpoint-detail-12345" not in str(exc_info.value)
+
+
+def test_lazy_result_repository_failed_construction_is_not_cached_retry_succeeds(monkeypatch):
+    """A transient failure must not be remembered - the next call retries
+    construction from scratch, since the underlying condition may have
+    recovered by then."""
+    calls = {"count": 0}
+
+    class _FlakyThenWorkingCosmosClient:
+        def __init__(self, url, credential):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise ServiceRequestError(message="transient failure")
+
+        def get_database_client(self, name):
+            class _Database:
+                def get_container_client(self, name):
+                    class _Container:
+                        def create_item(self, body):
+                            pass
+                    return _Container()
+            return _Database()
+
+    monkeypatch.setattr("results.factory.CosmosClient", _FlakyThenWorkingCosmosClient)
+    lazy = LazyResultRepository(_cosmos_options(monkeypatch))
+
+    with pytest.raises(ResultRepositoryUnavailable):
+        lazy.put(_lazy_test_stored())  # first attempt: fails
+    assert calls["count"] == 1
+
+    lazy.put(_lazy_test_stored())  # second attempt, same LazyResultRepository instance: succeeds
+    assert calls["count"] == 2
+
+
+def test_lazy_result_repository_config_error_is_not_disguised_as_unavailable(monkeypatch):
+    """A ResultsStoreConfigError (bad/incomplete config) is a configuration/
+    startup defect, never a transient infrastructure failure - it must
+    propagate as itself, not become ResultRepositoryUnavailable."""
+    _set_cosmos_core_env(monkeypatch)
+    monkeypatch.setenv("ARIEL_RESULTS_COSMOS_AUTH_MODE", "client_secret")
+    monkeypatch.setenv("ARIEL_RESULTS_COSMOS_TENANT_ID", "test-tenant")
+    monkeypatch.setenv("ARIEL_RESULTS_COSMOS_CLIENT_ID", "test-client")
+    monkeypatch.setenv("ARIEL_RESULTS_COSMOS_CLIENT_SECRET", "test-secret")
+    options = ResultsStoreOptions.from_env()
+    # Hand-corrupt a valid options object so _build_credential's own
+    # defensive check fires inside LazyResultRepository - from_env() itself
+    # would already refuse to produce this combination.
+    import dataclasses
+    broken_options = dataclasses.replace(options, client_secret=None)
+    lazy = LazyResultRepository(broken_options)
+
+    with pytest.raises(ResultsStoreConfigError):
+        lazy.get("res_x", _lazy_test_scope())
+
+
+def test_lazy_result_repository_construction_failure_never_falls_back_to_in_memory(monkeypatch):
+    class _ExplodingCosmosClient:
+        def __init__(self, url, credential):
+            raise ServiceRequestError(message="boom")
+
+    monkeypatch.setattr("results.factory.CosmosClient", _ExplodingCosmosClient)
+    lazy = LazyResultRepository(_cosmos_options(monkeypatch))
+
+    with pytest.raises(ResultRepositoryUnavailable):
+        lazy.get("res_x", _lazy_test_scope())
+    # The internal slot must remain unset - never silently replaced with an
+    # InMemoryResultRepository.
+    assert lazy._repository is None

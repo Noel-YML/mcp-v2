@@ -573,3 +573,108 @@ def test_audit_event_never_carries_raw_session_id():
     assert len(events) == 1
     assert events[0].session_id_hash != "a-very-real-session-id"
     assert events[0].session_id_hash == hash_session_id("a-very-real-session-id")
+
+
+# =============================================================================
+# Corrective R3B: lazy result-store construction failures, end-to-end
+# through the tool layer, and sanitized logging for the tools' own
+# last-resort safety net.
+# =============================================================================
+
+
+def _lazy_repository_that_always_fails_construction(monkeypatch):
+    """A real LazyResultRepository wired to a CosmosClient fake that always
+    raises a genuine azure.core.exceptions.AzureError subclass during
+    construction - proves the FULL chain (LazyResultRepository -> the tool
+    layer's ResultRepositoryUnavailable handling) end-to-end, not just a
+    hand-rolled stub repository."""
+    from azure.core.exceptions import ServiceRequestError
+
+    from results.config import ResultsStoreAuthMode, ResultsStoreBackend, ResultsStoreOptions
+    from results.factory import LazyResultRepository
+
+    class _ExplodingCosmosClient:
+        def __init__(self, url, credential):
+            raise ServiceRequestError(message="DNS resolution failed - must never leak.")
+
+    monkeypatch.setattr("results.factory.CosmosClient", _ExplodingCosmosClient)
+    options = ResultsStoreOptions(
+        backend=ResultsStoreBackend.COSMOS, auth_mode=ResultsStoreAuthMode.MANAGED_IDENTITY,
+        cosmos_endpoint="https://example.documents.azure.com:443/", cosmos_database="db", cosmos_container="c",
+        tenant_id=None, client_id=None, client_secret=None, managed_identity_client_id=None,
+    )
+    return LazyResultRepository(options)
+
+
+# 9. lazy construction failure from get_performance_digest -> RESULT_STORE_UNAVAILABLE, retryable
+def test_lazy_construction_failure_from_get_performance_digest_is_result_store_unavailable(monkeypatch):
+    lazy_repo = _lazy_repository_that_always_fails_construction(monkeypatch)
+    rows = _build_rows("other", "mtd", "none")
+    response = _digest(FakeFabricQueryService(rows=rows), _scope(), lazy_repo)
+    parsed = json.loads(response)
+    assert parsed["status"] == "error"
+    assert parsed["code"] == "result_store_unavailable"
+    assert parsed["retryable"] is True
+    assert "DNS resolution failed" not in json.dumps(parsed)
+
+
+# 10. lazy construction failure from get_result_evidence -> RESULT_STORE_UNAVAILABLE, retryable
+def test_lazy_construction_failure_from_get_result_evidence_is_result_store_unavailable(monkeypatch):
+    lazy_repo = _lazy_repository_that_always_fails_construction(monkeypatch)
+    response = rdt.get_result_evidence(lazy_repo, _scope(), _VALID_RESULT_ID_A)
+    parsed = json.loads(response)
+    assert parsed["status"] == "error"
+    assert parsed["code"] == "result_store_unavailable"
+    assert parsed["retryable"] is True
+    assert "DNS resolution failed" not in json.dumps(parsed)
+
+
+class _ExplodingRepository:
+    """Raises a plain, unexpected exception - not ResultRepositoryUnavailable,
+    not ValueError, not RevenueDigestExecutionError - to exercise the
+    outer, last-resort `except Exception` safety net specifically."""
+
+    def put(self, stored_result):
+        raise RuntimeError("super-secret-leak-marker-12345")
+
+    def get(self, result_id, scope):
+        raise RuntimeError("super-secret-leak-marker-12345")
+
+
+# 11. broad unexpected-error safety net still returns sanitized INTERNAL_ERROR
+def test_get_performance_digest_unexpected_error_returns_sanitized_internal_error():
+    rows = _build_rows("other", "mtd", "none")
+    response = _digest(FakeFabricQueryService(rows=rows), _scope(), _ExplodingRepository())
+    parsed = json.loads(response)
+    assert parsed["status"] == "error"
+    assert parsed["code"] == "internal_error"
+    assert "super-secret-leak-marker-12345" not in json.dumps(parsed)
+
+
+def test_get_result_evidence_unexpected_error_returns_sanitized_internal_error():
+    response = rdt.get_result_evidence(_ExplodingRepository(), _scope(), _VALID_RESULT_ID_A)
+    parsed = json.loads(response)
+    assert parsed["status"] == "error"
+    assert parsed["code"] == "internal_error"
+    assert "super-secret-leak-marker-12345" not in json.dumps(parsed)
+
+
+# 12. unexpected raw exception message is not LOGGED by the R3B tool layer
+def test_get_performance_digest_unexpected_error_raw_message_not_logged(caplog):
+    rows = _build_rows("other", "mtd", "none")
+    _digest(FakeFabricQueryService(rows=rows), _scope(), _ExplodingRepository())
+    assert "super-secret-leak-marker-12345" not in caplog.text
+
+
+def test_get_result_evidence_unexpected_error_raw_message_not_logged(caplog):
+    rdt.get_result_evidence(_ExplodingRepository(), _scope(), _VALID_RESULT_ID_A)
+    assert "super-secret-leak-marker-12345" not in caplog.text
+
+
+def test_get_performance_digest_unexpected_error_no_traceback_logged(caplog):
+    """logger.exception(...) (removed by this corrective fix) would have
+    attached a full traceback via exc_info - the sanitized replacement
+    (_log_error, a plain logger.error with no exc_info) must not."""
+    rows = _build_rows("other", "mtd", "none")
+    _digest(FakeFabricQueryService(rows=rows), _scope(), _ExplodingRepository())
+    assert not any(record.exc_info for record in caplog.records)
