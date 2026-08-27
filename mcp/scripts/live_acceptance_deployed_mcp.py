@@ -131,8 +131,34 @@ _FORBIDDEN_SCHEMA_FIELDS = (
 _FORBIDDEN_OUTPUT_SUBSTRINGS = (
     "hotel_id", "hotelid", "session_id", "sessionidhash", "session_id_hash",
     "token", "jwt", "workspace", "dataset", "partition", "credential",
-    "dax", "sql", "cosmos", "partition_key", "partitionkey",
+    "cosmos", "partition_key", "partitionkey",
     "workspace_id", "dataset_id", "documents.azure.com",
+)
+
+# Real DAX-leak detection - deliberately NOT the bare English word "dax"/"sql"
+# (removed: dmr/named_queries.py's own governed comparator_semantics prose
+# legitimately says "...rejected before any DAX is built..." in
+# get_result_evidence's response - that is explanatory metadata, not a
+# leaked query). These are actual DAX syntax signatures instead, mirroring
+# test_revenue_digest_execution.py's own test_public_result_serialization_has_no_raw_dax
+# (which checks "EVALUATE"/"CALCULATE"/"SUMMARIZECOLUMNS"/the derived-mart
+# table literal). Refined one step further here: the multi-character
+# "KEYWORD(" forms (not bare "CALCULATE") specifically so a legitimate
+# sentence using the English word "calculate"/"calculated" can never match -
+# real DAX always has the open-paren immediately after the function
+# keyword, English prose never does. Checked case-SENSITIVELY against the
+# RAW (non-lowercased) serialized payload - this codebase's DAX builder
+# always emits these keywords in literal uppercase (dmr/dax_query_builder.py),
+# so a genuine leak preserves that casing, while case-folding first (as a
+# bare case-insensitive substring check would) is exactly what would turn
+# lowercase business prose into a false positive.
+_DAX_SIGNATURES = (
+    "EVALUATE",
+    "CALCULATE(",
+    "CALCULATETABLE(",
+    "SUMMARIZECOLUMNS(",
+    "SELECTCOLUMNS(",
+    "'DERIVED MART_DMR_REVENUE_MATRIX'",
 )
 
 _RESULT_ID_PATTERN = re.compile(r"^res_[0-9a-f]{16}$")
@@ -578,18 +604,31 @@ def _gate_output_security(report: Report, *payloads: dict | None) -> None:
     """Scans the successful get_performance_digest response and the
     successful get_result_evidence response (both passed by the caller) for
     the full R3C forbidden-output contract - hotel/session identifiers,
-    scope token/JWT, DAX/SQL, Cosmos endpoint/partition key, Fabric
-    workspace/dataset ids, credentials. Case-insensitive, checked against
-    the serialized payload(s) together.
+    scope token/JWT, Cosmos endpoint/partition key, Fabric workspace/dataset
+    ids, credentials (case-insensitive substring check), and actual raw DAX
+    query signatures (case-sensitive - see _DAX_SIGNATURES) - deliberately
+    NOT a bare-word "dax"/"sql" check, which would false-positive on
+    get_result_evidence's own legitimate governed prose (dmr/named_queries.py's
+    comparator_semantics: "...rejected before any DAX is built...").
     """
     present = [p for p in payloads if p is not None]
     if not present:
         report.record("public output contains no hotel/session/token/DAX/Cosmos detail", "NOT EXECUTED", "no successful response captured to inspect")
         return
-    serialized = json.dumps(present, default=str).lower()
-    leaked = [f for f in _FORBIDDEN_OUTPUT_SUBSTRINGS if f in serialized]
-    if leaked:
-        report.record("public output contains no hotel/session/token/DAX/Cosmos detail", "FAIL", f"leaked substring(s): {leaked}")
+
+    raw_serialized = json.dumps(present, default=str)
+    serialized_lower = raw_serialized.lower()
+
+    leaked = [f for f in _FORBIDDEN_OUTPUT_SUBSTRINGS if f in serialized_lower]
+    leaked_dax = [sig for sig in _DAX_SIGNATURES if sig in raw_serialized]
+
+    if leaked or leaked_dax:
+        detail_parts = []
+        if leaked:
+            detail_parts.append(f"leaked substring(s): {leaked}")
+        if leaked_dax:
+            detail_parts.append(f"leaked DAX signature(s): {leaked_dax}")
+        report.record("public output contains no hotel/session/token/DAX/Cosmos detail", "FAIL", "; ".join(detail_parts))
     else:
         report.record("public output contains no hotel/session/token/DAX/Cosmos detail", "PASS")
 
