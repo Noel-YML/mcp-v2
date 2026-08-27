@@ -39,7 +39,6 @@ import dataclasses
 import json
 import logging
 import math
-import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Literal
@@ -52,7 +51,7 @@ from dmr.named_queries import NAMED_QUERY_DEFINITIONS, QueryId
 from dmr.revenue_performance_digest_reference import REVENUE_METRIC_MAPPINGS, VIEW_METRICS
 from fabric_client.result import ErrorCode, ToolError, new_trace_id
 from fabric_client.service import IFabricQueryService
-from results.repository import ResultRepository, StoredResult
+from results.repository import ResultRepository, StoredResult, compute_expiry
 from scope.scope_context import ScopeContext
 
 logger = logging.getLogger("ariel-mcp-server")
@@ -522,18 +521,24 @@ def execute_revenue_performance_digest(
         quality_warnings=tuple(quality_warnings),
     )
 
-    now = time.monotonic()
+    created_at, expires_at = compute_expiry(validated_ttl_seconds)
     repository.put(
         StoredResult(
             result_id=result_id,
             hotel_id=scope.hotel_id,
             session_id_hash=hash_session_id(scope.session_id),
-            created_at=now,
-            expires_at=now + validated_ttl_seconds,
+            created_at=created_at,
+            expires_at=expires_at,
             query_id=QueryId.REVENUE_PERFORMANCE_DIGEST_V1.value,
             query_version=_QUERY_DEFINITION.version,
-            result=result,
-            evidence=evidence,
+            # Persisted as plain JSON-compatible dicts, not the typed
+            # objects below - results/repository.py stays domain-agnostic
+            # and never imports Revenue-specific classes, and both
+            # ResultRepository implementations (in-memory, Cosmos) must see
+            # the exact same payload shape. execute_revenue_performance_digest
+            # still RETURNS the typed `result` unchanged.
+            result=result.to_dict(),
+            evidence=evidence.to_dict(),
         )
     )
 

@@ -3,6 +3,7 @@ result/evidence boundary for revenue_performance_digest_v1. Uses a fake
 IFabricQueryService so no live Fabric call is ever made.
 """
 
+import json
 from datetime import date, datetime, timezone
 
 import pytest
@@ -419,7 +420,11 @@ def test_public_result_serialization_has_no_raw_dax():
 
 def test_evidence_serialization_also_has_no_authorization_state():
     """Evidence is richer than the result, but still must never leak
-    hotel_id/session_id/scope token/raw DAX."""
+    hotel_id/session_id/scope token/raw DAX. Note: `stored.evidence` is a
+    plain JSON-compatible dict (results/repository.py persists
+    `.to_dict()` output, not the typed RevenueDigestEvidence object - see
+    revenue_digest_execution.py) - `.to_json()` was never a public,
+    model-facing contract of the stored record."""
     rows = _build_rows("other", "mtd", "budget", source_variance_value=10.0)
     service = FakeFabricQueryService(rows=rows)
     scope = _scope()
@@ -427,13 +432,37 @@ def test_evidence_serialization_also_has_no_authorization_state():
     repository = InMemoryResultRepository()
     result = rde.execute_revenue_performance_digest(service, scope, request, repository, result_ttl_seconds=300)
     stored = repository.get(result.result_id, scope)
-    serialized = stored.evidence.to_json()
+    serialized = json.dumps(stored.evidence, default=str)
     lowered = serialized.lower()
     assert "hotel_id" not in lowered and "hotelid" not in lowered
     assert "session" not in lowered
     assert "token" not in lowered
     assert "EVALUATE" not in serialized.upper()
     assert "SUMMARIZECOLUMNS" not in serialized.upper()
+
+
+# ---------------------------------------------------------------------------
+# R3A: the execution's RETURN value stays the typed RevenueDigestResult, but
+# what's PERSISTED into the repository is a plain JSON-compatible dict (both
+# result and evidence) - not the typed dataclass. This is what lets either
+# ResultRepository backend (in-memory, Cosmos) store/return the exact same
+# payload shape without results/repository.py ever importing Revenue types.
+# ---------------------------------------------------------------------------
+
+
+def test_execution_returns_typed_result_but_persists_json_compatible_dicts():
+    rows = _build_rows("other", "mtd", "none")
+    scope = _scope()
+    repository = InMemoryResultRepository()
+    result = _run(rows, timeframe="mtd", view="other", comparator="none", repository=repository)
+    assert isinstance(result, rde.RevenueDigestResult)
+
+    stored = repository.get(result.result_id, scope)
+    assert isinstance(stored.result, dict)
+    assert isinstance(stored.evidence, dict)
+    assert stored.result == result.to_dict()
+    json.dumps(stored.result)  # must not raise - proves JSON-compatible
+    json.dumps(stored.evidence)
 
 
 # ---------------------------------------------------------------------------

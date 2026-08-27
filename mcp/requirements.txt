@@ -1,6 +1,7 @@
 mcp[cli]>=2.0.0
 azure-functions>=2.2.0
 azure-identity>=1.19.0
+azure-cosmos>=4.7.0
 requests>=2.32.0
 urllib3>=2.0.0,<3
 pyjwt>=2.9.0
