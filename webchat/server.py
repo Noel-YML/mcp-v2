@@ -102,7 +102,7 @@ Run:
     ARIEL_MCP_FUNCTION_KEY (its system key) once pointed at a real
     deployment - both are optional for local testing against `func start`,
     which has no key requirement by default
-    Optionally set ARIEL_AGENT_VERSION (default "10") to point at a
+    Optionally set ARIEL_AGENT_VERSION (default "12") to point at a
     different ask-ariel agent version - see agent_contract.py and
     presentation_validator.py for what Phase 4's versions add: a
     schema-constrained response (message/presentation/insights/actions)
@@ -155,13 +155,13 @@ PROJECT_ENDPOINT = "https://analyticsai1.services.ai.azure.com/api/projects/proj
 AGENT_NAME = "ask-ariel"
 # An env var, not a hardcoded constant, specifically so pointing at a new
 # agent version - or rolling back to an old one - is a config change, not a
-# redeploy. Default "11" is the Phase 4 version (schema-constrained
-# message/presentation/insights/actions, validated in presentation_validator.py
-# before rendering) - verified live (both directly via the SDK and through
-# this actual app in a browser) before being made the default here. Set
-# ARIEL_AGENT_VERSION=10 to roll back to the pre-Phase-4 agent (plain text,
-# no instructions) if ever needed.
-AGENT_VERSION = os.environ.get("ARIEL_AGENT_VERSION", "11")
+# redeploy. Default "12" is the version carrying the 5th tool's schema
+# (get_dmr_holdings_outlook, added alongside the mcp-v2 UC3 deploy) on top of
+# Phase 4's schema-constrained message/presentation/insights/actions,
+# validated in presentation_validator.py before rendering. Set
+# ARIEL_AGENT_VERSION=11 to roll back to the 4-tool Phase 4 agent, or =10 for
+# the pre-Phase-4 agent (plain text, no instructions) if ever needed.
+AGENT_VERSION = os.environ.get("ARIEL_AGENT_VERSION", "12")
 AGENT_REFERENCE = {"type": "agent_reference", "name": AGENT_NAME, "version": AGENT_VERSION}
 
 # Same service principal/model the MCP server itself uses - only for the
