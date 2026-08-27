@@ -7,12 +7,13 @@ a future tool can't skip scope enforcement (see test_tool_scope_enforcement.py) 
 so they're pinned down here explicitly.
 """
 
+import hashlib
 from datetime import date, datetime, timezone
 
 import pytest
 
 from dmr import dax_query_builder
-from dmr.dax_query_builder import HoldingsPaceRequest, MAX_DAYS, QuerySpec
+from dmr.dax_query_builder import HoldingsPaceRequest, MAX_DAYS, QuerySpec, RevenueDigestRequest
 from dmr.measures import (
     FNB_MEASURES,
     HOLDINGS_MEASURES,
@@ -24,6 +25,7 @@ from dmr.measures import (
 )
 from dmr.named_queries import NAMED_QUERY_DEFINITIONS, QueryId
 from dmr.reports import Report
+from dmr.revenue_performance_digest_reference import REVENUE_METRIC_MAPPINGS, VIEW_METRICS
 from scope.scope_context import ScopeContext
 
 _SCOPE = ScopeContext(hotel_id=7, session_id="s", permissions=frozenset({"dmr:read"}), expires_at=datetime.now(timezone.utc))
@@ -140,6 +142,26 @@ def test_revenue_trend_is_pinned_to_the_total_revenue_line_item():
 
 
 # ---------------------------------------------------------------------------
+# Golden-string regressions for the two existing Revenue tools - proves
+# revenue_performance_digest_v1's addition (and the QueryLimits refactor,
+# see the Holdings section below) touched neither of them.
+# ---------------------------------------------------------------------------
+
+_REVENUE_TREND_GOLDEN_SHA256 = "fada1523d2fb993935e7f1aef60b9fee458c518626b4f5eba207a17fa9d3c356"
+_REVENUE_SNAPSHOT_GOLDEN_SHA256 = "de559bb3ab32a7819af77db0948cc52dcd2bed3415f573c92366aa111d8785c2"
+
+
+def test_revenue_trend_query_is_byte_identical_to_the_captured_golden_hash():
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_TREND, days=5), _SCOPE)
+    assert hashlib.sha256(query.encode()).hexdigest() == _REVENUE_TREND_GOLDEN_SHA256
+
+
+def test_revenue_snapshot_query_is_byte_identical_to_the_captured_golden_hash():
+    query = dax_query_builder.build(QuerySpec(report=Report.REVENUE_SNAPSHOT, days=3), _SCOPE)
+    assert hashlib.sha256(query.encode()).hexdigest() == _REVENUE_SNAPSHOT_GOLDEN_SHA256
+
+
+# ---------------------------------------------------------------------------
 # Holdings pace (UC-01, Phase 1) - build_named(), a separate entry point.
 # ---------------------------------------------------------------------------
 
@@ -154,6 +176,22 @@ def test_holdings_outlook_query_is_byte_identical_before_and_after_this_change()
     assert "TOPN(14," in query
     assert "ADDCOLUMNS" not in query
     assert "EDATE" not in query
+
+
+# Captured via build_named(HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1, _PACE_REQUEST, _SCOPE)
+# BEFORE the QueryLimits refactor (max_stay_window_days moved from a bare
+# QueryDefinition field into QueryDefinition.limits.max_stay_window_days).
+# max_stay_window_days's value is read exclusively by _validate_pace_window's
+# Python length check and is never interpolated into generated DAX text, so
+# this hash must never change as a result of that refactor - if it does, the
+# refactor accidentally changed Holdings' actual behavior, not just its
+# registry's field shape.
+_HOLDINGS_PACE_GOLDEN_SHA256 = "b044ff9d3760c4e69c19d410d2f95198fd65f81455736d6d4a3e3b233b72cfa7"
+
+
+def test_holdings_pace_query_is_byte_identical_after_the_query_limits_refactor():
+    query = dax_query_builder.build_named(QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1, _PACE_REQUEST, _SCOPE)
+    assert hashlib.sha256(query.encode()).hexdigest() == _HOLDINGS_PACE_GOLDEN_SHA256
 
 
 def test_holdings_pace_metric_columns_match_the_allowlist():
@@ -188,7 +226,7 @@ def test_validate_pace_window_rejects_stay_end_before_stay_start():
 def test_validate_pace_window_rejects_a_window_longer_than_the_named_querys_own_limit():
     from datetime import timedelta
 
-    max_days = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1].max_stay_window_days
+    max_days = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1].limits.max_stay_window_days
     stay_start = date(2026, 1, 1)
     too_long = HoldingsPaceRequest(
         stay_start=stay_start,
@@ -202,7 +240,7 @@ def test_validate_pace_window_rejects_a_window_longer_than_the_named_querys_own_
 def test_validate_pace_window_accepts_a_window_exactly_at_the_named_querys_limit():
     from datetime import timedelta
 
-    max_days = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1].max_stay_window_days
+    max_days = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1].limits.max_stay_window_days
     stay_start = date(2026, 1, 1)
     at_limit = HoldingsPaceRequest(
         stay_start=stay_start,
@@ -367,3 +405,198 @@ def test_output_field_dax_aliases_agree_with_the_generated_query():
     definition = NAMED_QUERY_DEFINITIONS[QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1]
     declared_aliases = {field.dax_alias for field in definition.output_fields}
     assert declared_aliases == set(dax_query_builder._PACE_OUTPUT_COLUMN_ALIASES)
+
+
+# ---------------------------------------------------------------------------
+# Revenue Performance Digest (revenue_performance_digest_v1, Phase R1) - a
+# second, sibling named query. Existing revenue/Holdings behavior above this
+# section is proved unchanged by the golden-hash tests earlier in this file.
+# ---------------------------------------------------------------------------
+
+_DIGEST_DATE = date(2026, 8, 16)
+
+
+@pytest.mark.parametrize(
+    "timeframe,comparator",
+    [
+        ("day", "none"), ("day", "last_year"),
+        ("mtd", "none"), ("mtd", "last_year"), ("mtd", "budget"), ("mtd", "forecast"),
+        ("ytd", "none"), ("ytd", "last_year"), ("ytd", "budget"), ("ytd", "forecast"),
+    ],
+)
+def test_every_approved_comparator_matrix_combination_builds_successfully(timeframe, comparator):
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe=timeframe, view="headline", comparator=comparator)
+    query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+    assert "EVALUATE" in query
+
+
+@pytest.mark.parametrize("comparator", ["budget", "forecast"])
+def test_day_timeframe_with_budget_or_forecast_is_rejected_before_any_dax_is_built(comparator):
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="day", view="headline", comparator=comparator)
+    with pytest.raises(ValueError):
+        dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+
+
+def test_revenue_digest_requires_a_real_scope_context():
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="headline", comparator="none")
+    with pytest.raises(ValueError):
+        dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, scope=None)
+
+    class FakeScope:
+        hotel_id = 7
+
+    with pytest.raises(ValueError):
+        dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, scope=FakeScope())
+
+
+@pytest.mark.parametrize("view", ["headline", "rooms", "fnb_revenue", "other"])
+def test_each_view_produces_exactly_its_governed_metric_count(view):
+    """The N-governed-metrics-in -> N-rows-out invariant, checked at the
+    generated-DAX level: exactly one ROW( block per metric in the view,
+    never more, never fewer - the query is built from the governed metric
+    SET, not from however many physical rows happen to exist."""
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view=view, comparator="none")
+    query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+    assert query.count("ROW(\n") == len(VIEW_METRICS[view])
+
+
+def test_headline_view_has_exactly_the_ten_approved_metrics():
+    assert VIEW_METRICS["headline"] == (
+        "total_revenue", "room_revenue", "total_fnb", "total_other_misc",
+        "occupancy_pct", "adr", "revpar", "rooms_sold", "rooms_available", "guests",
+    )
+
+
+def test_rooms_view_has_exactly_the_seven_approved_metrics():
+    assert VIEW_METRICS["rooms"] == ("room_revenue", "rooms_sold", "rooms_available", "occupancy_pct", "adr", "revpar", "guests")
+
+
+def test_fnb_revenue_view_has_exactly_the_four_approved_metrics():
+    assert VIEW_METRICS["fnb_revenue"] == ("food", "beverage", "other_fnb_income", "total_fnb")
+
+
+def test_other_view_has_exactly_the_one_approved_metric():
+    assert VIEW_METRICS["other"] == ("total_other_misc",)
+
+
+def test_revenue_digest_query_touches_exactly_one_audit_date_literal():
+    """Structural protection against summing cumulative MTD/YTD snapshots
+    across dates: only one DATE(...) literal value should ever appear
+    (the requested business date, repeated identically across the
+    BusinessDate column and every metric's AuditDate filter) - never a
+    second, different date."""
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="headline", comparator="none")
+    query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+    date_literal = dax_query_builder._dax_date_literal(_DIGEST_DATE)
+    # comparator="none" -> 2 CALCULATE blocks per metric (Value, SourceRowCount),
+    # each with one AuditDate filter, plus one BusinessDate column = 3 per metric.
+    assert query.count(date_literal) == 10 * 3
+    assert query.count("DATE(") == 10 * 3
+    assert "DATE(2026, 8, 15)" not in query
+    assert "DATE(2026, 8, 17)" not in query
+
+
+def test_revenue_digest_never_touches_the_average_spend_or_por_rows():
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="headline", comparator="none")
+    query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+    assert "Avg. Spend / Guest" not in query
+    assert "Total Revenue POR" not in query
+    assert "Room Density" not in query
+
+
+# --- per-metric, per-CALCULATE-block hotel/date/group/type scoping --------
+#
+# The exact lesson from the Holdings cross-hotel aggregation correction,
+# applied here from the start: every Value/ComparisonValue/
+# SourceVarianceValue/SourceRowCount CALCULATE must independently carry all
+# 5 governed filters. Tested at the block-generating-function level (not by
+# parsing the assembled UNION text) so a regression in exactly ONE metric's
+# block generation fails exactly ONE parametrized case.
+
+_ALL_GOVERNED_METRIC_IDS = sorted({m for metrics in VIEW_METRICS.values() for m in metrics})
+
+
+@pytest.mark.parametrize("metric_id", _ALL_GOVERNED_METRIC_IDS)
+def test_every_metrics_value_block_is_hotel_date_group_type_scoped(metric_id):
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="headline", comparator="budget")
+    block = dax_query_builder._revenue_digest_metric_row(_SCOPE.hotel_id, request, metric_id)
+    mapping = REVENUE_METRIC_MAPPINGS[metric_id]
+    governed_filters = [
+        f"_Hotels[Hotel_ID] = {_SCOPE.hotel_id}",
+        f"{dax_query_builder.REVENUE_TABLE}[Hotel_ID] = {_SCOPE.hotel_id}",
+        f"{dax_query_builder.REVENUE_TABLE}[AuditDate] = {dax_query_builder._dax_date_literal(_DIGEST_DATE)}",
+        f'{dax_query_builder.REVENUE_TABLE}[Revenue_Group] = "{mapping.revenue_group}"',
+        f'{dax_query_builder.REVENUE_TABLE}[Revenue_Type] = "{mapping.revenue_type}"',
+    ]
+    # mtd+budget populates Value, ComparisonValue, SourceVarianceValue, and
+    # SourceRowCount - 4 CALCULATE blocks, each carrying all 5 filters.
+    for filter_text in governed_filters:
+        assert block.count(filter_text) == 4, f"{metric_id}: expected {filter_text!r} in exactly 4 CALCULATE blocks, found {block.count(filter_text)}"
+    assert block.count("CALCULATE(") == 4
+
+
+@pytest.mark.parametrize("metric_id", _ALL_GOVERNED_METRIC_IDS)
+def test_every_metrics_source_row_count_block_is_scoped_even_with_no_comparator(metric_id):
+    """comparator="none" -> ComparisonValue/SourceVarianceValue both become
+    bare BLANK() (no CALCULATE at all) - Value and SourceRowCount are the
+    only 2 CALCULATE blocks left, and both must still carry all 5 filters."""
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="headline", comparator="none")
+    block = dax_query_builder._revenue_digest_metric_row(_SCOPE.hotel_id, request, metric_id)
+    mapping = REVENUE_METRIC_MAPPINGS[metric_id]
+    assert block.count('"ComparisonValue", BLANK()') == 1
+    assert block.count('"SourceVarianceValue", BLANK()') == 1
+    assert block.count("CALCULATE(") == 2  # Value and SourceRowCount only
+    for filter_text in (
+        f"_Hotels[Hotel_ID] = {_SCOPE.hotel_id}",
+        f"{dax_query_builder.REVENUE_TABLE}[Hotel_ID] = {_SCOPE.hotel_id}",
+        f"{dax_query_builder.REVENUE_TABLE}[AuditDate] = {dax_query_builder._dax_date_literal(_DIGEST_DATE)}",
+        f'{dax_query_builder.REVENUE_TABLE}[Revenue_Group] = "{mapping.revenue_group}"',
+        f'{dax_query_builder.REVENUE_TABLE}[Revenue_Type] = "{mapping.revenue_type}"',
+    ):
+        assert block.count(filter_text) == 2
+
+
+def test_day_plus_last_year_has_no_source_variance_calculate_block():
+    """day+last_year has a real ComparisonValue (Value (Last Year)) but NO
+    precomputed daily delta measure - SourceVarianceValue must be a bare
+    BLANK(), never a CALCULATE, and never silently reuse a Vs_* measure that
+    doesn't apply at this grain."""
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="day", view="headline", comparator="last_year")
+    block = dax_query_builder._revenue_digest_metric_row(_SCOPE.hotel_id, request, "total_revenue")
+    assert '"ComparisonValue", CALCULATE(' in block
+    assert '"SourceVarianceValue", BLANK()' in block
+    assert "Vs LY" not in block and "Vs Budget" not in block and "Vs Forecast" not in block
+
+
+def test_source_variance_value_uses_the_precomputed_vs_measure_for_mtd_budget():
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="headline", comparator="budget")
+    block = dax_query_builder._revenue_digest_metric_row(_SCOPE.hotel_id, request, "total_revenue")
+    assert "[Matrix: Value (Vs Budget MTD)]" in block
+
+
+def test_source_variance_value_uses_the_precomputed_vs_measure_for_mtd_forecast():
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="headline", comparator="forecast")
+    block = dax_query_builder._revenue_digest_metric_row(_SCOPE.hotel_id, request, "total_revenue")
+    assert "[Matrix: Value (Vs Forecast MTD)]" in block
+
+
+def test_revenue_digest_output_field_dax_aliases_agree_with_the_generated_row():
+    """Cross-check named_queries.py's declared aliases against the literal
+    column names _revenue_digest_metric_row actually emits, mirroring the
+    Holdings agreement test."""
+    definition = NAMED_QUERY_DEFINITIONS[QueryId.REVENUE_PERFORMANCE_DIGEST_V1]
+    declared_aliases = {field.dax_alias for field in definition.output_fields}
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="other", comparator="none")
+    block = dax_query_builder._revenue_digest_metric_row(_SCOPE.hotel_id, request, "total_other_misc")
+    emitted_aliases = {line.split(",", 1)[0].strip().strip('"') for line in block.splitlines() if line.strip().startswith('"')}
+    assert declared_aliases == emitted_aliases
+
+
+def test_revenue_digest_never_touches_the_raw_adr_style_column_directly():
+    """Every value comes from a curated Matrix: Value measure reference,
+    never a raw mart column SUM - unlike Holdings, this query never computes
+    its own ratio."""
+    request = RevenueDigestRequest(date=_DIGEST_DATE, timeframe="mtd", view="rooms", comparator="none")
+    query = dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, _SCOPE)
+    assert "SUM(" not in query
+    assert "[Matrix: Value (MTD)]" in query

@@ -73,7 +73,9 @@ each day is a multi-row group rather than a single value - see
 
 from dataclasses import dataclass
 from datetime import date
+from typing import Literal
 
+from dmr import semantics
 from dmr.measures import (
     FNB_MEASURES,
     FNB_TABLE,
@@ -89,6 +91,7 @@ from dmr.measures import (
 )
 from dmr.named_queries import NAMED_QUERY_DEFINITIONS, QueryId
 from dmr.reports import Measure, Report
+from dmr.revenue_performance_digest_reference import REVENUE_METRIC_MAPPINGS, VIEW_METRICS
 from scope.scope_context import ScopeContext
 
 # Hard ceiling regardless of what a caller asks for - about a quarter of
@@ -366,7 +369,7 @@ def _validate_pace_window(query_id: QueryId, request: HoldingsPaceRequest) -> No
         raise ValueError("stay_start, stay_end, and as_of_date must all be real date values.")
     if request.stay_end < request.stay_start:
         raise ValueError("stay_end must be on or after stay_start.")
-    max_days = NAMED_QUERY_DEFINITIONS[query_id].max_stay_window_days
+    max_days = NAMED_QUERY_DEFINITIONS[query_id].limits.max_stay_window_days
     window_length = (request.stay_end - request.stay_start).days + 1
     if window_length > max_days:
         raise ValueError(f"stay window cannot exceed {max_days} days, got {window_length}.")
@@ -592,13 +595,188 @@ def _build_holdings_pace_same_point_last_year_query(hotel_id: int, request: Hold
     """
 
 
-def build_named(query_id: QueryId, request: HoldingsPaceRequest, scope: ScopeContext) -> str:
-    """The named-query sibling to build() - see the module-section comment
-    above for why this is a separate entry point rather than folded into
-    build()/QuerySpec/REPORT_DEFINITIONS.
+# ---------------------------------------------------------------------------
+# Revenue Performance Digest (revenue_performance_digest_v1, Phase R1) - a
+# second, sibling named query. Additive only: nothing above this line (every
+# existing report's query builder, and the Holdings-pace query above) is
+# touched.
+#
+# Unlike Holdings, this query needs NO per-row snapshot resolution at all -
+# Revenue's AuditDate already IS the business date, and every governed metric
+# shares the identical (hotel, date) filter context. So the shape here is
+# deliberately simpler: one literal ROW(...) expression per governed metric,
+# UNION'd together - never a SUMMARIZECOLUMNS-over-physical-rows shape,
+# because SUMMARIZECOLUMNS only ever produces a row when a matching physical
+# row exists, which cannot satisfy "a missing metric row must still be
+# returned, with null values" (missing_canonical_metric_row, surface_null).
+# Building from the REQUESTED GOVERNED METRIC SET (never from physical rows)
+# is what guarantees exactly len(VIEW_METRICS[view]) output rows regardless
+# of how much data actually exists.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RevenueDigestRequest:
+    date: date
+    timeframe: Literal["day", "mtd", "ytd"]
+    view: Literal["headline", "rooms", "fnb_revenue", "other"]
+    comparator: Literal["none", "last_year", "budget", "forecast"] = "none"
+
+
+# (timeframe, comparator) -> unsupported. Confirmed directly from
+# MEASURE_DEFINITIONS: no REVENUE_BUDGET_CURRENT/REVENUE_FORECAST_CURRENT
+# measure exists at all - day+budget/day+forecast are structurally impossible,
+# not merely a data-availability gap, so they're rejected here rather than
+# surfaced as a runtime quality condition.
+_UNSUPPORTED_REVENUE_TIMEFRAME_COMPARATOR: frozenset[tuple[str, str]] = frozenset({("day", "budget"), ("day", "forecast")})
+
+_REVENUE_DIGEST_VALUE_MEASURE_BY_TIMEFRAME: dict[str, "Measure"] = {
+    "day": Measure.REVENUE_CURRENT,
+    "mtd": Measure.REVENUE_MTD,
+    "ytd": Measure.REVENUE_YTD,
+}
+
+_REVENUE_DIGEST_COMPARISON_MEASURE: dict[tuple[str, str], "Measure"] = {
+    ("day", "last_year"): Measure.REVENUE_LAST_YEAR,
+    ("mtd", "last_year"): Measure.REVENUE_LY_MTD,
+    ("ytd", "last_year"): Measure.REVENUE_LY_YTD,
+    ("mtd", "budget"): Measure.REVENUE_BUDGET_MTD,
+    ("ytd", "budget"): Measure.REVENUE_BUDGET_YTD,
+    ("mtd", "forecast"): Measure.REVENUE_FORECAST_MTD,
+    ("ytd", "forecast"): Measure.REVENUE_FORECAST_YTD,
+}
+
+# Only where a real precomputed Value_Vs_* column exists - never populated
+# for day+last_year (no such daily-delta measure exists).
+_REVENUE_DIGEST_VARIANCE_MEASURE: dict[tuple[str, str], "Measure"] = {
+    ("mtd", "last_year"): Measure.REVENUE_VS_LY_MTD,
+    ("ytd", "last_year"): Measure.REVENUE_VS_LY_YTD,
+    ("mtd", "budget"): Measure.REVENUE_VS_BUDGET_MTD,
+    ("ytd", "budget"): Measure.REVENUE_VS_BUDGET_YTD,
+    ("mtd", "forecast"): Measure.REVENUE_VS_FORECAST_MTD,
+    ("ytd", "forecast"): Measure.REVENUE_VS_FORECAST_YTD,
+}
+
+
+def _validate_revenue_digest_request(request: RevenueDigestRequest) -> None:
+    """Rejects - never silently substitutes - an invalid request, mirroring
+    _validate_pace_window's discipline. day+budget/day+forecast are rejected
+    here, before any DAX is built, never answered by comparing a day actual
+    against an MTD/YTD comparator instead.
+    """
+    if not isinstance(request.date, date):
+        raise ValueError("date must be a real date value.")
+    if request.timeframe not in ("day", "mtd", "ytd"):
+        raise ValueError(f"Unknown timeframe: {request.timeframe!r}")
+    if request.view not in VIEW_METRICS:
+        raise ValueError(f"Unknown view: {request.view!r}")
+    if request.comparator not in ("none", "last_year", "budget", "forecast"):
+        raise ValueError(f"Unknown comparator: {request.comparator!r}")
+    if (request.timeframe, request.comparator) in _UNSUPPORTED_REVENUE_TIMEFRAME_COMPARATOR:
+        raise ValueError(
+            f"comparator {request.comparator!r} is not supported for timeframe {request.timeframe!r} - "
+            "no Value_Budget_Current/Value_Forecast_Current measure exists in this mart."
+        )
+
+
+def _revenue_digest_metric_row(hotel_id: int, request: RevenueDigestRequest, metric_id: str) -> str:
+    """One literal ROW(...) for exactly one governed metric. Every one of the
+    4 CALCULATE calls below (Value, ComparisonValue if requested,
+    SourceVarianceValue if one exists, SourceRowCount) independently repeats
+    the FULL governed filter set - both hotel filters, the AuditDate filter,
+    and this metric's own Revenue_Group/Revenue_Type - never relying on a
+    surrounding table expression to provide them. This is the exact lesson
+    from the Holdings cross-hotel aggregation correction, applied from the
+    start here rather than discovered after the fact.
+    """
+    mapping = REVENUE_METRIC_MAPPINGS[metric_id]
+    semantic_key = mapping.semantic_key(request.timeframe)
+    unit = semantics.get(semantic_key).unit
+    date_literal = _dax_date_literal(request.date)
+    group = mapping.revenue_group.replace('"', '""')
+    revenue_type = mapping.revenue_type.replace('"', '""')
+
+    governed_filters = (
+        f"_Hotels[Hotel_ID] = {int(hotel_id)},\n"
+        f'        {REVENUE_TABLE}[Hotel_ID] = {int(hotel_id)},\n'
+        f'        {REVENUE_TABLE}[AuditDate] = {date_literal},\n'
+        f'        {REVENUE_TABLE}[Revenue_Group] = "{group}",\n'
+        f'        {REVENUE_TABLE}[Revenue_Type] = "{revenue_type}"'
+    )
+
+    value_measure = MEASURE_DEFINITIONS[_REVENUE_DIGEST_VALUE_MEASURE_BY_TIMEFRAME[request.timeframe]][1]
+    value_expr = f"CALCULATE(\n        {value_measure},\n        {governed_filters}\n    )"
+
+    comparison_measure = _REVENUE_DIGEST_COMPARISON_MEASURE.get((request.timeframe, request.comparator))
+    comparison_expr = (
+        f"CALCULATE(\n        {MEASURE_DEFINITIONS[comparison_measure][1]},\n        {governed_filters}\n    )"
+        if comparison_measure is not None
+        else "BLANK()"
+    )
+
+    variance_measure = _REVENUE_DIGEST_VARIANCE_MEASURE.get((request.timeframe, request.comparator))
+    variance_expr = (
+        f"CALCULATE(\n        {MEASURE_DEFINITIONS[variance_measure][1]},\n        {governed_filters}\n    )"
+        if variance_measure is not None
+        else "BLANK()"
+    )
+
+    source_row_count_expr = f"CALCULATE(\n        COUNTROWS({REVENUE_TABLE}),\n        {governed_filters}\n    )"
+
+    return (
+        "ROW(\n"
+        f'    "HotelId", {int(hotel_id)},\n'
+        f'    "BusinessDate", {date_literal},\n'
+        f'    "Timeframe", "{request.timeframe}",\n'
+        f'    "View", "{request.view}",\n'
+        f'    "MetricId", "{metric_id}",\n'
+        f'    "SemanticKey", "{semantic_key}",\n'
+        f'    "MetricLabel", "{mapping.label}",\n'
+        f'    "RevenueGroup", "{group}",\n'
+        f'    "RevenueType", "{revenue_type}",\n'
+        f'    "Unit", "{unit}",\n'
+        f'    "ComparatorType", "{request.comparator}",\n'
+        f'    "Value", {value_expr},\n'
+        f'    "ComparisonValue", {comparison_expr},\n'
+        f'    "SourceVarianceValue", {variance_expr},\n'
+        f'    "SourceRowCount", {source_row_count_expr}\n'
+        ")"
+    )
+
+
+def _build_revenue_performance_digest_query(hotel_id: int, request: RevenueDigestRequest) -> str:
+    """revenue_performance_digest_v1 - one ROW() per metric in the requested
+    view, UNION'd together. Exactly len(VIEW_METRICS[request.view]) rows,
+    always - a metric with zero matching physical rows still produces a row
+    here (its CALCULATE calls simply evaluate to BLANK()/0), never a dropped
+    one. Touches exactly one AuditDate - the structural protection against
+    summing cumulative MTD/YTD snapshots across dates.
+    """
+    metric_ids = VIEW_METRICS[request.view]
+    row_blocks = [_revenue_digest_metric_row(hotel_id, request, metric_id) for metric_id in metric_ids]
+    union_args = ",\n    ".join(row_blocks)
+    return f"""
+    EVALUATE
+    UNION(
+    {union_args}
+    )
+    """
+
+
+def build_named(
+    query_id: QueryId,
+    request: "HoldingsPaceRequest | RevenueDigestRequest",
+    scope: ScopeContext,
+) -> str:
+    """The named-query sibling to build() - see the module-section comments
+    above for why each domain is a separate entry point rather than folded
+    into build()/QuerySpec/REPORT_DEFINITIONS.
     """
     _require_scope(scope)
-    _validate_pace_window(query_id, request)
     if query_id is QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1:
+        _validate_pace_window(query_id, request)
         return _build_holdings_pace_same_point_last_year_query(scope.hotel_id, request)
+    if query_id is QueryId.REVENUE_PERFORMANCE_DIGEST_V1:
+        _validate_revenue_digest_request(request)
+        return _build_revenue_performance_digest_query(scope.hotel_id, request)
     raise ValueError(f"Unknown named query: {query_id}")

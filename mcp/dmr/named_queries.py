@@ -1,5 +1,5 @@
-"""The named-query transport/evidence contract - Phase 1 of the UC-01
-Holdings-pace vertical slice.
+"""The named-query transport/evidence contract - now shared by two domains:
+Holdings pace (Phase 1) and Revenue Performance Digest (Phase R1).
 
 This is deliberately NOT a renamed `ReportDefinition` (see reports.py):
 `ReportDefinition` says what the *tool-execution boundary* needs to know
@@ -8,21 +8,28 @@ call). A `QueryDefinition` here says what a *specific, versioned query
 implementation* actually is - its visible/server-bound parameters, its
 output schema, its quality rules, and a logical (never hard-coded
 production) semantic-model reference - independent of whether any MCP tool
-exists yet that calls it. `get_holdings_pace` (Phase 3) will eventually bind
-a `Report` enum value to this query id; nothing in dmr_tools.py or
-report_registry.py reads this module yet, so no `Report` reference is added
-here now (adding an unused `Report.HOLDINGS_PACE` member without a matching
+exists yet that calls it. Neither `get_holdings_pace` nor
+`get_performance_digest` exists yet; nothing in dmr_tools.py or
+report_registry.py reads this module, so no `Report` reference is added
+here (adding an unused `Report` member without a matching
 `REPORT_DEFINITIONS` entry would break `tools/dmr_tools.py`'s
 `TOOL_NAMES = tuple(REPORT_DEFINITIONS[r].tool_name for r in Report)` at
 import time - that wiring is deferred to Phase 3, bundled with its registry
 entry, not introduced piecemeal here).
 
-`max_stay_window_days` on `HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1` is 62 -
-confirmed as the value for this named query's contract. `dax_query_builder.py`
-reads it from here rather than declaring its own copy, so the two can never
-independently disagree (the same "one owner, everyone else reads" discipline
-`dax_query_builder.py`'s own `MAX_DAYS`/`_DEFAULT_DAYS` already use for the
-5 existing reports - see that module and tools/report_registry.py's docstring).
+`QueryLimits` (below) replaces what used to be a bare `max_stay_window_days`
+field directly on `QueryDefinition` - a Holdings-specific field on a shared
+type is exactly the "domain-specific fields on someone else's contract"
+problem this refactor exists to avoid, now that a second domain (Revenue)
+needs the same shared shape with different limits. `QueryLimits` carries
+only fields actually needed by at least one domain today - `max_output_rows`
+(generic - Revenue's bounded view sizes) and `max_stay_window_days`
+(Holdings-specific, left `None` for every other domain). This refactor is
+behavior-preserving: `max_stay_window_days`'s value is read exclusively by
+`dax_query_builder._validate_pace_window`'s Python length check and is never
+interpolated into any generated DAX string, so it cannot change Holdings'
+DAX output - see test_dax_query_builder.py's byte-identical regression test,
+which proves this against a snapshot captured before this refactor.
 
 Never imports `analytics` or `tools` - see
 test_dmr_named_queries_module_never_imports_analytics_or_tools.
@@ -38,20 +45,32 @@ class QueryId(Enum):
     # elsewhere in dmr core - a new version is a NEW member, never a mutation
     # of this one's definition.
     HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1 = "holdings_pace_same_point_last_year_v1"
+    REVENUE_PERFORMANCE_DIGEST_V1 = "revenue_performance_digest_v1"
 
 
 @dataclass(frozen=True)
 class VisibleParam:
     """Documentation/introspection metadata only - not a validation engine.
-    Real validation is typed Python (`HoldingsPaceRequest` + `_validate_pace_window`
-    in dax_query_builder.py), exactly like `days: int | None` is for the 5
-    existing reports.
+    Real validation is typed Python (`HoldingsPaceRequest`/`RevenueDigestRequest`
+    + their `_validate_*` functions in dax_query_builder.py), exactly like
+    `days: int | None` is for the 5 existing reports.
     """
 
     name: str
-    type: Literal["date"]
+    type: Literal["date", "string", "enum"]
     description: str
     required: bool
+
+
+@dataclass(frozen=True)
+class QueryLimits:
+    """Only fields at least one domain actually needs today - never a
+    speculative catch-all. A domain that doesn't need a given limit leaves
+    it at its default `None`; this is a typed struct, never a dict/Any bag.
+    """
+
+    max_output_rows: int | None = None
+    max_stay_window_days: int | None = None
 
 
 @dataclass(frozen=True)
@@ -92,7 +111,7 @@ class QueryDefinition:
     semantic_model_ref: str
     visible_params: tuple[VisibleParam, ...]
     server_bound_params: frozenset[str]
-    max_stay_window_days: int
+    limits: QueryLimits
     comparator_semantics: str
     output_fields: tuple[OutputField, ...]
     quality_rules: tuple[QualityRule, ...]
@@ -193,6 +212,82 @@ _HOLDINGS_PACE_QUALITY_RULES: tuple[QualityRule, ...] = (
     ),
 )
 
+_REVENUE_DIGEST_OUTPUT_FIELDS: tuple[OutputField, ...] = (
+    OutputField("hotel_id", "int", "Internal only - never a model-visible parameter.", dax_alias="HotelId"),
+    OutputField("business_date", "date", "The requested date - echoes the request.", dax_alias="BusinessDate"),
+    OutputField("timeframe", "string", "day | mtd | ytd - echoes the request.", dax_alias="Timeframe"),
+    OutputField("view", "string", "headline | rooms | fnb_revenue | other - echoes the request.", dax_alias="View"),
+    OutputField("metric_id", "string", "Stable, public business-facing metric identifier - never internal semantic-registry naming.", dax_alias="MetricId"),
+    OutputField(
+        "semantic_key",
+        "string",
+        "The FULL timeframe-specific dmr.semantics key that backed this value (e.g. "
+        "'revenue.rooms_from_market_segment.mtd'), not just the metric family - the result/evidence "
+        "layer needs the exact semantic identity that produced the value.",
+        dax_alias="SemanticKey",
+    ),
+    OutputField("metric_label", "string", "Stable, hand-authored label - never parsed from MetricSemantics.business_name.", dax_alias="MetricLabel"),
+    OutputField("revenue_group", "string", "The governed Revenue_Group actually matched - evidence that no group subtotal was taken.", dax_alias="RevenueGroup"),
+    OutputField("revenue_type", "string", "The governed Revenue_Type actually matched.", dax_alias="RevenueType"),
+    OutputField("unit", "string", "currency | count | percentage | rate, from dmr.semantics.", dax_alias="Unit"),
+    OutputField("value", "float", "The timeframe-resolved value. Null means no physical row exists - see missing_canonical_metric_row.", dax_alias="Value"),
+    OutputField("comparator_type", "string", "none | last_year | budget | forecast - echoes the request.", dax_alias="ComparatorType"),
+    OutputField("comparison_value", "float", "The requested comparator's raw value. Null if unsupported or absent.", dax_alias="ComparisonValue"),
+    OutputField(
+        "source_variance_value",
+        "float",
+        "Populated ONLY from a real, source-provided Value_Vs_* measure (mtd/ytd x last_year/budget/"
+        "forecast) - always null for day+last_year, since no precomputed daily delta measure exists. "
+        "Never computed by this query - a canonical value - comparison_value delta belongs to a later, "
+        "deterministic result layer.",
+        dax_alias="SourceVarianceValue",
+    ),
+    OutputField(
+        "source_row_count",
+        "int",
+        "Physical rows matched at the full (Hotel_ID, AuditDate, Revenue_Group, Revenue_Type) grain - "
+        "the mart's own declared natural key. 0 when unresolved, 1 when clean, >1 flags "
+        "duplicate_physical_grain.",
+        dax_alias="SourceRowCount",
+    ),
+)
+
+_REVENUE_DIGEST_QUALITY_RULES: tuple[QualityRule, ...] = (
+    QualityRule(
+        "comparison_grain_mismatch",
+        "A day-timeframe request paired with a budget/forecast comparator - no Value_Budget_Current or "
+        "Value_Forecast_Current measure exists, so this must never be silently compared against an "
+        "MTD/YTD value instead.",
+        policy="block",
+    ),
+    QualityRule(
+        "unsupported_comparator",
+        "The requested comparator has no measure for the requested timeframe.",
+        policy="block",
+    ),
+    QualityRule(
+        "unresolved_metric_mapping",
+        "A requested metric has no governed Revenue_Group/Revenue_Type mapping - structurally "
+        "unreachable in normal operation since every view lists only pre-vetted metric ids.",
+        policy="block",
+    ),
+    QualityRule(
+        "duplicate_physical_grain",
+        "More than one physical row exists at the full (Hotel_ID, AuditDate, Revenue_Group, "
+        "Revenue_Type) grain - the mart's own declared natural key. Summing them would silently "
+        "misstate the metric, not merely restate a correct total. Phase R1 detects this via "
+        "source_row_count; enforcing the block is a later execution layer's job.",
+        policy="block",
+    ),
+    QualityRule(
+        "missing_canonical_metric_row",
+        "No physical row exists for this governed metric at the requested date. The row is still "
+        "returned - value/comparison_value/source_variance_value null, source_row_count=0 - never "
+        "dropped from the result.",
+        policy="surface_null",
+    ),
+)
+
 NAMED_QUERY_DEFINITIONS: dict[QueryId, QueryDefinition] = {
     QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1: QueryDefinition(
         query_id=QueryId.HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1,
@@ -203,7 +298,7 @@ NAMED_QUERY_DEFINITIONS: dict[QueryId, QueryDefinition] = {
             VisibleParam("as_of_date", "date", "Snapshot/audit date to resolve the pace as of.", required=True),
         ),
         server_bound_params=frozenset({"hotel_id"}),
-        max_stay_window_days=62,
+        limits=QueryLimits(max_stay_window_days=62),
         comparator_semantics=(
             "Always computes both a current window and a calendar-shifted "
             "(EDATE, -12 months) same-point-last-year comparator window. No other "
@@ -213,5 +308,27 @@ NAMED_QUERY_DEFINITIONS: dict[QueryId, QueryDefinition] = {
         ),
         output_fields=_HOLDINGS_PACE_OUTPUT_FIELDS,
         quality_rules=_HOLDINGS_PACE_QUALITY_RULES,
+    ),
+    QueryId.REVENUE_PERFORMANCE_DIGEST_V1: QueryDefinition(
+        query_id=QueryId.REVENUE_PERFORMANCE_DIGEST_V1,
+        semantic_model_ref="dmr-v3",
+        visible_params=(
+            VisibleParam("date", "date", "The business/reporting date (mart_dmr_revenue_matrix's AuditDate).", required=True),
+            VisibleParam("timeframe", "enum", "day | mtd | ytd.", required=True),
+            VisibleParam("view", "enum", "headline | rooms | fnb_revenue | other - a fixed, governed metric bundle.", required=True),
+            VisibleParam("comparator", "enum", "none | last_year | budget | forecast.", required=False),
+        ),
+        server_bound_params=frozenset({"hotel_id"}),
+        limits=QueryLimits(max_output_rows=10),
+        comparator_semantics=(
+            "last_year is supported at every timeframe (day/mtd/ytd). budget and "
+            "forecast are supported only at mtd/ytd - no Value_Budget_Current or "
+            "Value_Forecast_Current measure exists in this mart (confirmed against "
+            "measures.py's MEASURE_DEFINITIONS), so day+budget and day+forecast are "
+            "rejected before any DAX is built, never silently compared against an "
+            "MTD/YTD value instead."
+        ),
+        output_fields=_REVENUE_DIGEST_OUTPUT_FIELDS,
+        quality_rules=_REVENUE_DIGEST_QUALITY_RULES,
     ),
 }
