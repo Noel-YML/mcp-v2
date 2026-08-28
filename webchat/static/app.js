@@ -62,19 +62,33 @@ async function teardownActiveMcpApps() {
 
 function mountMcpAppIfPresent(container, mcpApp) {
   if (!mcpApp || !window.ArielMcpAppHost) return;
+  // Registered synchronously, before the fetch below even starts, so a
+  // teardownActiveMcpApps() triggered by the NEXT turn (sendMessage disables
+  // the send button for the duration of one turn, but a fast click right as
+  // it re-enables could still race this fetch) always finds this pending
+  // mount and can cancel it - instead of the fetch resolving into a
+  // now-orphaned iframe that nothing ever tracked or tore down.
+  let mountedApp = null;
+  let cancelled = false;
+  activeMcpApps.push({
+    teardown: async () => {
+      cancelled = true;
+      if (mountedApp) await mountedApp.teardown();
+    },
+  });
   fetch(mcpApp.resource_url)
     .then((res) => {
       if (!res.ok) throw new Error("failed to fetch MCP App template");
       return res.text();
     })
     .then((templateHtml) => {
-      const app = window.ArielMcpAppHost.mountRevenueApp({
+      if (cancelled) return;
+      mountedApp = window.ArielMcpAppHost.mountRevenueApp({
         container,
         templateHtml,
         toolInput: mcpApp.tool_input,
         toolResult: mcpApp.tool_result,
       });
-      activeMcpApps.push(app);
     })
     .catch((err) => {
       // The ordinary textual answer already rendered regardless - a failed
@@ -247,6 +261,11 @@ async function submitHotelCode() {
     }
     setHotelDisplay(data.hotel_name);
     hideIdentifyOverlay();
+    // H1.3D: the sidebar must reflect the NEWLY identified hotel's own
+    // history immediately, not whatever the previously-identified hotel's
+    // conversations left rendered in #historyList - the server now filters
+    // by the current session's hotel, but only a fresh fetch picks that up.
+    loadHistory();
   } catch (err) {
     identifyError.textContent = String(err);
   } finally {
@@ -264,11 +283,20 @@ hotelCodeInput.addEventListener("keydown", (e) => {
 });
 
 switchHotelBtn.addEventListener("click", async () => {
+  // H1.3D: same active-state reset as "New chat" (tear down any live MCP
+  // App instead of merely hiding its iframe via showEmptyState's DOM wipe)
+  // plus clearing the identified hotel itself - a hotel switch must leave
+  // no trace of the previous hotel's active conversation/result state.
+  await teardownActiveMcpApps();
   await fetch("/api/logout", { method: "POST" });
   setHotelDisplay(null);
   conversationId = null;
   previousResponseId = null;
   showEmptyState();
+  // The old hotel's conversations must disappear from the sidebar the
+  // moment its session ends, not linger until the next successful chat
+  // turn under the new hotel eventually calls loadHistory() via renderResult.
+  loadHistory();
   showIdentifyOverlay();
 });
 

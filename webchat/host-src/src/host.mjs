@@ -78,6 +78,15 @@ export function mountRevenueApp({ container, templateHtml, toolInput, toolResult
     // existing signal (the OS/browser's own color-scheme preference) rather
     // than inventing a second theme source of truth.
     await bridge.sendHostContextChange({ hostContext: { theme: prefersDark ? "dark" : "light" } });
+  }).catch(() => {
+    // H1.3D: if delivering the initial tool input/result fails partway
+    // (e.g. the transport was concurrently closed), the View has nothing
+    // telling it otherwise and is left showing its static "Loading..."
+    // shell forever with no visible error. Same graceful-degradation
+    // philosophy as the connect() failure above - tear the stuck iframe
+    // down instead of leaving it; the ordinary textual chat answer already
+    // rendered regardless.
+    teardown();
   });
 
   async function teardown() {

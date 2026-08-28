@@ -18132,6 +18132,8 @@ container holding the app. Specify either width or maxWidth, and either height o
       });
       const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
       await bridge.sendHostContextChange({ hostContext: { theme: prefersDark ? "dark" : "light" } });
+    }).catch(() => {
+      teardown();
     });
     async function teardown() {
       if (torndown) return;

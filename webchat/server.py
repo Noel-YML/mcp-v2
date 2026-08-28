@@ -795,14 +795,29 @@ def logout():
     return resp
 
 
+def _owned_by_current_hotel(convo: dict, session: dict) -> bool:
+    """H1.3D: a conversation belongs to the current session's hotel only if
+    it was created with a matching server-captured `hotel_id` - never the
+    browser's. A conversation with no `hotel_id` at all is a pre-H1.3D
+    legacy record with no trustworthy binding; it is deliberately treated as
+    owned by nobody (unavailable until recreated) rather than guessed at
+    from its title/message text, which the model or the user authored and
+    which this server does not trust for authorization.
+    """
+    return convo.get("hotel_id") is not None and convo["hotel_id"] == session["hotel_id"]
+
+
 @app.route("/api/conversations", methods=["GET"])
 def list_conversations():
+    session = _current_session()
+    if not session:
+        return jsonify({"error": "Not identified - enter your hotel code first."}), 401
     include_archived = request.args.get("archived") == "1"
     store = _load_store()
     summaries = [
         {"id": c["id"], "title": c["title"], "updated_at": c["updated_at"], "archived": c["archived"]}
         for c in store.values()
-        if include_archived or not c["archived"]
+        if _owned_by_current_hotel(c, session) and (include_archived or not c["archived"])
     ]
     summaries.sort(key=lambda c: c["updated_at"], reverse=True)
     return jsonify(summaries)
@@ -810,42 +825,64 @@ def list_conversations():
 
 @app.route("/api/conversations/<conversation_id>", methods=["GET"])
 def get_conversation(conversation_id):
+    session = _current_session()
+    if not session:
+        return jsonify({"error": "Not identified - enter your hotel code first."}), 401
     store = _load_store()
     convo = store.get(conversation_id)
-    if not convo:
+    # Deliberately the same generic 404 whether the id doesn't exist at all
+    # or exists but belongs to a different hotel - never reveal that a
+    # conversation_id is valid for someone else's hotel.
+    if not convo or not _owned_by_current_hotel(convo, session):
         return jsonify({"error": "Conversation not found."}), 404
-    return jsonify(convo)
+    # hotel_id is a server-internal ownership fact, never sent to the
+    # browser - same principle as list_conversations()'s field allowlist.
+    return jsonify({k: v for k, v in convo.items() if k != "hotel_id"})
 
 
 @app.route("/api/conversations/<conversation_id>/archive", methods=["POST"])
 def set_archived(conversation_id):
+    session = _current_session()
+    if not session:
+        return jsonify({"error": "Not identified - enter your hotel code first."}), 401
     body = request.get_json(force=True)
     archived = bool(body.get("archived", True))
     store = _load_store()
-    if conversation_id not in store:
+    convo = store.get(conversation_id)
+    if not convo or not _owned_by_current_hotel(convo, session):
         return jsonify({"error": "Conversation not found."}), 404
-    store[conversation_id]["archived"] = archived
+    convo["archived"] = archived
     _save_store(store)
     return jsonify({"ok": True})
 
 
 @app.route("/api/conversations/<conversation_id>/rename", methods=["POST"])
 def rename_conversation(conversation_id):
+    session = _current_session()
+    if not session:
+        return jsonify({"error": "Not identified - enter your hotel code first."}), 401
     body = request.get_json(force=True)
     title = (body.get("title") or "").strip()
     if not title:
         return jsonify({"error": "Title can't be empty."}), 400
     store = _load_store()
-    if conversation_id not in store:
+    convo = store.get(conversation_id)
+    if not convo or not _owned_by_current_hotel(convo, session):
         return jsonify({"error": "Conversation not found."}), 404
-    store[conversation_id]["title"] = title[:60]
+    convo["title"] = title[:60]
     _save_store(store)
     return jsonify({"ok": True})
 
 
 @app.route("/api/conversations/<conversation_id>", methods=["DELETE"])
 def delete_conversation(conversation_id):
+    session = _current_session()
+    if not session:
+        return jsonify({"error": "Not identified - enter your hotel code first."}), 401
     store = _load_store()
+    convo = store.get(conversation_id)
+    if convo and not _owned_by_current_hotel(convo, session):
+        return jsonify({"error": "Conversation not found."}), 404
     store.pop(conversation_id, None)
     _save_store(store)
     return jsonify({"ok": True})
@@ -873,10 +910,20 @@ def chat():
 
     store = _load_store()
     convo = store.get(conversation_id) if conversation_id else None
+    # H1.3D: a conversation_id from another hotel (a stale client-side value
+    # left over from before a hotel switch, or simply a foreign id someone
+    # tried) is never honored - silently starting a fresh conversation is
+    # the correct response, not an error, since the client may just be
+    # mid-switch. This is what keeps a Hotel B turn from ever inheriting
+    # Hotel A's last_response_id/last_result_id: convo is treated as if the
+    # id didn't exist at all, so the block below builds a brand-new one.
+    if convo is not None and not _owned_by_current_hotel(convo, session):
+        convo = None
     if convo is None:
         conversation_id = str(uuid.uuid4())
         convo = {
             "id": conversation_id,
+            "hotel_id": hotel_id,
             "title": message[:60],
             "created_at": _now(),
             "updated_at": _now(),
