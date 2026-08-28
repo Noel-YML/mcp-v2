@@ -229,7 +229,11 @@ Respond with a single JSON object matching your configured response schema: {"me
 
 8. Never include a scope token, hotel id, tenant id, function key, or any authorization/credential detail anywhere in your response.
 
-9. If a tool call failed or returned no data, say so plainly in "message" and leave "presentation"/"insights" empty - never fabricate figures."""
+9. If a tool call failed or returned no data, say so plainly in "message" and leave "presentation"/"insights" empty - never fabricate figures.
+
+10. Before calling get_performance_digest for a NEW Revenue fact, you must know the exact calendar date to report on. Use it directly if the user gave an explicit date, or if trusted context has already supplied one. Otherwise - including "today", "yesterday", "this morning", "last night", "this MTD", "this YTD", or no date mentioned at all - ask the user to provide or confirm the exact calendar date, and make ZERO get_performance_digest calls until you have one. Never resolve a relative date yourself, never assume a timezone, and never explain why you lack a trusted date source - just ask for it plainly. This rule does NOT apply to get_result_evidence: continuing with evidence for an already-established result (e.g. "why", "show the evidence") never requires asking for a date again - that result already carries its own governed date context.
+
+11. A generic performance question that doesn't name a view means view="headline", called exactly once. Never call get_performance_digest more than once, or across multiple views, to build one richer answer - only use rooms/fnb_revenue/other when the user actually asks for that view."""
 
 
 def build_instructions() -> str:
