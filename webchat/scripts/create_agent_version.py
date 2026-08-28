@@ -254,41 +254,16 @@ Respond with a single JSON object matching your configured response schema: {{"m
 6. If a tool call failed or returned no data, say so plainly in "message" and leave "presentation" and "insights" empty - never fabricate figures."""
 
 
-def main():
-    # Default stays draft=True - a permanent, sequentially-numbered version
-    # is immutable once created, so promoting off draft is an explicit,
-    # opt-in choice (--publish), not this script's default behavior.
-    publish = "--publish" in sys.argv[1:]
-    f1_revenue = "--f1-revenue" in sys.argv[1:]
-
-    project = AIProjectClient(endpoint=PROJECT_ENDPOINT, credential=DefaultAzureCredential())
-
-    if f1_revenue:
-        # F1: an independent draft exposing ONLY the two governed Revenue
-        # tools - never the 5 legacy DMR tools (module docstring). Mutually
-        # exclusive with the default DMR definition below within one run.
-        tools = build_f1_revenue_tools()
-        instructions = build_f1_instructions()
-        description = (
-            "F1 Revenue conversational vertical slice: exposes ONLY get_performance_digest and "
-            "get_result_evidence (no legacy DMR tools). Foundry owns reasoning/tool selection; webchat's "
-            "existing _run_function_call_loop/_call_mcp_tool_async broker executes every call and attaches "
-            "X-Ariel-Scope + x-functions-key server-side - see docs/system-manifest.md's F1 orchestration note."
-        )
-    else:
-        tools = CURRENT_TOOLS
-        instructions = build_instructions()
-        description = (
-            "Phase 4 + E4 revenue snapshot: schema-constrained AgentResponse (message/presentation/insights/actions), "
-            "validated against the real tool result in webchat before rendering. Adds get_dmr_revenue_snapshot; "
-            "other 4 tools unchanged from v10."
-        )
-
+def build_f1_definition() -> tuple[PromptAgentDefinition, str]:
+    """The approved F1 PromptAgentDefinition (ONLY the two governed Revenue
+    tools) plus its description - factored out of main() so a test can
+    construct it and assert on its shape without touching argv/the network.
+    """
     definition = PromptAgentDefinition(
         model="gpt-5",
         reasoning=Reasoning(effort="low"),
-        instructions=instructions,
-        tools=[Tool(t) for t in tools],
+        instructions=build_f1_instructions(),
+        tools=[Tool(t) for t in build_f1_revenue_tools()],
         text=PromptAgentDefinitionTextOptions(
             format=TextResponseFormatJsonSchema(
                 name="ariel_agent_response",
@@ -298,17 +273,107 @@ def main():
             )
         ),
     )
-
-    version = project.agents.create_version(
-        AGENT_NAME,
-        definition=definition,
-        description=description,
-        draft=not publish,
+    description = (
+        "F1 Revenue conversational vertical slice: exposes ONLY get_performance_digest and "
+        "get_result_evidence (no legacy DMR tools). Foundry owns reasoning/tool selection; webchat's "
+        "existing _run_function_call_loop/_call_mcp_tool_async broker executes every call and attaches "
+        "X-Ariel-Scope + x-functions-key server-side - see docs/system-manifest.md's F1 orchestration note."
     )
-    label = "version" if publish else "draft version"
-    print(f"Created {label}: {version.version}")
-    if publish:
-        print('Set ARIEL_AGENT_VERSION to this number to use it - webchat\'s own default is untouched.')
+    return definition, description
+
+
+def build_dmr_definition() -> tuple[PromptAgentDefinition, str]:
+    """The existing (pre-F1) DMR PromptAgentDefinition - unchanged in
+    content, just factored out alongside build_f1_definition() so main()
+    treats both the same way through one corrected create_version() call.
+    """
+    definition = PromptAgentDefinition(
+        model="gpt-5",
+        reasoning=Reasoning(effort="low"),
+        instructions=build_instructions(),
+        tools=[Tool(t) for t in CURRENT_TOOLS],
+        text=PromptAgentDefinitionTextOptions(
+            format=TextResponseFormatJsonSchema(
+                name="ariel_agent_response",
+                description="Ariel's schema-constrained chat response - message, an optional validated presentation, evidence-backed insights, and allowlisted follow-up actions.",
+                schema=foundry_json_schema(),
+                strict=False,
+            )
+        ),
+    )
+    description = (
+        "Phase 4 + E4 revenue snapshot: schema-constrained AgentResponse (message/presentation/insights/actions), "
+        "validated against the real tool result in webchat before rendering. Adds get_dmr_revenue_snapshot; "
+        "other 4 tools unchanged from v10."
+    )
+    return definition, description
+
+
+def create_agent_version(agents_client, *, agent_name: str, definition: PromptAgentDefinition, description: str):
+    """The ONE supported way to create a new ask-ariel version under the
+    currently installed azure-ai-projects==2.1.0 (F1.1 lifecycle fix).
+
+    There is no `draft=` parameter on `AgentsOperations.create_version` in
+    this SDK version (confirmed by direct signature inspection - it isn't
+    silently absorbed into **kwargs here either, since that's exactly what
+    caused the original TypeError: an unrecognized kwarg fell all the way
+    through to the underlying `requests.Session.request()` call). Current
+    Foundry semantics (per Microsoft's current documentation and this SDK's
+    own `AgentVersionDetails.version`/`.status` docstrings): agent versions
+    are immutable the moment they're created - "agents are immutable and
+    every update creates a new version" - there is no separate draft/publish
+    step at this layer at all. `status` on the returned object reflects
+    provisioning state (creating/active/failed/deleting/deleted), not a
+    draft/published distinction - it defaults to "active" for a non-hosted
+    PromptAgentDefinition like ours the moment provisioning succeeds.
+
+    Which version is used by ANYONE is controlled entirely outside this
+    call, by whatever caller passes an explicit `agent_reference` - for this
+    repo, that's `webchat/server.py`'s `ARIEL_AGENT_VERSION` env var. Calling
+    this function only ever adds one new, additional, immutable version
+    alongside every existing one; it can never change what a running webchat
+    is pointed at, publish anything, or touch an existing version.
+    """
+    return agents_client.create_version(agent_name=agent_name, definition=definition, description=description)
+
+
+def main():
+    if "--publish" in sys.argv[1:]:
+        print(
+            "--publish is no longer a supported flag on this script.\n\n"
+            "Under the currently installed azure-ai-projects SDK, every create_version() call already "
+            "creates one permanent, immutable version - there is no draft/publish distinction at this "
+            "layer to opt into (see create_agent_version()'s docstring). This script always creates "
+            "exactly one new version and never touches any other version.\n\n"
+            "Which version anything actually USES is controlled entirely by webchat/server.py's "
+            "ARIEL_AGENT_VERSION - pointing production at a new version is a separate, manual operator "
+            "step (updating that setting), not something this script does or should do.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    f1_revenue = "--f1-revenue" in sys.argv[1:]
+
+    project = AIProjectClient(endpoint=PROJECT_ENDPOINT, credential=DefaultAzureCredential())
+    definition, description = build_f1_definition() if f1_revenue else build_dmr_definition()
+
+    version = create_agent_version(project.agents, agent_name=AGENT_NAME, definition=definition, description=description)
+
+    # Safe metadata only - never instructions/full tool schemas, never a
+    # credential (create_version returns none, but keep this deliberately
+    # narrow regardless of what future fields the SDK adds to the response).
+    # Bracket access (not `.name`), since azure-ai-projects' generic `Tool`
+    # model is Mapping-like but doesn't always resolve into a subtype with a
+    # real `.name` attribute (confirmed empirically) - `t["name"]` works
+    # either way.
+    tool_names = [t["name"] for t in version.definition.tools]
+    print(f"Created version: {version.version}")
+    print(f"agent: {version.name}")
+    print(f"model: {version.definition.model}")
+    print(f"tools: {', '.join(tool_names)}")
+    print("\nThis is a NEW, additional, immutable version - no existing version was changed, and "
+          "production's ARIEL_AGENT_VERSION is untouched. Set ARIEL_AGENT_VERSION to this number "
+          "locally to test it; do not point production at it without a separate review step.")
 
 
 if __name__ == "__main__":
