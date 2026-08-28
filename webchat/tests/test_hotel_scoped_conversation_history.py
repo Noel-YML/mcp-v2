@@ -229,6 +229,16 @@ def test_14_user_supplied_hotel_identifier_cannot_override_server_binding(monkey
     assert store[conversation_id]["hotel_id"] == 40  # the session's real hotel, never 999
 
 
+def test_conversations_list_response_is_never_browser_cacheable(monkeypatch):
+    """A stale, browser-cached GET /api/conversations response would defeat
+    server-side hotel filtering entirely - observed in practice right after
+    a hotel switch. Every /api/* response must tell the browser not to
+    reuse it."""
+    session_a = _make_session(hotel_id=39)
+    resp = _client_for(session_a).get("/api/conversations?archived=0")
+    assert resp.headers.get("Cache-Control") == "no-store"
+
+
 def test_legacy_conversation_with_no_hotel_id_is_unavailable_to_everyone(monkeypatch, tmp_path):
     """H1.3D Part I: a pre-fix record with no `hotel_id` field at all must
     not be inferred/guessed at - it's simply unreachable until recreated."""

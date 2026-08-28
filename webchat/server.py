@@ -344,6 +344,14 @@ def _set_security_headers(response):
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "same-origin"
+    if request.path.startswith("/api/"):
+        # H1.3D: every /api/* response is session-scoped (identified hotel,
+        # conversation history, chat results). Without this, a browser can
+        # serve a cached response from BEFORE a hotel switch/logout instead
+        # of re-asking the server - observed in practice for GET
+        # /api/conversations, which would otherwise show a stale hotel's
+        # history for a moment after switching.
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
