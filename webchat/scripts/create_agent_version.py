@@ -26,6 +26,35 @@ The 4 tool definitions are copied VERBATIM from the live v10 definition
 during planning) - Phase 4 does not change tool schemas, only adds
 instructions and a structured-output format that didn't exist before
 (`v10.definition.instructions == ""`, confirmed live).
+
+F1 (Foundry Revenue conversational vertical slice, Aug 2026):
+
+    python scripts/create_agent_version.py --f1-revenue
+
+creates a SEPARATE draft exposing ONLY get_performance_digest/
+get_result_evidence - never the 5 legacy DMR tools - as its OWN independent
+draft version (never touches v10/v11/v12, and is never the default
+`--f1-revenue` + `--publish` together promotes THAT F1-only definition, not
+the DMR one - the two modes are mutually exclusive within one run of this
+script). This is a deliberate F1 architecture decision (see
+docs/system-manifest.md's "F1 orchestration" note): Foundry-native remote
+MCP tool calling was spiked and found incompatible with a versioned
+`agent_reference` (the service rejects a per-call `tools` override when an
+agent is specified, and `MCPTool.headers` on a versioned agent definition
+can only ever be static - useless for a per-request X-Ariel-Scope JWT that
+must be fresh per user/session/turn). F1 therefore reuses the exact
+production-proven shape above: two more OpenAI-style function tools,
+resolved by webchat's existing `_run_function_call_loop`/
+`_call_mcp_tool_async` broker, identical in kind to the 5 DMR tools already
+live - not a new orchestration mechanism.
+
+The two F1 tool schemas are typed by hand here (`build_f1_revenue_tools`)
+but are NOT the only source of truth for whether they match the governed
+MCP contract - see webchat/tests/test_revenue_tool_schema_alignment.py,
+which imports mcp/hosting.py's actual SDK-registered schema and asserts
+byte-for-byte property/enum/required alignment. A schema edit here that
+drifts from mcp/tools/revenue_digest_tools.py's real registration fails
+that test, not just this docstring's claim.
 """
 
 import sys
@@ -118,6 +147,91 @@ CURRENT_TOOLS = V10_TOOLS + [
 ]
 
 
+def build_f1_revenue_tools() -> list[dict]:
+    """The ONLY two tools the F1 agent version exposes - model-visible args
+    exactly mirror mcp/tools/revenue_digest_tools.py's registered SDK schema
+    (see that module and mcp/hosting.py). No hotel_id/hotel_name/hotel_code/
+    scope_token/JWT/function_key/TTL/DAX/SQL/Cosmos field anywhere - there is
+    nothing here for those to be. Kept alignment with the real MCP schema is
+    enforced by webchat/tests/test_revenue_tool_schema_alignment.py, not by
+    this comment alone.
+    """
+    return [
+        {
+            "type": "function",
+            "name": "get_performance_digest",
+            "description": (
+                "Gets a governed Revenue performance digest for your hotel for one calendar date - "
+                "actual value and (optionally) a comparison value, for a chosen view of the business "
+                "and a chosen comparator. Deterministic, governed figures - never recompute or "
+                "estimate these yourself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "The calendar date to report on, as an explicit ISO date (YYYY-MM-DD)."},
+                    "timeframe": {"type": "string", "enum": ["day", "mtd", "ytd"], "description": "The reporting grain."},
+                    "view": {
+                        "type": "string",
+                        "enum": ["headline", "rooms", "fnb_revenue", "other"],
+                        "description": "Which slice of Revenue to report - fnb_revenue is F&B REVENUE only, not covers/outlet/avg-spend.",
+                    },
+                    "comparator": {
+                        "type": "string",
+                        "enum": ["none", "last_year", "budget", "forecast"],
+                        "default": "none",
+                        "description": "What to compare the actual value against, if anything. budget/forecast are only valid at mtd/ytd, never day.",
+                    },
+                },
+                "required": ["date", "timeframe", "view"],
+            },
+            "strict": False,
+        },
+        {
+            "type": "function",
+            "name": "get_result_evidence",
+            "description": (
+                "Gets the definitions/evidence behind the MOST RECENT get_performance_digest result in "
+                "this conversation - use this for a follow-up like 'why' or 'show your evidence'. Only "
+                "ever use a result_id you actually received from a get_performance_digest call in this "
+                "same conversation - never invent one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "result_id": {"type": "string", "description": "The result_id returned by a prior get_performance_digest call in this conversation."},
+                },
+                "required": ["result_id"],
+            },
+            "strict": False,
+        },
+    ]
+
+
+def build_f1_instructions() -> str:
+    return """You are Ariel, an assistant for governed hotel Revenue performance data. Every tool call is already scoped to the current hotel - never ask which hotel, never state or repeat a hotel id, and never claim to change or compare to a different hotel; if asked, say hotel context is changed through the normal ARIEL sign-in flow, not through this conversation.
+
+Respond with a single JSON object matching your configured response schema: {"message": ..., "presentation": ..., "insights": [...], "actions": [...]}. You have no actions to recommend in this configuration - always return an empty "actions" list. Leave "presentation" and "insights" null/empty unless a tool result genuinely supports them.
+
+1. ALWAYS include "message" - a clear, direct answer first, in plain English. Never put JSON, DAX, SQL, chart configuration, HTML, or CSS inside "message".
+
+2. Use get_performance_digest for governed Revenue facts. Never generate DAX or SQL, and never recompute or estimate a value the tool could give you - treat every returned number, including exactly 0.0, as a real governed fact, never as "missing" or "unavailable".
+
+3. timeframe "day" + comparator "budget" or "forecast" is not supported. Never call the tool that way - tell the user daily budget/forecast comparison isn't available and offer the MTD equivalent instead.
+
+4. "fnb_revenue" is Revenue-matrix F&B REVENUE only. Never claim covers, average spend, outlet, or category-level F&B performance - that data isn't available to you.
+
+5. You have no tool for market-segment performance. If asked, say so plainly rather than guessing or attempting a workaround.
+
+6. Clearly distinguish a governed fact (a tool's returned value) from your own interpretation of it - never blur the two.
+
+7. Use get_result_evidence only to explain/support the MOST RECENT get_performance_digest result in this conversation (e.g. "why", "what definitions did you use", "show your evidence") - only with a result_id you actually received from that tool, never one you construct or guess.
+
+8. Never include a scope token, hotel id, tenant id, function key, or any authorization/credential detail anywhere in your response.
+
+9. If a tool call failed or returned no data, say so plainly in "message" and leave "presentation"/"insights" empty - never fabricate figures."""
+
+
 def build_instructions() -> str:
     action_lines = "\n".join(f'   - {action_id}' for action_id in ACTIONS)
     presentation_types = ", ".join(f'"{t}"' for t in PRESENTATION_TYPES)
@@ -145,14 +259,36 @@ def main():
     # is immutable once created, so promoting off draft is an explicit,
     # opt-in choice (--publish), not this script's default behavior.
     publish = "--publish" in sys.argv[1:]
+    f1_revenue = "--f1-revenue" in sys.argv[1:]
 
     project = AIProjectClient(endpoint=PROJECT_ENDPOINT, credential=DefaultAzureCredential())
+
+    if f1_revenue:
+        # F1: an independent draft exposing ONLY the two governed Revenue
+        # tools - never the 5 legacy DMR tools (module docstring). Mutually
+        # exclusive with the default DMR definition below within one run.
+        tools = build_f1_revenue_tools()
+        instructions = build_f1_instructions()
+        description = (
+            "F1 Revenue conversational vertical slice: exposes ONLY get_performance_digest and "
+            "get_result_evidence (no legacy DMR tools). Foundry owns reasoning/tool selection; webchat's "
+            "existing _run_function_call_loop/_call_mcp_tool_async broker executes every call and attaches "
+            "X-Ariel-Scope + x-functions-key server-side - see docs/system-manifest.md's F1 orchestration note."
+        )
+    else:
+        tools = CURRENT_TOOLS
+        instructions = build_instructions()
+        description = (
+            "Phase 4 + E4 revenue snapshot: schema-constrained AgentResponse (message/presentation/insights/actions), "
+            "validated against the real tool result in webchat before rendering. Adds get_dmr_revenue_snapshot; "
+            "other 4 tools unchanged from v10."
+        )
 
     definition = PromptAgentDefinition(
         model="gpt-5",
         reasoning=Reasoning(effort="low"),
-        instructions=build_instructions(),
-        tools=[Tool(t) for t in CURRENT_TOOLS],
+        instructions=instructions,
+        tools=[Tool(t) for t in tools],
         text=PromptAgentDefinitionTextOptions(
             format=TextResponseFormatJsonSchema(
                 name="ariel_agent_response",
@@ -166,7 +302,7 @@ def main():
     version = project.agents.create_version(
         AGENT_NAME,
         definition=definition,
-        description="Phase 4 + E4 revenue snapshot: schema-constrained AgentResponse (message/presentation/insights/actions), validated against the real tool result in webchat before rendering. Adds get_dmr_revenue_snapshot; other 4 tools unchanged from v10.",
+        description=description,
         draft=not publish,
     )
     label = "version" if publish else "draft version"

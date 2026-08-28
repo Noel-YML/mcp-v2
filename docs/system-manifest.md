@@ -175,3 +175,18 @@ cd webchat && python -m pytest tests -v
 ```
 
 Both run entirely against fakes and a local scripted HTTP server — no live Fabric or Azure calls. `tests/` and `requirements-dev.txt` are excluded from the deployed Functions package via `.funcignore`.
+
+---
+
+## 10. F1 — Foundry Revenue orchestration (architecture decision, Aug 2026)
+
+F1 adds the two governed Revenue capabilities (`get_performance_digest`, `get_result_evidence` — `mcp/tools/revenue_digest_tools.py`) to the `ask-ariel` agent, as an **independent draft agent version exposing only those two tools** (never the five DMR tools above) — `webchat/scripts/create_agent_version.py --f1-revenue`.
+
+**Decision: reuse the exact production-proven flow in §3 above (versioned Prompt Agent + webchat-executed OpenAI function tools), not Foundry-native remote MCP.** Foundry-native remote MCP tool calling (`azure.ai.projects.models.MCPTool` / the Responses API's per-call `tools=[{"type":"mcp",...}]`) was spiked directly against the live project and the live `ariel-mcp-server-v2` endpoint and found structurally incompatible with this repo's versioned-`agent_reference` model:
+
+- `responses.create(extra_body={"agent_reference": ...}, tools=[...])` is rejected by the service outright (`400 invalid_payload: "Not allowed when agent is specified."`).
+- A versioned `PromptAgentDefinition`'s `MCPTool.headers` is a static dict, fixed at `create_version` time — unusable for `X-Ariel-Scope`, which must be freshly signed per user/session/turn.
+
+So: **Foundry owns reasoning and tool selection; webchat's existing `_run_function_call_loop`/`_call_mcp_tool_async` broker remains the only thing that ever mints a scope token, attaches `X-Ariel-Scope`/the MCP function key, or talks to MCP; MCP remains the sole authorization/calculation/evidence boundary.** This is not a new mechanism — it's the same one the five DMR tools already use in production, extended by two more tool names.
+
+`get_result_evidence`'s `result_id` continuation handle is **BFF-authoritative, never model-trusted**: webchat captures the real `result_id` from a successful `get_performance_digest` MCP response, stores it as `conversations.json`'s `last_result_id`, and both (a) overwrites/canonicalizes the final `AgentResponse.result_id` from that captured value regardless of what the model's own JSON claims, and (b) refuses to forward a `get_result_evidence` call to MCP at all unless its `result_id` argument matches — MCP still independently re-authorizes by session/hotel regardless; this is defense in depth, not the security boundary.

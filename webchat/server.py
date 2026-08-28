@@ -117,6 +117,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import uuid
@@ -215,8 +216,36 @@ FUNCTION_TOOL_NAMES = frozenset(
         "get_dmr_segment_mix",
         "get_dmr_fnb_performance",
         "get_dmr_holdings_outlook",
+        # F1: the two governed Revenue capabilities, routed through the SAME
+        # _call_mcp_tool_async broker as every DMR tool above - see that
+        # function's docstring. The F1 Foundry agent version exposes ONLY
+        # these two (webchat/scripts/create_agent_version.py's
+        # build_f1_revenue_tools()); this allowlist is a second, independent
+        # gate - even a future/misconfigured agent version cannot make
+        # webchat execute a tool that isn't in both places.
+        "get_performance_digest",
+        "get_result_evidence",
     }
 )
+
+# get_performance_digest's own result_id format (mcp/tools/revenue_digest_tools.py's
+# _is_valid_result_id) - mirrored here, not imported, for the same reason
+# the JWT claim shape is mirrored rather than shared (mcp/ and webchat/ are
+# separate deployables - see _mint_scope_token's docstring).
+_RESULT_ID_PATTERN = re.compile(r"^res_[0-9a-f]{16}$")
+
+# The exact, generic response returned locally (never forwarded to MCP) when
+# the model asks for evidence without a legitimate result_id for this
+# conversation - see _run_function_call_loop. Deliberately identical whether
+# there is no prior result at all or the requested id just doesn't match:
+# never let the shape of the response reveal which case occurred.
+_NO_PRIOR_RESULT_RESPONSE = json.dumps({
+    "schemaVersion": "1.0",
+    "status": "error",
+    "code": "no_prior_result",
+    "message": "There is no prior governed Revenue result available in this conversation yet.",
+    "retryable": False,
+})
 
 SESSION_COOKIE_NAME = "ariel_session"
 SESSION_TTL_SECONDS = 8 * 60 * 60
@@ -422,26 +451,61 @@ def _as_analytics_result(output_text: str) -> dict | None:
     return None
 
 
-def _run_function_call_loop(response, hotel_id: int, session_id: str):
+def _extract_revenue_result_id(tool_name: str, output_text: str) -> str | None:
+    """Returns the real, MCP-issued result_id from a SUCCESSFUL
+    get_performance_digest response, or None. This is the only source
+    `_run_function_call_loop` ever trusts for `last_result_id` - the model's
+    own JSON output (agent_contract.py's `AgentResponse.result_id`) is never
+    consulted, so a model that hallucinates or copies a wrong id cannot make
+    it into conversation state.
+    """
+    if tool_name != "get_performance_digest":
+        return None
+    try:
+        parsed = json.loads(output_text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or parsed.get("status") != "success":
+        return None
+    result_id = parsed.get("result_id")
+    if isinstance(result_id, str) and _RESULT_ID_PATTERN.match(result_id):
+        return result_id
+    return None
+
+
+def _run_function_call_loop(response, hotel_id: int, session_id: str, last_result_id: str | None, correlation_id: str | None = None):
     """Executes any `function_call` items the model emitted and submits
     their results, repeating until the model stops calling tools. The model
     only ever sees a tool name and business arguments (e.g. days) going in,
     and result text coming back - hotel scope is injected entirely outside
     its visibility, in `_call_mcp_tool_async` above.
 
-    Returns `(response, last_analytics_result)` - the second is the most
-    recent Phase 3-shaped tool result seen this turn (or None, if no tool
-    was called this turn, or the tool called doesn't have the Phase 3
-    contract yet - see `_as_analytics_result`). `chat()` hands that to
-    `presentation_validator.validate_agent_response` so a fabricated chart
-    or an evidence-free insight has nothing real to validate against.
+    `last_result_id` is the conversation's current server-authoritative
+    Revenue continuation handle (`convo["last_result_id"]`, carried in from
+    `chat()` - None if no governed Revenue result exists yet this
+    conversation). It is:
+      - checked BEFORE any `get_result_evidence` call is allowed to reach
+        MCP at all (F1 section 5 - defense in depth; MCP independently
+        re-authorizes by session/hotel regardless, this just fails closed
+        locally with a generic response and never leaks whether some other
+        result_id exists), and
+      - updated, never invented, whenever a `get_performance_digest` call
+        this turn succeeds (`_extract_revenue_result_id`) - a turn with no
+        successful digest call leaves it exactly as it was.
+
+    Returns `(response, last_analytics_result, last_result_id)` - the
+    second is the most recent Phase 3-shaped tool result seen this turn (see
+    `_as_analytics_result`); the third is the (possibly updated)
+    conversation-level Revenue result id `chat()` must persist and the
+    final `AgentResponse.result_id` must be canonicalized from - never from
+    whatever the model's own JSON output claims.
     """
     last_analytics_result: dict | None = None
 
     for _ in range(MAX_FUNCTION_CALL_ROUNDS):
         calls = [item for item in response.output if item.type == "function_call"]
         if not calls:
-            return response, last_analytics_result
+            return response, last_analytics_result, last_result_id
 
         outputs = []
         for call in calls:
@@ -451,16 +515,26 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str):
                 arguments = {}
 
             if call.name not in FUNCTION_TOOL_NAMES:
-                logger.warning("Model requested unknown function tool %r - refusing.", call.name)
+                logger.warning("[%s] Model requested unknown function tool %r - refusing.", correlation_id, call.name)
                 output_text = f"Unknown tool {call.name!r}."
+            elif call.name == "get_result_evidence" and arguments.get("result_id") != last_result_id:
+                # Fails closed locally, before MCP is ever contacted - a
+                # None last_result_id (nothing governed yet this
+                # conversation) and a mismatching one get the IDENTICAL
+                # response so neither case can be distinguished from outside.
+                logger.info("[%s] get_result_evidence requested with no matching prior result - not calling MCP.", correlation_id)
+                output_text = _NO_PRIOR_RESULT_RESPONSE
             else:
                 try:
                     output_text = _call_mcp_tool(call.name, arguments, hotel_id, session_id)
                     analytics_result = _as_analytics_result(output_text)
                     if analytics_result is not None:
                         last_analytics_result = analytics_result
+                    new_result_id = _extract_revenue_result_id(call.name, output_text)
+                    if new_result_id is not None:
+                        last_result_id = new_result_id
                 except Exception:
-                    logger.exception("MCP tool call failed: %s", call.name)
+                    logger.exception("[%s] MCP tool call failed: %s", correlation_id, call.name)
                     output_text = "That tool call failed - please try again."
 
             outputs.append({"type": "function_call_output", "call_id": call.call_id, "output": output_text})
@@ -471,8 +545,8 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str):
             extra_body={"agent_reference": AGENT_REFERENCE},
         )
 
-    logger.warning("Exhausted %d function-call rounds with calls still pending", MAX_FUNCTION_CALL_ROUNDS)
-    return response, last_analytics_result
+    logger.warning("[%s] Exhausted %d function-call rounds with calls still pending", correlation_id, MAX_FUNCTION_CALL_ROUNDS)
+    return response, last_analytics_result, last_result_id
 
 
 def _now() -> str:
@@ -491,7 +565,7 @@ def _save_store(store: dict) -> None:
         json.dump(store, f, indent=2)
 
 
-def _summarize_response(response, last_analytics_result: dict | None) -> dict:
+def _summarize_response(response, last_analytics_result: dict | None, last_result_id: str | None) -> dict:
     """Flattens a Responses API result into what the UI needs. The model's
     final message is JSON conforming to webchat/agent_contract.py's
     AgentResponse (once ARIEL_AGENT_VERSION points at a Phase 4 agent
@@ -502,6 +576,14 @@ def _summarize_response(response, last_analytics_result: dict | None) -> dict:
     full pipeline and every fallback path. Function-tool calls are resolved
     automatically server-side (see `_run_function_call_loop`) and never
     reach the UI.
+
+    `result_id` in the returned dict is ALWAYS `last_result_id` - the
+    server-captured, MCP-issued id `_run_function_call_loop` tracked this
+    turn (F1 section 4) - never whatever `AgentResponse.result_id` the
+    model's own JSON happened to contain. `validate_agent_response`
+    deliberately doesn't surface that field at all; this function does not
+    read it either, so there is no path by which a model-authored result_id
+    reaches the browser or conversation state.
     """
     text_parts = []
     consents = []
@@ -524,6 +606,7 @@ def _summarize_response(response, last_analytics_result: dict | None) -> dict:
         "insights": validated["insights"],
         "actions": validated["actions"],
         "consents": consents,
+        "result_id": last_result_id,
     }
 
 
@@ -638,12 +721,13 @@ def delete_conversation(conversation_id):
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
+    correlation_id = str(uuid.uuid4())
     session = _current_session()
     if not session:
         return jsonify({"error": "Not identified - enter your hotel code first."}), 401
     hotel_id, hotel_name, session_id = session["hotel_id"], session["hotel_name"], _current_session_id()
     if not SCOPE_PRIVATE_KEY:
-        logger.error("ARIEL_SCOPE_PRIVATE_KEY is not set - refusing to chat without a way to scope DMR tools.")
+        logger.error("[%s] ARIEL_SCOPE_PRIVATE_KEY is not set - refusing to chat without a way to scope DMR tools.", correlation_id)
         return jsonify({"error": "Server misconfiguration: missing ARIEL_SCOPE_PRIVATE_KEY."}), 500
     if not _check_rate_limit(session_id):
         return jsonify({"error": "Too many requests - please slow down."}), 429
@@ -666,9 +750,15 @@ def chat():
             "updated_at": _now(),
             "archived": False,
             "last_response_id": None,
+            # F1: the conversation's current server-authoritative Revenue
+            # continuation handle - None until a get_performance_digest call
+            # succeeds. Never a scope JWT/function key - see module docstring.
+            "last_result_id": None,
             "messages": [],
         }
         store[conversation_id] = convo
+
+    logger.info("[%s] chat request: conversation=%s tool_names_allowed=%d", correlation_id, conversation_id, len(FUNCTION_TOOL_NAMES))
 
     try:
         response = _client.responses.create(
@@ -679,12 +769,14 @@ def chat():
             previous_response_id=convo.get("last_response_id"),
             extra_body={"agent_reference": AGENT_REFERENCE},
         )
-        response, last_analytics_result = _run_function_call_loop(response, hotel_id, session_id)
+        response, last_analytics_result, last_result_id = _run_function_call_loop(
+            response, hotel_id, session_id, convo.get("last_result_id"), correlation_id=correlation_id,
+        )
     except Exception as exc:
-        logger.exception("Agent call failed")
+        logger.exception("[%s] Agent call failed", correlation_id)
         return jsonify({"error": str(exc)}), 502
 
-    result = _summarize_response(response, last_analytics_result)
+    result = _summarize_response(response, last_analytics_result, last_result_id)
 
     convo["messages"].append({"role": "user", "text": message})
     if result["text"]:
@@ -698,10 +790,14 @@ def chat():
             }
         )
     convo["last_response_id"] = result["response_id"]
+    # F1: server-authoritative only - never the model's own claimed
+    # AgentResponse.result_id (see _summarize_response/_run_function_call_loop).
+    convo["last_result_id"] = last_result_id
     convo["updated_at"] = _now()
     _save_store(store)
 
     result["conversation_id"] = conversation_id
+    result["correlation_id"] = correlation_id
     return jsonify(result)
 
 
