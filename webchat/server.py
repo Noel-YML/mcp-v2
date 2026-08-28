@@ -263,8 +263,100 @@ STORE_PATH = os.path.join(os.path.dirname(__file__), "conversations.json")
 
 app = Flask(__name__)
 
+
+def _validate_required_production_config() -> None:
+    """H1.1: fails fast at import time - never on the first user request -
+    if a REQUIRED, non-development configuration value is missing. Checks
+    PRESENCE only, never validity (that would mean calling Foundry/MCP/
+    Fabric/Key Vault, which this function must never do). Skipped entirely
+    when `ARIEL_ENVIRONMENT == "development"` (the local/test default) so
+    this never affects local dev or the test suite, both of which routinely
+    run with several of these unset. Never logs a value, only a name.
+    """
+    if ARIEL_ENVIRONMENT == "development":
+        return
+    missing = []
+    if not SCOPE_PRIVATE_KEY:
+        missing.append("ARIEL_SCOPE_PRIVATE_KEY (or ARIEL_SCOPE_PRIVATE_KEY_FILE)")
+    if not FABRIC_TENANT_ID:
+        missing.append("AR_FABRIC_TENANT_ID")
+    if not FABRIC_CLIENT_ID:
+        missing.append("AR_FABRIC_CLIENT_ID")
+    if not FABRIC_CLIENT_SECRET:
+        missing.append("AR_FABRIC_CLIENT_SECRET")
+    if not ARIEL_MCP_FUNCTION_KEY:
+        missing.append("ARIEL_MCP_FUNCTION_KEY")
+    if ARIEL_MCP_URL.startswith("http://localhost"):
+        missing.append("ARIEL_MCP_URL (still the local-dev default - set it to the real deployed MCP endpoint)")
+    if missing:
+        raise RuntimeError(
+            "Refusing to start outside development with missing/default required configuration: "
+            + ", ".join(missing) + ". No value is logged here, only names."
+        )
+
+
+def _warn_if_environment_credential_vars_present() -> None:
+    """H1.1 section 6: `DefaultAzureCredential()`'s chain tries
+    `EnvironmentCredential` (AZURE_CLIENT_ID/AZURE_CLIENT_SECRET/
+    AZURE_TENANT_ID) BEFORE falling through to managed identity. In
+    production this app is meant to run under an App Service system-
+    assigned managed identity with none of these three set - if they are
+    set (e.g. an accidentally-copied local dev value), they would silently
+    take precedence over the managed identity every time. This only warns
+    (never blocks startup and never touches RBAC) - skipped in development,
+    where a developer's own `az login`/environment credentials are normal
+    and expected.
+    """
+    if ARIEL_ENVIRONMENT == "development":
+        return
+    shadowing_vars = [name for name in ("AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_TENANT_ID") if os.environ.get(name)]
+    if shadowing_vars:
+        logger.warning(
+            "%s %s set outside development - DefaultAzureCredential() will prefer these over the App "
+            "Service system-assigned managed identity. Remove them unless a non-managed-identity Foundry "
+            "credential is deliberately required.",
+            "/".join(shadowing_vars), "is" if len(shadowing_vars) == 1 else "are",
+        )
+
+
+_validate_required_production_config()
+_warn_if_environment_credential_vars_present()
+
 _project = AIProjectClient(endpoint=PROJECT_ENDPOINT, credential=DefaultAzureCredential())
 _client = _project.get_openai_client()
+
+
+@app.after_request
+def _set_security_headers(response):
+    """H1.1 section 9: a conservative baseline for the OUTER webchat page
+    only - the MCP App View's own inline CSP (inside its bundled `srcdoc`
+    resource) is a completely separate policy this does not touch or
+    override. No external script/style/font/image origin is allowed
+    because none is needed: every asset webchat serves is same-origin
+    (`static/`), there is no inline `<script>`/`<style>`/`on*=` handler
+    anywhere in `templates/index.html`, and the Google Fonts dependency was
+    removed (H1.1 section 9) rather than allowlisted. `frame-ancestors
+    'none'` - this page is never meant to be embedded by anything.
+    """
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "font-src 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    )
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "same-origin"
+    return response
+
+
+@app.route("/health/live")
+def health_live():
+    """H1.1 section 4: the App Service health-check/readiness probe target.
+    Deliberately calls NOTHING external (no Foundry/MCP/Fabric/Cosmos/Key
+    Vault) and needs no authentication - a probe that depended on a live
+    downstream call would make the whole app look unhealthy the moment any
+    one dependency has a blip, which is not what a liveness check is for
+    (mirrors the same liveness/deep-check split `mcp/health.py` already
+    uses for the MCP server)."""
+    return jsonify({"status": "live"})
 
 _fabric_credential = None
 
