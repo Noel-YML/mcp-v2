@@ -45,10 +45,12 @@ from datetime import datetime, timezone
 from typing import Any, Literal, Mapping
 
 import audit
+import mcp.types as types
 from dmr.dax_query_builder import RevenueDigestRequest
 from fabric_client.result import ErrorCode, ToolError, new_trace_id
 from fabric_client.service import IFabricQueryService
-from mcp.server.mcpserver import Context
+from mcp.server.apps import Apps
+from mcp.server.mcpserver import Context, MCPServer
 from results.repository import ResultRepository, ResultRepositoryUnavailable, StoredResult
 from revenue_digest_execution import RevenueDigestExecutionError, execute_revenue_performance_digest
 from scope.scope_context import ScopeContext
@@ -348,31 +350,65 @@ def get_result_evidence(
         )
 
 
-def register(
-    mcp,
+# The one MCP App View this server hosts (A1) - a fixed, code-owned URI, never
+# derived from a model/caller-supplied string anywhere in this module.
+REVENUE_PERFORMANCE_RESOURCE_URI = "ui://ariel/revenue-performance"
+
+
+def _as_call_tool_result(result_json: str) -> types.CallToolResult:
+    """Approach B (A1 plan/spike, both empirically preferred over a typed
+    return): `content` is the EXACT SAME JSON string get_performance_digest
+    already produces - text-only clients see byte-identical output to before
+    this existed. `structured_content` is that same string parsed back into
+    a dict, for MCP-Apps-capable hosts/Views - never independently rebuilt,
+    so there is no second place variance/totals/comparators could drift from
+    the governed object. Works identically for the success shape
+    (RevenueDigestResult.to_json()) and the safe-error-envelope shape
+    (ToolError.to_json()) - both are just JSON text either way.
+    """
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=result_json)],
+        structured_content=json.loads(result_json),
+    )
+
+
+def register_performance_digest(
+    apps: Apps,
     service: IFabricQueryService,
     repository: ResultRepository,
     public_keys: dict[str, str],
     result_ttl_seconds: float,
 ) -> None:
-    """Wires the 2 module-level functions above up as MCP SDK tools for
-    `server.py` - mirrors `tools/dmr_tools.py`'s own `register()`. Uses
-    `Literal` for `timeframe`/`view`/`comparator` (the MCP SDK generates a
-    proper `enum` JSON-schema constraint from it - see this module's tests);
-    `date` stays a plain `str` deliberately, so the SDK never does its own
-    date coercion - `_parse_request_date` above is the ONLY date parser
-    either hosting uses. Runtime validation (inside
-    execute_revenue_performance_digest) remains authoritative regardless.
+    """Binds get_performance_digest onto `apps` (an `Apps()` extension
+    instance) rather than directly onto an `MCPServer` - `Apps.tool()` defers
+    actual registration until the caller later constructs
+    `MCPServer(..., extensions=[apps])` (see `hosting.build_ariel_mcp_server`),
+    which is why this must run BEFORE that construction, unlike
+    `register_result_evidence`/`tools/dmr_tools.py`'s `register()` below,
+    which register directly onto an already-built `MCPServer` afterward.
+
+    Everything about the tool itself - name, input schema (`Literal` for
+    `timeframe`/`view`/`comparator`, so the MCP SDK still generates a proper
+    `enum` JSON-schema constraint), docstring, scope resolution, and the
+    underlying `get_performance_digest()` call - is IDENTICAL to before this
+    split; only the decorator and the return shape (see `_as_call_tool_result`)
+    changed. `visibility=["model"]` because the View never calls this tool
+    itself (see the View source under `mcp/apps/revenue/`) - there is no app-only
+    capability in A1.
     """
 
-    @mcp.tool(name="get_performance_digest")
+    @apps.tool(
+        resource_uri=REVENUE_PERFORMANCE_RESOURCE_URI,
+        name="get_performance_digest",
+        visibility=["model"],
+    )
     def _get_performance_digest(
         ctx: Context,
         date: str,
         timeframe: Literal["day", "mtd", "ytd"],
         view: Literal["headline", "rooms", "fnb_revenue", "other"],
         comparator: Literal["none", "last_year", "budget", "forecast"] = "none",
-    ) -> str:
+    ) -> types.CallToolResult:
         """Gets governed revenue performance for your hotel on one business
         date - deterministic, source-reconciled metrics (not a live
         recomputation) for the requested view. timeframe supports day, mtd
@@ -394,8 +430,15 @@ def register(
         try:
             scope = dmr_tools.resolve_scope_from_ctx(ctx, public_keys, "get_performance_digest")
         except dmr_tools.ScopeResolutionError as exc:
-            return exc.tool_error.to_json()
-        return get_performance_digest(service, scope, repository, result_ttl_seconds, date, timeframe, view, comparator)
+            return _as_call_tool_result(exc.tool_error.to_json())
+        result_json = get_performance_digest(service, scope, repository, result_ttl_seconds, date, timeframe, view, comparator)
+        return _as_call_tool_result(result_json)
+
+
+def register_result_evidence(mcp: MCPServer, repository: ResultRepository, public_keys: dict[str, str]) -> None:
+    """Unchanged from before the split - registered directly on `mcp` (no
+    Apps binding; get_result_evidence has no UI resource in A1), after
+    `MCPServer(...)` is constructed, exactly like every other non-Apps tool."""
 
     @mcp.tool(name="get_result_evidence")
     def _get_result_evidence(ctx: Context, result_id: str) -> str:

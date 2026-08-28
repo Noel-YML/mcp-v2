@@ -3,3 +3,12 @@ __pycache__
 local.settings.json
 tests
 requirements-dev.txt
+
+# Revenue MCP App View: only dist/view.html (the built artifact
+# hosting.py loads) is needed at runtime - never ship the View's own
+# node_modules/TypeScript source/test harness to Azure Functions.
+apps/revenue/node_modules
+apps/revenue/src
+apps/revenue/test
+apps/revenue/tsconfig.json
+apps/revenue/dist/view.bundle.js

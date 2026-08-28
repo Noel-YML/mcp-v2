@@ -89,7 +89,8 @@ app = func.FunctionApp()
 _results_store_options = ResultsStoreOptions.from_env()
 require_cosmos_backend(_results_store_options)
 
-mcp, fabric_service, _readiness = hosting.build_ariel_mcp_server(require_cosmos=True)
+_app_server = hosting.build_ariel_mcp_server(require_cosmos=True)
+mcp, fabric_service, _readiness = _app_server
 
 # The real, deployed hostname this Function App is served under - if this
 # app is ever redeployed under a different name, this constant (and the
@@ -97,7 +98,7 @@ mcp, fabric_service, _readiness = hosting.build_ariel_mcp_server(require_cosmos=
 # need updating together.
 _DEPLOYED_HOSTNAME = "ariel-mcp-server-v2.azurewebsites.net"
 
-_lowlevel_mcp_server = hosting.build_capability_honest_lowlevel_server(mcp)
+_lowlevel_mcp_server = hosting.build_capability_honest_lowlevel_server(mcp, extensions=[_app_server.apps])
 _streamable_app = _lowlevel_mcp_server.streamable_http_app(
     streamable_http_path="/api/mcp",
     json_response=True,  # AsgiMiddleware's response adapter buffers, not streams - see hosting.py/module docstring

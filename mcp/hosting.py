@@ -51,8 +51,13 @@ usage ever inspects `server/discover`'s capability flags.
 """
 
 import base64
+import dataclasses
+from collections.abc import Sequence
+from pathlib import Path
 
 import mcp.types as types
+from mcp.server.apps import Apps, ResourceCsp, ResourcePermissions
+from mcp.server.extension import Extension
 from mcp.server.lowlevel import Server as LowLevelServer
 from mcp.server.mcpserver import Context, MCPServer
 
@@ -64,16 +69,69 @@ from results.config import ResultsStoreOptions, require_cosmos_backend, result_t
 from results.factory import LazyResultRepository
 from tools import dmr_tools, revenue_digest_tools
 
+# A1: the one MCP App View this server hosts - a built, self-contained HTML
+# artifact (mcp/apps/revenue/dist/view.html, produced by `npm run build`
+# there; see that directory's README/build.mjs). Resolved relative to THIS
+# file's own package location, never the process's current working
+# directory, so it works the same whether started from mcp/, the repo root,
+# or Azure Functions' own working directory.
+_REVENUE_VIEW_HTML_PATH = Path(__file__).resolve().parent / "apps" / "revenue" / "dist" / "view.html"
 
-def build_ariel_mcp_server(*, require_cosmos: bool) -> tuple[MCPServer, FabricQueryService, health.Readiness]:
+
+def _load_revenue_view_html() -> str:
+    """Fails loudly and clearly at server-construction time if the View
+    artifact is missing - never silently omits the MCP App (which would
+    leave get_performance_digest bound to a resource_uri that 404s on
+    resources/read, itself already caught by `Apps.tools()` - see
+    mcp/server/apps.py) and never fetches it from npm/a CDN at runtime.
+    """
+    try:
+        return _REVENUE_VIEW_HTML_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"Revenue MCP App View artifact not found at {_REVENUE_VIEW_HTML_PATH} - "
+            "run `npm install && npm run build` in mcp/apps/revenue/ (or ensure that build "
+            "artifact is included in this deployment) before starting the server."
+        ) from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class AppServer:
+    """Everything `build_ariel_mcp_server` builds. Iterates as the ORIGINAL
+    3-tuple (`mcp, fabric_service, readiness = build_ariel_mcp_server(...)`
+    still works unchanged, everywhere that already does it) while also
+    exposing `.apps` by name for the one caller (the deployed adapter, via
+    `build_capability_honest_lowlevel_server`) that needs to forward its
+    extension settings honestly - see that function's docstring.
+    """
+
+    mcp: MCPServer
+    fabric_service: FabricQueryService
+    readiness: health.Readiness
+    apps: Apps
+
+    def __iter__(self):
+        return iter((self.mcp, self.fabric_service, self.readiness))
+
+
+def build_ariel_mcp_server(*, require_cosmos: bool) -> AppServer:
     """Builds one fully-registered `MCPServer` - Fabric service, results
-    repository, all 7 tools (5 DMR + 2 R3B governed capabilities), and the
-    `ariel://status` resource - exactly once, regardless of which hosting
-    calls it. `require_cosmos=True` (deployed Azure Functions) fails
-    closed on anything but an explicitly configured Cosmos backend, never
-    silently substituting `InMemoryResultRepository`; `require_cosmos=False`
-    (local/dev, `server.py`) allows `ResultsStoreOptions.from_env()`'s
-    `in_memory` default.
+    repository, all 7 tools (5 DMR + 2 R3B governed capabilities), the A1
+    Revenue MCP App (get_performance_digest bound to
+    ui://ariel/revenue-performance), and the `ariel://status` resource -
+    exactly once, regardless of which hosting calls it. `require_cosmos=True`
+    (deployed Azure Functions) fails closed on anything but an explicitly
+    configured Cosmos backend, never silently substituting
+    `InMemoryResultRepository`; `require_cosmos=False` (local/dev,
+    `server.py`) allows `ResultsStoreOptions.from_env()`'s `in_memory`
+    default.
+
+    Registration order matters for the Apps-bound tool specifically:
+    `Apps.tool()`/`add_html_resource()` must run BEFORE `MCPServer(...)` is
+    constructed (extensions are consumed at `MCPServer.__init__` time) - see
+    `revenue_digest_tools.register_performance_digest`'s docstring. Every
+    other tool (`get_result_evidence`, the 5 DMR tools) registers directly
+    onto `mcp` AFTER construction, exactly as before this A1 round.
     """
     fabric_options = FabricOptions.from_env()
     fabric_service = FabricQueryService(fabric_options)
@@ -85,14 +143,32 @@ def build_ariel_mcp_server(*, require_cosmos: bool) -> tuple[MCPServer, FabricQu
     result_repository = LazyResultRepository(results_store_options)
     result_ttl_seconds = result_ttl_seconds_from_env()
 
+    apps = Apps()
+    revenue_digest_tools.register_performance_digest(
+        apps, fabric_service, result_repository, fabric_options.scope_public_keys, result_ttl_seconds
+    )
+    apps.add_html_resource(
+        revenue_digest_tools.REVENUE_PERFORMANCE_RESOURCE_URI,
+        _load_revenue_view_html(),
+        title="Revenue performance",
+        description="Read-only Revenue performance card for get_performance_digest - presentation only, no analytics.",
+        # No network access requested at all - matches the View's own CSP
+        # meta tag (default-src 'none') and the empirically-proven A1
+        # design: zero connect/resource/frame/baseUri domains, no
+        # camera/mic/geolocation/clipboard permission.
+        csp=ResourceCsp(connect_domains=[], resource_domains=[], frame_domains=[], base_uri_domains=[]),
+        permissions=ResourcePermissions(),
+    )
+
     mcp = MCPServer(
         name="ariel-mcp-v2",
         version="2.0.0",
         instructions="Remote MCP server for Ask ARIEL - DMR (Daily Management Report) data.",
+        extensions=[apps],
     )
 
     dmr_tools.register(mcp, fabric_service, fabric_options.scope_public_keys)
-    revenue_digest_tools.register(mcp, fabric_service, result_repository, fabric_options.scope_public_keys, result_ttl_seconds)
+    revenue_digest_tools.register_result_evidence(mcp, result_repository, fabric_options.scope_public_keys)
     all_tool_names = dmr_tools.TOOL_NAMES + revenue_digest_tools.TOOL_NAMES
 
     @mcp.resource(
@@ -105,15 +181,32 @@ def build_ariel_mcp_server(*, require_cosmos: bool) -> tuple[MCPServer, FabricQu
     def status_resource() -> dict:
         return health.status_resource(readiness, config.analytics_schema_version(), all_tool_names)
 
-    return mcp, fabric_service, readiness
+    return AppServer(mcp=mcp, fabric_service=fabric_service, readiness=readiness, apps=apps)
 
 
-def build_capability_honest_lowlevel_server(mcp: MCPServer) -> LowLevelServer:
+def build_capability_honest_lowlevel_server(
+    mcp: MCPServer, *, extensions: Sequence[Extension] | None = None
+) -> LowLevelServer:
     """Wraps an already-fully-registered `MCPServer` with a low-level
     `Server` advertising ONLY `tools`/`resources` capabilities - see this
     module's docstring for the empirical proof this preserves scope-header
     propagation (`ctx.headers`) and tool/resource schemas exactly, using
     only public SDK APIs.
+
+    `extensions`, when given, is forwarded HONESTLY as this adapter's own
+    `.extensions` map (a plain public attribute the SDK itself says "higher
+    layers populate" - see `mcp/server/lowlevel/server.py`), computed
+    entirely from the `Extension` objects the caller already built and
+    passed to `MCPServer(extensions=...)` - this NEVER reads
+    `mcp._lowlevel_server` (a private attribute, and in any case a
+    DIFFERENT low-level server instance than the one this function
+    constructs and returns). Without this, `server/discover` would not
+    advertise `io.modelcontextprotocol/ui` at all for the deployed adapter,
+    even though tool/resource `_meta`/`structured_content` already flow
+    through it unmodified (empirically proven in the A1.1 spike). Every
+    existing capability-honesty guarantee is unaffected: `tools.list_changed`,
+    `resources.subscribe`, `resources.list_changed` stay exactly as they
+    were, `prompts` stays `None`.
     """
 
     async def on_list_tools(request_ctx, params):
@@ -164,7 +257,7 @@ def build_capability_honest_lowlevel_server(mcp: MCPServer) -> LowLevelServer:
                 ))
         return types.ReadResourceResult(contents=contents)
 
-    return LowLevelServer(
+    adapter = LowLevelServer(
         name=mcp.name,
         version=mcp.version,
         on_list_tools=on_list_tools,
@@ -172,3 +265,10 @@ def build_capability_honest_lowlevel_server(mcp: MCPServer) -> LowLevelServer:
         on_list_resources=on_list_resources,
         on_read_resource=on_read_resource,
     )
+    if extensions:
+        # Public attribute assignment only (see docstring above) - presence-
+        # only settings (Apps.settings() is `{}`), matching what MCPServer's
+        # OWN internal low-level server would advertise for the same
+        # extensions list.
+        adapter.extensions = {extension.identifier: extension.settings() for extension in extensions}
+    return adapter
