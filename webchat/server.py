@@ -801,14 +801,24 @@ def chat():
     logger.info("[%s] chat request: conversation=%s tool_names_allowed=%d", correlation_id, conversation_id, len(FUNCTION_TOOL_NAMES))
 
     try:
-        response = _client.responses.create(
-            input=[
+        # W0: previous_response_id must be OMITTED (not sent as null) on the
+        # first turn of a new conversation - installed openai==3.2.0
+        # serializes an explicit None as JSON null, which the Foundry
+        # Responses endpoint now rejects (400 invalid_payload: "Expected
+        # string, got Null"). A later turn always has a real, non-None
+        # last_response_id here and is sent exactly as before - this only
+        # changes what happens when there isn't one yet.
+        request_kwargs = {
+            "input": [
                 {"type": "message", "role": "developer", "content": _scope_instruction(hotel_name)},
                 {"type": "message", "role": "user", "content": message},
             ],
-            previous_response_id=convo.get("last_response_id"),
-            extra_body={"agent_reference": AGENT_REFERENCE},
-        )
+            "extra_body": {"agent_reference": AGENT_REFERENCE},
+        }
+        last_response_id = convo.get("last_response_id")
+        if last_response_id is not None:
+            request_kwargs["previous_response_id"] = last_response_id
+        response = _client.responses.create(**request_kwargs)
         loop_result = _run_function_call_loop(
             response, hotel_id, session_id, convo.get("last_result_id"), correlation_id=correlation_id,
         )
