@@ -49,7 +49,41 @@ function addLoading() {
   return transcript.lastElementChild;
 }
 
-function addAgentMessage(text, presentation, insights, actions) {
+// Live MCP App instances currently mounted in the transcript - torn down
+// (per A1's read-only Host design) whenever a NEW response arrives, since
+// only the latest turn's app is ever kept live. See mountMcpAppIfPresent.
+let activeMcpApps = [];
+
+async function teardownActiveMcpApps() {
+  const apps = activeMcpApps;
+  activeMcpApps = [];
+  await Promise.all(apps.map((app) => app.teardown().catch(() => {})));
+}
+
+function mountMcpAppIfPresent(container, mcpApp) {
+  if (!mcpApp || !window.ArielMcpAppHost) return;
+  fetch(mcpApp.resource_url)
+    .then((res) => {
+      if (!res.ok) throw new Error("failed to fetch MCP App template");
+      return res.text();
+    })
+    .then((templateHtml) => {
+      const app = window.ArielMcpAppHost.mountRevenueApp({
+        container,
+        templateHtml,
+        toolInput: mcpApp.tool_input,
+        toolResult: mcpApp.tool_result,
+      });
+      activeMcpApps.push(app);
+    })
+    .catch((err) => {
+      // The ordinary textual answer already rendered regardless - a failed
+      // app mount is never surfaced as a chat error.
+      console.warn("MCP App failed to mount:", err);
+    });
+}
+
+function addAgentMessage(text, presentation, insights, actions, mcpApp) {
   const tpl = document.getElementById("tpl-agent").content.cloneNode(true);
   tpl.querySelector(".ai-body").textContent = text;
   if (presentation) {
@@ -61,7 +95,11 @@ function addAgentMessage(text, presentation, insights, actions) {
   if (actions && actions.length) {
     renderActions(tpl.querySelector(".ai-actions-slot"), actions, onActionClicked);
   }
+  const mcpAppSlot = tpl.querySelector(".ai-mcp-app-slot");
   transcript.appendChild(tpl);
+  if (mcpApp) {
+    mountMcpAppIfPresent(mcpAppSlot, mcpApp);
+  }
   scrollToBottom();
 }
 
@@ -78,7 +116,7 @@ function addError(text) {
 
 function renderResult(result) {
   if (result.text) {
-    addAgentMessage(result.text, result.presentation, result.insights, result.actions);
+    addAgentMessage(result.text, result.presentation, result.insights, result.actions, result.mcp_app);
   }
   (result.consents || []).forEach((c) => {
     addError("This tool needs sign-in first: " + c.consent_link);
@@ -90,6 +128,7 @@ function renderResult(result) {
 
 async function sendMessage(text) {
   if (!text.trim()) return;
+  await teardownActiveMcpApps();
   showTranscript();
   addUserMessage(text);
   input.value = "";
@@ -147,7 +186,8 @@ chips.addEventListener("click", (e) => {
   sendMessage(chip.dataset.prompt);
 });
 
-newChatBtn.addEventListener("click", () => {
+newChatBtn.addEventListener("click", async () => {
+  await teardownActiveMcpApps();
   conversationId = null;
   previousResponseId = null;
   showEmptyState();

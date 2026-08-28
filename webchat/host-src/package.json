@@ -1,0 +1,16 @@
+{
+  "name": "ariel-webchat-mcp-app-host",
+  "private": true,
+  "version": "1.0.0",
+  "description": "ARIEL webchat's read-only MCP Apps Host (AppBridge, client=null) - bundled build for webchat/static/vendor/.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/host.security.test.mjs"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "1.7.5",
+    "esbuild": "^0.28.2",
+    "puppeteer-core": "^25.9.0"
+  }
+}

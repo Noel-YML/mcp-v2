@@ -533,6 +533,19 @@ body{
 
 .ai-presentation{margin-top:14px}
 
+/* A1: the sandboxed MCP App iframe (see host-src/src/host.mjs). Sizing only
+   - all visual styling of the app's own content lives inside the View's own
+     CSP-scoped stylesheet, never here. */
+.ai-mcp-app-slot:empty{margin:0}
+.ai-mcp-app-slot{margin-top:14px}
+.mcp-app-frame{
+  width:100%;
+  min-height:120px;
+  border:1px solid rgba(255,255,255,.14);
+  border-radius:10px;
+  background:#fff;
+}
+
 .ariel-chart-title{
   font-family:var(--font-sans);
   font-size:12.5px;

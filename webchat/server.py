@@ -114,6 +114,7 @@ Then open http://127.0.0.1:5050
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -129,10 +130,11 @@ import requests
 from azure.ai.projects import AIProjectClient
 from azure.core.exceptions import ClientAuthenticationError
 from azure.identity import ClientSecretCredential, DefaultAzureCredential
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+import mcp_app
 from presentation_validator import validate_agent_response
 
 logging.basicConfig(level=logging.INFO)
@@ -473,6 +475,23 @@ def _extract_revenue_result_id(tool_name: str, output_text: str) -> str | None:
     return None
 
 
+@dataclasses.dataclass
+class _FunctionCallLoopResult:
+    """Everything `_run_function_call_loop` produces. Iterates as the
+    ORIGINAL 3-tuple (`response, last_analytics_result, last_result_id = ...`
+    still works unchanged - every existing test already destructures it that
+    way) while also exposing `.last_mcp_app` by name for `chat()`, the one
+    new caller that needs it (A1)."""
+
+    response: object
+    last_analytics_result: dict | None
+    last_result_id: str | None
+    last_mcp_app: dict | None = None
+
+    def __iter__(self):
+        return iter((self.response, self.last_analytics_result, self.last_result_id))
+
+
 def _run_function_call_loop(response, hotel_id: int, session_id: str, last_result_id: str | None, correlation_id: str | None = None):
     """Executes any `function_call` items the model emitted and submits
     their results, repeating until the model stops calling tools. The model
@@ -493,19 +512,22 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str, last_resul
         this turn succeeds (`_extract_revenue_result_id`) - a turn with no
         successful digest call leaves it exactly as it was.
 
-    Returns `(response, last_analytics_result, last_result_id)` - the
-    second is the most recent Phase 3-shaped tool result seen this turn (see
-    `_as_analytics_result`); the third is the (possibly updated)
-    conversation-level Revenue result id `chat()` must persist and the
-    final `AgentResponse.result_id` must be canonicalized from - never from
-    whatever the model's own JSON output claims.
+    Returns a `_FunctionCallLoopResult` - unpacks as the original
+    `(response, last_analytics_result, last_result_id)` 3-tuple everywhere
+    that already does so; `.last_mcp_app` (A1) additionally carries the
+    BFF-derived MCP App descriptor for the most recent SUCCESSFUL
+    get_performance_digest call this turn (see `mcp_app.build_mcp_app_descriptor`),
+    or None if no such call happened/succeeded this turn - built entirely
+    from the real executed tool input/output and real MCP tool metadata,
+    never from the model's own JSON output.
     """
     last_analytics_result: dict | None = None
+    last_mcp_app: dict | None = None
 
     for _ in range(MAX_FUNCTION_CALL_ROUNDS):
         calls = [item for item in response.output if item.type == "function_call"]
         if not calls:
-            return response, last_analytics_result, last_result_id
+            return _FunctionCallLoopResult(response, last_analytics_result, last_result_id, last_mcp_app)
 
         outputs = []
         for call in calls:
@@ -533,6 +555,19 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str, last_resul
                     new_result_id = _extract_revenue_result_id(call.name, output_text)
                     if new_result_id is not None:
                         last_result_id = new_result_id
+                    if call.name == "get_performance_digest":
+                        # A1: BFF-derived app descriptor, gated on REAL MCP
+                        # tool metadata (never a bare tool-name match) - see
+                        # mcp_app.py's module docstring. Mirrors
+                        # last_analytics_result's own update rule just above:
+                        # only overwritten on a genuine success, never reset
+                        # to None by a later failed call this same turn.
+                        resource_uri = mcp_app.get_revenue_tool_resource_uri(asyncio.run, ARIEL_MCP_URL, ARIEL_MCP_FUNCTION_KEY)
+                        new_mcp_app = mcp_app.build_mcp_app_descriptor(
+                            tool_name=call.name, tool_input=arguments, output_text=output_text, resource_uri=resource_uri,
+                        )
+                        if new_mcp_app is not None:
+                            last_mcp_app = new_mcp_app
                 except Exception:
                     logger.exception("[%s] MCP tool call failed: %s", correlation_id, call.name)
                     output_text = "That tool call failed - please try again."
@@ -546,7 +581,7 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str, last_resul
         )
 
     logger.warning("[%s] Exhausted %d function-call rounds with calls still pending", correlation_id, MAX_FUNCTION_CALL_ROUNDS)
-    return response, last_analytics_result, last_result_id
+    return _FunctionCallLoopResult(response, last_analytics_result, last_result_id, last_mcp_app)
 
 
 def _now() -> str:
@@ -565,7 +600,9 @@ def _save_store(store: dict) -> None:
         json.dump(store, f, indent=2)
 
 
-def _summarize_response(response, last_analytics_result: dict | None, last_result_id: str | None) -> dict:
+def _summarize_response(
+    response, last_analytics_result: dict | None, last_result_id: str | None, mcp_app_descriptor: dict | None = None
+) -> dict:
     """Flattens a Responses API result into what the UI needs. The model's
     final message is JSON conforming to webchat/agent_contract.py's
     AgentResponse (once ARIEL_AGENT_VERSION points at a Phase 4 agent
@@ -607,6 +644,9 @@ def _summarize_response(response, last_analytics_result: dict | None, last_resul
         "actions": validated["actions"],
         "consents": consents,
         "result_id": last_result_id,
+        # A1: BFF-derived only (see mcp_app.py) - never read from
+        # `validated`/the model's own JSON output.
+        "mcp_app": mcp_app_descriptor,
     }
 
 
@@ -769,14 +809,15 @@ def chat():
             previous_response_id=convo.get("last_response_id"),
             extra_body={"agent_reference": AGENT_REFERENCE},
         )
-        response, last_analytics_result, last_result_id = _run_function_call_loop(
+        loop_result = _run_function_call_loop(
             response, hotel_id, session_id, convo.get("last_result_id"), correlation_id=correlation_id,
         )
+        response, last_analytics_result, last_result_id = loop_result
     except Exception as exc:
         logger.exception("[%s] Agent call failed", correlation_id)
         return jsonify({"error": str(exc)}), 502
 
-    result = _summarize_response(response, last_analytics_result, last_result_id)
+    result = _summarize_response(response, last_analytics_result, last_result_id, loop_result.last_mcp_app)
 
     convo["messages"].append({"role": "user", "text": message})
     if result["text"]:
@@ -799,6 +840,26 @@ def chat():
     result["conversation_id"] = conversation_id
     result["correlation_id"] = correlation_id
     return jsonify(result)
+
+
+@app.route("/api/mcp-app/revenue-performance")
+def mcp_app_revenue_performance():
+    """A1: the ONLY route that serves an MCP App resource - narrow and fixed,
+    never a generic `?uri=`-style proxy (see mcp_app.py's module docstring).
+    Requires an identified session (same guard as /api/chat) purely so this
+    can't be hit anonymously as an open relay; the returned HTML is the
+    static View TEMPLATE only - no user-scoped Revenue data is ever placed
+    in it or in this route's cache (see mcp_app.fetch_revenue_view_template).
+    The browser never receives the MCP endpoint URL or its function key.
+    """
+    if not _current_session():
+        return jsonify({"error": "Not identified - enter your hotel code first."}), 401
+    try:
+        html = mcp_app.fetch_revenue_view_template(asyncio.run, ARIEL_MCP_URL, ARIEL_MCP_FUNCTION_KEY)
+    except Exception:
+        logger.exception("Failed to fetch the Revenue MCP App view template.")
+        return jsonify({"error": "The Revenue app view is temporarily unavailable."}), 503
+    return Response(html, mimetype="text/html")
 
 
 if __name__ == "__main__":
