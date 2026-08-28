@@ -6,9 +6,13 @@ requirements-dev.txt
 
 # Revenue MCP App View: only dist/view.html (the built artifact
 # hosting.py loads) is needed at runtime - never ship the View's own
-# node_modules/TypeScript source/test harness to Azure Functions.
+# node_modules/TypeScript source/test harness/npm metadata to Azure
+# Functions. The deployed runtime needs no npm/node/network access at all.
 apps/revenue/node_modules
 apps/revenue/src
 apps/revenue/test
 apps/revenue/tsconfig.json
+apps/revenue/package.json
+apps/revenue/package-lock.json
+apps/revenue/build.mjs
 apps/revenue/dist/view.bundle.js
