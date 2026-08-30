@@ -24,6 +24,8 @@ supplied resource URI of any kind.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import re
@@ -57,6 +59,40 @@ _FORBIDDEN_KEY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _JWT_SHAPE_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
+
+# H1.3G: the View's `srcdoc` document is a `<meta>`-CSP'd inline
+# script/style, but a srcdoc document ALSO inherits its owner document's own
+# Content-Security-Policy (CSP3 - "a document loaded via `srcdoc` inherits
+# its policy from its creator") - both are enforced independently, so the
+# outer webchat page's own CSP (server.py's _set_security_headers) must
+# separately allow the exact same inline blocks, or the browser blocks them
+# regardless of what the View's own <meta> tag says. These patterns extract
+# the SAME single <style>/<script> blocks mcp/apps/revenue/build.mjs hashes
+# at build time, so the hash computed here from the actual served bytes is
+# always byte-for-byte identical to the one already embedded in the View's
+# own <meta> CSP tag - there is nothing to keep in sync by hand.
+_INLINE_STYLE_PATTERN = re.compile(r"<style>([\s\S]*?)</style>")
+_INLINE_SCRIPT_PATTERN = re.compile(r"<script>([\s\S]*?)</script>")
+
+
+def compute_inline_csp_hashes(html: str) -> tuple[str | None, str | None]:
+    """Returns (script_hash, style_hash) as `'sha256-<base64>'` CSP source
+    values, or None for either that can't be found - never raises. Hashing
+    algorithm matches the CSP3 spec exactly (sha256 over the UTF-8 bytes of
+    the element's exact source text) - this is what a browser itself
+    computes when it prints a "browser suggested hash" console message for
+    a blocked inline block.
+    """
+    style_match = _INLINE_STYLE_PATTERN.search(html)
+    script_match = _INLINE_SCRIPT_PATTERN.search(html)
+    style_hash = _sha256_csp_hash(style_match.group(1)) if style_match else None
+    script_hash = _sha256_csp_hash(script_match.group(1)) if script_match else None
+    return script_hash, style_hash
+
+
+def _sha256_csp_hash(source_text: str) -> str:
+    digest = hashlib.sha256(source_text.encode("utf-8")).digest()
+    return "sha256-" + base64.b64encode(digest).decode("ascii")
 
 
 class McpAppLookupError(RuntimeError):
@@ -181,6 +217,28 @@ def fetch_revenue_view_template(call_async, mcp_url: str, function_key: str | No
     html = call_async(_fetch_revenue_view_template_async(mcp_url, function_key, uri))
     _template_cache.set(html)
     return html
+
+
+def get_current_view_csp_hashes(call_async, mcp_url: str, function_key: str | None) -> tuple[str | None, str | None]:
+    """(script_hash, style_hash) for the outer webchat page's own CSP header
+    to allowlist (see server.py's _set_security_headers) - derived from
+    whatever `fetch_revenue_view_template` actually returns (same 1-hour
+    cache, so this costs nothing beyond a cheap regex+hash on every request
+    once warm). Returns (None, None) on any failure (MCP unreachable, tool
+    metadata missing, etc.) rather than raising: the outer page's CSP then
+    simply omits the hash, which fails CLOSED (the MCP App's inline
+    script/style stay blocked until the template becomes fetchable again)
+    rather than falling open to 'unsafe-inline'.
+    """
+    try:
+        resource_uri = get_revenue_tool_resource_uri(call_async, mcp_url, function_key)
+        if resource_uri is None:
+            return None, None
+        html = fetch_revenue_view_template(call_async, mcp_url, function_key)
+    except Exception:  # noqa: BLE001 - CSP header construction must never break page rendering
+        logger.exception("Failed to derive the Revenue MCP App's inline CSP hashes.")
+        return None, None
+    return compute_inline_csp_hashes(html)
 
 
 def build_mcp_app_descriptor(

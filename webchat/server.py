@@ -328,18 +328,41 @@ _client = _project.get_openai_client()
 
 @app.after_request
 def _set_security_headers(response):
-    """H1.1 section 9: a conservative baseline for the OUTER webchat page
-    only - the MCP App View's own inline CSP (inside its bundled `srcdoc`
-    resource) is a completely separate policy this does not touch or
-    override. No external script/style/font/image origin is allowed
-    because none is needed: every asset webchat serves is same-origin
-    (`static/`), there is no inline `<script>`/`<style>`/`on*=` handler
-    anywhere in `templates/index.html`, and the Google Fonts dependency was
-    removed (H1.1 section 9) rather than allowlisted. `frame-ancestors
-    'none'` - this page is never meant to be embedded by anything.
+    """H1.1 section 9: a conservative baseline for the OUTER webchat page.
+    No external script/style/font/image origin is allowed because none is
+    needed: every asset webchat serves is same-origin (`static/`), there is
+    no inline `<script>`/`<style>`/`on*=` handler anywhere in
+    `templates/index.html`, and the Google Fonts dependency was removed
+    (H1.1 section 9) rather than allowlisted. `frame-ancestors 'none'` -
+    this page is never meant to be embedded by anything.
+
+    H1.3G correction: an earlier version of this comment claimed the MCP
+    App View's own inline CSP (inside its `srcdoc` resource) was a
+    "completely separate policy this does not touch or override" - that was
+    wrong. Per CSP3, a document loaded via `srcdoc` (see
+    webchat/host-src/src/host.mjs's `iframe.srcdoc = templateHtml`)
+    INHERITS its owner document's CSP in addition to its own `<meta>` CSP;
+    both are enforced independently, so this page's own `script-src`/
+    `style-src` also constrained the View's inline script/style, and
+    blocked them (see docs/system-manifest.md's H1.3G entry). The one place
+    that matters is `/` - the only full-page navigation response, and the
+    document whose CSP is actually inherited when app.js later creates the
+    srcdoc iframe on it. Hashes are derived from the exact bytes MCP itself
+    currently serves (mcp_app.get_current_view_csp_hashes), so they can
+    never silently drift from the deployed View; if MCP is unreachable this
+    just omits the hash and fails CLOSED (App inline content stays blocked)
+    rather than ever falling back to 'unsafe-inline'.
     """
+    script_src = "'self'"
+    style_src = "'self'"
+    if request.path == "/":
+        script_hash, style_hash = mcp_app.get_current_view_csp_hashes(asyncio.run, ARIEL_MCP_URL, ARIEL_MCP_FUNCTION_KEY)
+        if script_hash:
+            script_src += f" '{script_hash}'"
+        if style_hash:
+            style_src += f" '{style_hash}'"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        f"default-src 'self'; script-src {script_src}; style-src {style_src}; img-src 'self' data:; "
         "font-src 'self'; connect-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
