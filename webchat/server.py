@@ -325,6 +325,20 @@ _warn_if_environment_credential_vars_present()
 _project = AIProjectClient(endpoint=PROJECT_ENDPOINT, credential=DefaultAzureCredential())
 _client = _project.get_openai_client()
 
+# H1.3G: warms mcp_app's tool-metadata/template caches (and therefore the
+# View's inline CSP hashes - see _set_security_headers) once, at process
+# start, rather than lazily on whichever request happens to be first. Without
+# this, the FIRST "/" request after a cold start/deploy can race MCP's own
+# readiness and get a hash-less CSP (fails closed - the View just stays
+# blocked for that visitor's entire SPA session, since nothing ever
+# reloads "/" again) - reproduced live during H1.3G acceptance. Best-effort
+# only: a failure here just means the ordinary lazy per-request lookup in
+# _set_security_headers tries again later, exactly as before this existed.
+try:
+    mcp_app.get_current_view_csp_hashes(asyncio.run, ARIEL_MCP_URL, ARIEL_MCP_FUNCTION_KEY)
+except Exception:  # noqa: BLE001 - must never block app startup
+    logger.exception("Startup warm-up of the Revenue MCP App's CSP hashes failed - will retry lazily on first request.")
+
 
 @app.after_request
 def _set_security_headers(response):
