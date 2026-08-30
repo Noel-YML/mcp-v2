@@ -636,6 +636,14 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str, last_resul
             except (TypeError, ValueError):
                 arguments = {}
 
+            # H1.3F: which tool the model actually chose was previously
+            # invisible in server-side logs on the success path (only a
+            # failure or an unknown/refused tool name was ever logged) -
+            # this is business-parameter diagnostic only (tool name + the
+            # same non-secret arguments already visible in the browser's own
+            # tool_input), never a credential, scope token, or result content.
+            logger.info("[%s] model requested tool=%s arguments=%s", correlation_id, call.name, json.dumps(arguments))
+
             if call.name not in FUNCTION_TOOL_NAMES:
                 logger.warning("[%s] Model requested unknown function tool %r - refusing.", correlation_id, call.name)
                 output_text = f"Unknown tool {call.name!r}."
