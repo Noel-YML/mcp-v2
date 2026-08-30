@@ -61,6 +61,15 @@
   .metric-table td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); }
   .variance-positive { color: var(--positive); }
   .variance-negative { color: var(--negative); }
+  .stream-chart { margin-top: 14px; }
+  .stream-chart-title { font-size: 12px; font-weight: 600; margin: 0 0 2px; text-transform: uppercase; letter-spacing: 0.02em; color: var(--muted); }
+  .stream-chart-subtitle { font-size: 11px; color: var(--muted); margin: 0 0 8px; }
+  .stream-bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+  .stream-bar-label { flex: 0 0 44px; color: var(--fg); }
+  .stream-bar-track { flex: 1 1 auto; min-width: 0; height: 10px; background: var(--border); border-radius: 5px; overflow: hidden; }
+  .stream-bar-fill { height: 100%; background: #2f6feb; border-radius: 5px; }
+  .stream-bar-fill.stream-bar-negative { background: var(--negative); }
+  .stream-bar-value { flex: 0 0 auto; min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }
   a, button, [tabindex] { }
   :focus-visible { outline: 2px solid #2f6feb; outline-offset: 2px; }
   @media (prefers-reduced-motion: reduce) {

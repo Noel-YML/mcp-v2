@@ -33,16 +33,21 @@ window.__runScenario = async function runScenario(viewUrl, toolInput, structured
 
   let cardText = null;
   let themeAttr = null;
+  let chartBarCount = null;
+  let chartBarWidths = null;
   if (!opts.strictSandbox) {
     // Only readable when allow-same-origin was added for introspection.
     cardText = frame.contentDocument.getElementById("card").innerText;
     themeAttr = frame.contentDocument.documentElement.getAttribute("data-theme");
+    const fills = frame.contentDocument.querySelectorAll(".stream-bar-fill");
+    chartBarCount = fills.length;
+    chartBarWidths = Array.from(fills).map((f) => f.style.width);
   }
 
   const teardownResult = await bridge.teardownResource({});
   frame.remove();
 
-  return { cardText, themeAttr, teardownResult };
+  return { cardText, themeAttr, teardownResult, chartBarCount, chartBarWidths };
 };
 
 window.__runScenarioRepeat = async function runScenarioRepeat(viewUrl, times) {

@@ -61,6 +61,15 @@
   .metric-table td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border); }
   .variance-positive { color: var(--positive); }
   .variance-negative { color: var(--negative); }
+  .stream-chart { margin-top: 14px; }
+  .stream-chart-title { font-size: 12px; font-weight: 600; margin: 0 0 2px; text-transform: uppercase; letter-spacing: 0.02em; color: var(--muted); }
+  .stream-chart-subtitle { font-size: 11px; color: var(--muted); margin: 0 0 8px; }
+  .stream-bar-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+  .stream-bar-label { flex: 0 0 44px; color: var(--fg); }
+  .stream-bar-track { flex: 1 1 auto; min-width: 0; height: 10px; background: var(--border); border-radius: 5px; overflow: hidden; }
+  .stream-bar-fill { height: 100%; background: #2f6feb; border-radius: 5px; }
+  .stream-bar-fill.stream-bar-negative { background: var(--negative); }
+  .stream-bar-value { flex: 0 0 auto; min-width: 64px; text-align: right; font-variant-numeric: tabular-nums; color: var(--fg); }
   a, button, [tabindex] { }
   :focus-visible { outline: 2px solid #2f6feb; outline-offset: 2px; }
   @media (prefers-reduced-motion: reduce) {
@@ -18505,6 +18514,11 @@ container holding the app. Specify either width or maxWidth, and either height o
   function isSuccessResult(sc) {
     return !!sc && sc.status === "success" && Array.isArray(sc.metrics);
   }
+  var STREAM_METRICS = [
+    { metricId: "room_revenue", label: "Rooms" },
+    { metricId: "total_fnb", label: "F&B" },
+    { metricId: "total_other_misc", label: "Other" }
+  ];
   function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -18558,6 +18572,50 @@ container holding the app. Specify either width or maxWidth, and either height o
     for (const metric of result.metrics) tbody.appendChild(renderMetricRow(metric));
     table.appendChild(tbody);
     root.appendChild(table);
+    renderStreamChart(root, result);
+  }
+  function collectStreamBars(metrics) {
+    const byId = new Map(metrics.map((m) => [m.metric_id, m]));
+    const found = STREAM_METRICS.map((s) => byId.get(s.metricId));
+    if (found.some((m) => m === void 0)) return [];
+    const bars = [];
+    STREAM_METRICS.forEach((s, i2) => {
+      const value = found[i2].value;
+      if (value !== null && value !== void 0) bars.push({ label: s.label, value });
+    });
+    return bars;
+  }
+  function renderStreamChart(root, result) {
+    const bars = collectStreamBars(result.metrics);
+    if (bars.length === 0) return;
+    const unit = "currency";
+    const maxValue = Math.max(...bars.map((b2) => Math.abs(b2.value)), 0);
+    const section = el("section", "stream-chart");
+    section.setAttribute("role", "group");
+    section.setAttribute("aria-label", "Revenue by stream");
+    section.appendChild(el("h2", "stream-chart-title", "Revenue by stream"));
+    section.appendChild(
+      el(
+        "p",
+        "stream-chart-subtitle",
+        `${formatDateLabel(result.context.business_date)} \xB7 ${TIMEFRAME_LABELS[result.context.timeframe] ?? result.context.timeframe}`
+      )
+    );
+    for (const bar of bars) {
+      const row = el("div", "stream-bar-row");
+      row.appendChild(el("span", "stream-bar-label", bar.label));
+      const track = el("div", "stream-bar-track");
+      track.setAttribute("aria-hidden", "true");
+      const fill = el("div", "stream-bar-fill");
+      const widthPct = maxValue > 0 ? Math.max(Math.abs(bar.value) / maxValue * 100, 2) : 2;
+      fill.style.width = widthPct + "%";
+      if (bar.value < 0) fill.classList.add("stream-bar-negative");
+      track.appendChild(fill);
+      row.appendChild(track);
+      row.appendChild(el("span", "stream-bar-value", formatNumber(bar.value, unit)));
+      section.appendChild(row);
+    }
+    root.appendChild(section);
   }
   function renderUnavailable(root, message) {
     root.innerHTML = "";

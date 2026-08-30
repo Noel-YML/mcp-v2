@@ -299,3 +299,163 @@ test("repeat mount/unmount (10x) completes without error or accumulating failure
     await page.close();
   }
 });
+
+// --- H1.3E: Revenue by stream chart ---
+
+function headlineResultWithStreams(overrides) {
+  return baseResult({
+    context: baseContext({ view: "headline" }),
+    metrics: [
+      { metric_id: "total_revenue", label: "Total Revenue", unit: "currency", value: 60388.58, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+      { metric_id: "room_revenue", label: "Room Revenue", unit: "currency", value: 54117.02, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+      { metric_id: "total_fnb", label: "Total F&B Revenue", unit: "currency", value: 5991.88, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+      { metric_id: "total_other_misc", label: "Other & Misc Revenue", unit: "currency", value: 279.68, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+    ],
+    ...overrides,
+  });
+}
+
+test("Revenue by stream chart renders with exactly the governed values, in order", async () => {
+  const page = await newHarnessPage();
+  try {
+    const result = headlineResultWithStreams();
+    const { cardText, chartBarCount, chartBarWidths } = await page.evaluate(
+      (viewUrl, input, sc) => window.__runScenario(viewUrl, input, sc),
+      "/view.html",
+      result.context,
+      result
+    );
+    assert.match(cardText, /Revenue by stream/i);
+    assert.match(cardText, /Rooms/);
+    assert.match(cardText, /F&B/);
+    assert.match(cardText, /Other/);
+    assert.match(cardText, /54,117\.02/);
+    assert.match(cardText, /5,991\.88/);
+    assert.match(cardText, /279\.68/);
+    assert.equal(chartBarCount, 3);
+    // Rooms is the largest value, so its bar must be the widest (100%).
+    assert.equal(chartBarWidths[0], "100%");
+  } finally {
+    await page.close();
+  }
+});
+
+test("Revenue by stream chart renders a genuine 0.0 stream as a real zero bar, never as missing", async () => {
+  const page = await newHarnessPage();
+  try {
+    const result = headlineResultWithStreams({
+      metrics: [
+        { metric_id: "total_revenue", label: "Total Revenue", unit: "currency", value: 54117.02, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+        { metric_id: "room_revenue", label: "Room Revenue", unit: "currency", value: 54117.02, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+        { metric_id: "total_fnb", label: "Total F&B Revenue", unit: "currency", value: 0.0, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+        { metric_id: "total_other_misc", label: "Other & Misc Revenue", unit: "currency", value: 0.0, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+      ],
+    });
+    const { cardText, chartBarCount } = await page.evaluate(
+      (viewUrl, input, sc) => window.__runScenario(viewUrl, input, sc),
+      "/view.html",
+      result.context,
+      result
+    );
+    assert.equal(chartBarCount, 3);
+    // Two genuine-zero streams must still each show "0.00", not disappear.
+    const zeroCount = (cardText.match(/\b0\.00\b/g) || []).length;
+    assert.ok(zeroCount >= 2, `expected at least 2 occurrences of 0.00, got card text: ${cardText}`);
+  } finally {
+    await page.close();
+  }
+});
+
+test("Revenue by stream chart omits only the genuinely missing stream, keeps the rest", async () => {
+  const page = await newHarnessPage();
+  try {
+    const result = headlineResultWithStreams({
+      metrics: [
+        { metric_id: "total_revenue", label: "Total Revenue", unit: "currency", value: 54117.02, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+        { metric_id: "room_revenue", label: "Room Revenue", unit: "currency", value: 54117.02, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+        { metric_id: "total_fnb", label: "Total F&B Revenue", unit: "currency", value: null, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 0 },
+        { metric_id: "total_other_misc", label: "Other & Misc Revenue", unit: "currency", value: 279.68, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+      ],
+    });
+    const { chartBarCount } = await page.evaluate(
+      (viewUrl, input, sc) => window.__runScenario(viewUrl, input, sc),
+      "/view.html",
+      result.context,
+      result
+    );
+    assert.equal(chartBarCount, 2, "the null F&B stream must be dropped, not shown as a fabricated zero");
+  } finally {
+    await page.close();
+  }
+});
+
+test("Revenue by stream chart does NOT render for a non-headline view (breakdown unavailable)", async () => {
+  const page = await newHarnessPage();
+  try {
+    const result = baseResult({
+      context: baseContext({ view: "rooms" }),
+      metrics: [
+        { metric_id: "room_revenue", label: "Room Revenue", unit: "currency", value: 54117.02, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+      ],
+    });
+    const { cardText, chartBarCount } = await page.evaluate(
+      (viewUrl, input, sc) => window.__runScenario(viewUrl, input, sc),
+      "/view.html",
+      result.context,
+      result
+    );
+    assert.doesNotMatch(cardText, /Revenue by stream/);
+    assert.equal(chartBarCount, 0);
+  } finally {
+    await page.close();
+  }
+});
+
+test("Revenue by stream chart does NOT render when all three streams are null", async () => {
+  const page = await newHarnessPage();
+  try {
+    const result = headlineResultWithStreams({
+      metrics: [
+        { metric_id: "total_revenue", label: "Total Revenue", unit: "currency", value: null, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 0 },
+        { metric_id: "room_revenue", label: "Room Revenue", unit: "currency", value: null, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 0 },
+        { metric_id: "total_fnb", label: "Total F&B Revenue", unit: "currency", value: null, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 0 },
+        { metric_id: "total_other_misc", label: "Other & Misc Revenue", unit: "currency", value: null, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 0 },
+      ],
+    });
+    const { cardText, chartBarCount } = await page.evaluate(
+      (viewUrl, input, sc) => window.__runScenario(viewUrl, input, sc),
+      "/view.html",
+      result.context,
+      result
+    );
+    assert.doesNotMatch(cardText, /Revenue by stream/);
+    assert.equal(chartBarCount, 0);
+  } finally {
+    await page.close();
+  }
+});
+
+test("View makes zero network requests beyond its own single initial document load", async () => {
+  const page = await newHarnessPage();
+  const requests = [];
+  page.on("request", (req) => requests.push(req.url()));
+  try {
+    const result = headlineResultWithStreams();
+    await page.evaluate(
+      (viewUrl, input, sc) => window.__runScenario(viewUrl, input, sc),
+      "/view.html",
+      result.context,
+      result
+    );
+    // Exactly one request is expected: the harness's own `frame.src =
+    // viewUrl` navigation that loads dist/view.html in the first place.
+    // Once loaded, the View itself (tool input/result/theme all arrive via
+    // postMessage, never fetch/XHR) must issue nothing further - no MCP,
+    // no Fabric, no Cosmos, no Key Vault, no telemetry, nothing.
+    assert.equal(requests.length, 1, `expected exactly 1 request (the initial view.html load), got: ${JSON.stringify(requests)}`);
+    assert.match(requests[0], /\/view\.html/);
+  } finally {
+    page.removeAllListeners("request");
+    await page.close();
+  }
+});
