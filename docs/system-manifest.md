@@ -5,6 +5,7 @@ A technical reference for what the code in this repository **actually does today
 Companion documents:
 - [`mcp/README.md`](../mcp/README.md) — the data engine's own developer guide (structure, "where do I go to…", env vars, deploy)
 - [`docs/how-ariel-works.md`](how-ariel-works.md) — the plain-language explanation for non-engineering readers
+- [`docs/end-to-end-technical-flow.md`](end-to-end-technical-flow.md) — the full request trace from the Fabric semantic model to the rendered answer, plus the live Azure/identity/Key Vault inventory
 
 ---
 
