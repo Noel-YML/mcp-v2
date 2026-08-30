@@ -899,6 +899,16 @@ def delete_conversation(conversation_id):
 @app.route("/api/chat", methods=["POST"])
 def chat():
     correlation_id = str(uuid.uuid4())
+    # H1.3E: coarse phase timing, tagged with the same correlation_id every
+    # other log line in this request already uses. Deliberately NOT a new
+    # return field or a change to _run_function_call_loop's signature/tests -
+    # the per-MCP-call and per-Foundry-continuation-call timestamps are
+    # already visible in the existing httpx/httpx2 INFO logs (see
+    # docs/system-manifest.md's H1.3E note); this just brackets "request
+    # received" and "response ready" plus the first Foundry round trip,
+    # which nothing else currently timestamps. Never logs message content,
+    # tool arguments, or any credential.
+    request_started_at = time.monotonic()
     session = _current_session()
     if not session:
         return jsonify({"error": "Not identified - enter your hotel code first."}), 401
@@ -965,7 +975,9 @@ def chat():
         last_response_id = convo.get("last_response_id")
         if last_response_id is not None:
             request_kwargs["previous_response_id"] = last_response_id
+        foundry_call_started_at = time.monotonic()
         response = _client.responses.create(**request_kwargs)
+        logger.info("[%s] timing: first Foundry call %.0fms", correlation_id, (time.monotonic() - foundry_call_started_at) * 1000)
         loop_result = _run_function_call_loop(
             response, hotel_id, session_id, convo.get("last_result_id"), correlation_id=correlation_id,
         )
@@ -975,6 +987,7 @@ def chat():
         return jsonify({"error": str(exc)}), 502
 
     result = _summarize_response(response, last_analytics_result, last_result_id, loop_result.last_mcp_app)
+    logger.info("[%s] timing: total request %.0fms", correlation_id, (time.monotonic() - request_started_at) * 1000)
 
     convo["messages"].append({"role": "user", "text": message})
     if result["text"]:
