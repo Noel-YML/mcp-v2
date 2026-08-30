@@ -14,7 +14,16 @@ export function formatNumber(value: number | null, unit: string): string {
     case "currency":
       return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     case "percentage":
-      return value.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%";
+      // H1.3H: the governed contract for this unit (occupancy_pct - see
+      // mcp/dmr/semantics.py's NON_ADDITIVE_PERCENTAGE family, and
+      // mcp/scripts/live_acceptance_deployed_mcp.py's own expected values
+      // like 0.8087) is a 0-1 FRACTION, not an already-scaled 0-100
+      // percentage - a raw DAX SUM(rooms)/SUM(rooms_available) division.
+      // This is the ONLY unit on this contract with that convention
+      // (currency/count/rate/ratio values are already in their display
+      // scale) - the *100 below is specific to this one governed unit, not
+      // a blanket rescale.
+      return (value * 100).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%";
     case "count":
       return Math.round(value).toLocaleString("en-US");
     case "rate":

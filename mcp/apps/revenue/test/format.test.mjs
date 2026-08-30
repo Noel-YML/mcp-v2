@@ -27,8 +27,29 @@ test("ratio 0.0 renders as zero", () => {
   assert.equal(format.formatNumber(0.0, "ratio"), "0.00");
 });
 
-test("percentage appends a % suffix without altering the numeric value", () => {
-  assert.equal(format.formatNumber(72.5, "percentage"), "72.5%");
+test("H1.3H: percentage scales a governed 0-1 fraction to a 0-100 display value", () => {
+  // occupancy_pct's real governed contract (mcp/dmr/semantics.py's
+  // NON_ADDITIVE_PERCENTAGE family - a raw SUM(rooms)/SUM(rooms_available)
+  // DAX division) is a 0-1 fraction, not an already-scaled percentage. The
+  // live staging bug: governed occupancy 96.77% (fraction 0.9677) rendered
+  // as "1.0%" before this fix, because the old formatter appended "%"
+  // to the raw fraction unchanged.
+  assert.equal(format.formatNumber(0.9677, "percentage"), "96.8%");
+});
+
+test("percentage 0.0 renders as a real zero, never Unavailable/blank", () => {
+  assert.equal(format.formatNumber(0.0, "percentage"), "0.0%");
+});
+
+test("percentage comparator/variance are scaled the same way as the base value", () => {
+  assert.equal(format.formatComparator(0.7748, "percentage"), "77.5%");
+  assert.equal(format.formatVariance(0.02, "percentage"), "+2.0%");
+  assert.equal(format.formatVariance(-0.031, "percentage"), "-3.1%");
+});
+
+test("rate (ADR/RevPAR) is NOT rescaled - it is already in display units", () => {
+  assert.equal(format.formatNumber(245.84, "rate"), "245.84");
+  assert.equal(format.formatNumber(235.43, "rate"), "235.43");
 });
 
 test("count rounds and groups but never adds decimals", () => {

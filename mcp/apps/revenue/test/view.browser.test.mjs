@@ -171,7 +171,7 @@ test("an absent comparator/variance renders an em-dash, never a fabricated value
     const result = baseResult({
       context: { comparator: "none" },
       metrics: [
-        { metric_id: "occupancy_pct", label: "Occupancy", unit: "percentage", value: 72.5, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
+        { metric_id: "occupancy_pct", label: "Occupancy", unit: "percentage", value: 0.725, comparison_value: null, computed_variance_value: null, source_variance_value: null, source_row_count: 1 },
       ],
     });
     const { cardText } = await page.evaluate(

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-GmYj4/h8cqsCFNSbmoAHc8bFmqoPsUinvGKuTMx8r54='; style-src 'sha256-BdYjgEa64Nrnt3d/4YnTxMrOeerwEZGyvCdA90rLIIQ='; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Hc0HyRvrYiSqPPabwUJ0DedschHXo5Y2MlcbRHw8pYM='; style-src 'sha256-BdYjgEa64Nrnt3d/4YnTxMrOeerwEZGyvCdA90rLIIQ='; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'">
 <title>Revenue performance</title>
 <style>
   :root {
@@ -18474,7 +18474,7 @@ container holding the app. Specify either width or maxWidth, and either height o
       case "currency":
         return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       case "percentage":
-        return value.toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%";
+        return (value * 100).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%";
       case "count":
         return Math.round(value).toLocaleString("en-US");
       case "rate":

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "test": "node test/host.security.test.mjs"
+    "test": "node test/host.security.test.mjs && node test/app_mcp_app_lifecycle.test.mjs"
   },
   "devDependencies": {
     "@modelcontextprotocol/ext-apps": "1.7.5",

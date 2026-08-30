@@ -49,15 +49,34 @@ function addLoading() {
   return transcript.lastElementChild;
 }
 
-// Live MCP App instances currently mounted in the transcript - torn down
-// (per A1's read-only Host design) whenever a NEW response arrives, since
-// only the latest turn's app is ever kept live. See mountMcpAppIfPresent.
+// Live MCP App instances currently mounted in the transcript. At most one
+// entry ever lives here (see teardownActiveMcpApps). H1.3H: this is no
+// longer unconditionally torn down at the start of every new turn - a
+// same-result evidence follow-up (see shouldPreserveMcpApp) now leaves it
+// mounted on purpose, since evidence is supplemental to the analytical
+// result it was requested for, not a replacement for it. Every OTHER new
+// analytical response still tears it down before rendering (see
+// renderResult) - the resultId/conversationId binding below is what makes
+// that decision safe rather than inferred from text.
 let activeMcpApps = [];
 
 async function teardownActiveMcpApps() {
   const apps = activeMcpApps;
   activeMcpApps = [];
   await Promise.all(apps.map((app) => app.teardown().catch(() => {})));
+}
+
+// H1.3H: true only when ALL of - an app is currently mounted/pending, this
+// turn's tool was actually get_result_evidence (evidence_for_result_id is
+// BFF-authoritative and non-null ONLY in that case - see server.py's
+// _summarize_response), it was authorized against the exact result_id the
+// active App represents, and it's the same conversation. Never inferred
+// from the assistant's own text (no "evidence"/"source" word-matching) -
+// every input here is a value the server computed, not the model's prose.
+function shouldPreserveMcpApp(result) {
+  const activeApp = activeMcpApps[0];
+  if (!activeApp || !result.evidence_for_result_id) return false;
+  return activeApp.resultId === result.evidence_for_result_id && activeApp.conversationId === (result.conversation_id || conversationId);
 }
 
 function mountMcpAppIfPresent(container, mcpApp) {
@@ -67,10 +86,17 @@ function mountMcpAppIfPresent(container, mcpApp) {
   // the send button for the duration of one turn, but a fast click right as
   // it re-enables could still race this fetch) always finds this pending
   // mount and can cancel it - instead of the fetch resolving into a
-  // now-orphaned iframe that nothing ever tracked or tore down.
+  // now-orphaned iframe that nothing ever tracked or tore down. resultId/
+  // conversationId are bound here too, synchronously, from the BFF-derived
+  // descriptor and the module-level conversationId (already updated to this
+  // turn's value by renderResult before this runs) - so a same-result
+  // evidence turn that arrives while this fetch is still pending can still
+  // correctly recognize and preserve it (H1.3H negative test 7).
   let mountedApp = null;
   let cancelled = false;
   activeMcpApps.push({
+    resultId: mcpApp.tool_result && mcpApp.tool_result.result_id,
+    conversationId,
     teardown: async () => {
       cancelled = true;
       if (mountedApp) await mountedApp.teardown();
@@ -128,21 +154,37 @@ function addError(text) {
   scrollToBottom();
 }
 
-function renderResult(result) {
+async function renderResult(result) {
+  // Set BEFORE any teardown/mount decision below - mountMcpAppIfPresent
+  // binds a new app to the module-level conversationId, and
+  // shouldPreserveMcpApp compares against it, so both must already see
+  // THIS turn's (possibly newly-created) conversation id.
+  previousResponseId = result.response_id;
+  conversationId = result.conversation_id || conversationId;
+
+  // H1.3H: replace (new app) or remove (anything else non-preservable)
+  // always tears down first; a same-result evidence turn preserves the
+  // existing app untouched instead - see shouldPreserveMcpApp.
+  if (result.mcp_app || !shouldPreserveMcpApp(result)) {
+    await teardownActiveMcpApps();
+  }
+
   if (result.text) {
     addAgentMessage(result.text, result.presentation, result.insights, result.actions, result.mcp_app);
   }
   (result.consents || []).forEach((c) => {
     addError("This tool needs sign-in first: " + c.consent_link);
   });
-  previousResponseId = result.response_id;
-  conversationId = result.conversation_id || conversationId;
   loadHistory();
 }
 
 async function sendMessage(text) {
   if (!text.trim()) return;
-  await teardownActiveMcpApps();
+  // H1.3H: teardown is no longer unconditional here - it now happens
+  // (or doesn't) inside renderResult, once the response is known, so a
+  // same-result evidence turn's existing chart is never destroyed before
+  // the BFF has even said whether to preserve it. See renderResult/
+  // shouldPreserveMcpApp.
   showTranscript();
   addUserMessage(text);
   input.value = "";
@@ -161,11 +203,15 @@ async function sendMessage(text) {
     const data = await res.json();
     if (!res.ok) {
       if (res.status === 401) {
+        // H1.3H: a session invalidation must remove any active App
+        // immediately, same as an explicit hotel switch/logout - it can no
+        // longer be trusted to represent this (now-unidentified) session.
+        await teardownActiveMcpApps();
         showIdentifyOverlay();
       }
       addError(data.error || "Something went wrong calling the agent.");
     } else {
-      renderResult(data);
+      await renderResult(data);
     }
   } catch (err) {
     loadingNode.remove();
@@ -368,6 +414,7 @@ function renderHistoryList(items) {
       if (!confirm("Delete this conversation? This can't be undone.")) return;
       await fetch(`/api/conversations/${item.id}`, { method: "DELETE" });
       if (conversationId === item.id) {
+        await teardownActiveMcpApps();
         conversationId = null;
         previousResponseId = null;
         showEmptyState();
@@ -380,6 +427,11 @@ function renderHistoryList(items) {
 }
 
 async function selectConversation(id) {
+  // H1.3H: switching to a DIFFERENT conversation is a conversation-
+  // ownership change - any App mounted for the one being left must not
+  // persist into the newly-loaded one (its own history never remounts an
+  // App - see the loop below - so there is nothing to replace it with).
+  await teardownActiveMcpApps();
   try {
     const res = await fetch(`/api/conversations/${id}`);
     if (!res.ok) return;

@@ -624,6 +624,14 @@ class _FunctionCallLoopResult:
     last_analytics_result: dict | None
     last_result_id: str | None
     last_mcp_app: dict | None = None
+    # H1.3H: the authoritative result_id a get_result_evidence call this
+    # turn was actually AUTHORIZED against (i.e. it passed the fail-closed
+    # `arguments.get("result_id") != last_result_id` gate below and reached
+    # MCP) - None on every other turn, including a REFUSED evidence call.
+    # Lets the frontend distinguish "this turn's evidence matches the App
+    # it already has mounted" from "some other/no tool ran" without ever
+    # trusting the model's own claimed result_id (see _summarize_response).
+    evidence_result_id: str | None = None
 
     def __iter__(self):
         return iter((self.response, self.last_analytics_result, self.last_result_id))
@@ -660,11 +668,12 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str, last_resul
     """
     last_analytics_result: dict | None = None
     last_mcp_app: dict | None = None
+    evidence_result_id: str | None = None
 
     for _ in range(MAX_FUNCTION_CALL_ROUNDS):
         calls = [item for item in response.output if item.type == "function_call"]
         if not calls:
-            return _FunctionCallLoopResult(response, last_analytics_result, last_result_id, last_mcp_app)
+            return _FunctionCallLoopResult(response, last_analytics_result, last_result_id, last_mcp_app, evidence_result_id)
 
         outputs = []
         for call in calls:
@@ -693,6 +702,12 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str, last_resul
                 output_text = _NO_PRIOR_RESULT_RESPONSE
             else:
                 try:
+                    if call.name == "get_result_evidence":
+                        # Reaching here means the gate above already matched
+                        # this call's result_id against last_result_id - this
+                        # IS that authoritative value, snapshotted before any
+                        # later call this same turn could change it.
+                        evidence_result_id = last_result_id
                     output_text = _call_mcp_tool(call.name, arguments, hotel_id, session_id)
                     analytics_result = _as_analytics_result(output_text)
                     if analytics_result is not None:
@@ -726,7 +741,7 @@ def _run_function_call_loop(response, hotel_id: int, session_id: str, last_resul
         )
 
     logger.warning("[%s] Exhausted %d function-call rounds with calls still pending", correlation_id, MAX_FUNCTION_CALL_ROUNDS)
-    return _FunctionCallLoopResult(response, last_analytics_result, last_result_id, last_mcp_app)
+    return _FunctionCallLoopResult(response, last_analytics_result, last_result_id, last_mcp_app, evidence_result_id)
 
 
 def _now() -> str:
@@ -746,7 +761,11 @@ def _save_store(store: dict) -> None:
 
 
 def _summarize_response(
-    response, last_analytics_result: dict | None, last_result_id: str | None, mcp_app_descriptor: dict | None = None
+    response,
+    last_analytics_result: dict | None,
+    last_result_id: str | None,
+    mcp_app_descriptor: dict | None = None,
+    evidence_result_id: str | None = None,
 ) -> dict:
     """Flattens a Responses API result into what the UI needs. The model's
     final message is JSON conforming to webchat/agent_contract.py's
@@ -766,6 +785,18 @@ def _summarize_response(
     deliberately doesn't surface that field at all; this function does not
     read it either, so there is no path by which a model-authored result_id
     reaches the browser or conversation state.
+
+    H1.3H: `evidence_for_result_id` is a second, distinct BFF-authoritative
+    signal - non-null ONLY when THIS turn's executed tool was
+    get_result_evidence and it was authorized against that exact result_id
+    (see `_run_function_call_loop`'s `evidence_result_id`). It is
+    deliberately NOT the same as `result_id` (which is always the
+    conversation's current continuation handle, even on a turn where no
+    tool ran at all) - the frontend needs to know THIS TURN specifically
+    ran evidence, not merely that some result_id happens to still match, or
+    an unrelated/no-tool turn would incorrectly look preservable too.
+    webchat/static/app.js uses this (never any word-matching on `text`) to
+    decide whether to keep its currently-mounted Revenue MCP App visible.
     """
     text_parts = []
     consents = []
@@ -792,6 +823,9 @@ def _summarize_response(
         # A1: BFF-derived only (see mcp_app.py) - never read from
         # `validated`/the model's own JSON output.
         "mcp_app": mcp_app_descriptor,
+        # H1.3H: see this function's docstring - BFF-authoritative, never
+        # derived from `validated`/the model's own JSON output either.
+        "evidence_for_result_id": evidence_result_id,
     }
 
 
@@ -1031,7 +1065,9 @@ def chat():
         logger.exception("[%s] Agent call failed", correlation_id)
         return jsonify({"error": str(exc)}), 502
 
-    result = _summarize_response(response, last_analytics_result, last_result_id, loop_result.last_mcp_app)
+    result = _summarize_response(
+        response, last_analytics_result, last_result_id, loop_result.last_mcp_app, loop_result.evidence_result_id
+    )
     logger.info("[%s] timing: total request %.0fms", correlation_id, (time.monotonic() - request_started_at) * 1000)
 
     convo["messages"].append({"role": "user", "text": message})

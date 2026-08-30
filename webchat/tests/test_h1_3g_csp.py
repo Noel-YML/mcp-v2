@@ -15,11 +15,23 @@ same inline blocks on the outer page's own CSP header - never
 
 import hashlib
 import base64
+import re
 
 import pytest
 
 import mcp_app
 import server
+
+
+def _declared_hashes_in(html: str) -> tuple[str, str]:
+    """Reads back the sha256- hashes already baked into the View's own
+    <meta> CSP tag (by mcp/apps/revenue/build.mjs) - the ground truth for
+    what dist/view.html currently declares, independent of any value
+    hardcoded in a test."""
+    script_match = re.search(r"script-src '(sha256-[A-Za-z0-9+/]+=*)'", html)
+    style_match = re.search(r"style-src '(sha256-[A-Za-z0-9+/]+=*)'", html)
+    assert script_match and style_match, "expected both a script-src and style-src sha256 hash in the CSP <meta> tag"
+    return script_match.group(1), style_match.group(1)
 
 
 FIXTURE_HTML = """<!doctype html>
@@ -51,9 +63,13 @@ def test_compute_inline_csp_hashes_matches_manual_computation_for_a_fixture():
 
 
 def test_compute_inline_csp_hashes_matches_the_real_committed_view_html():
-    """The exact two hashes Edge itself reported as "browser suggested
-    hash" for the real staging incident - independent confirmation that
-    this function's algorithm is byte-for-byte what a real browser expects.
+    """Proves this function's algorithm agrees, byte-for-byte, with
+    mcp/apps/revenue/build.mjs's own hash computation on the REAL committed
+    artifact - independent verification, not a hardcoded value, so it can
+    never drift when the View's content legitimately changes (e.g. H1.3H's
+    percentage-formatting fix changed the bundled JS and this hash with
+    it). The original H1.3G incident's exact Edge-reported values are
+    covered by test_h1_3g_csp.py's git history, not pinned here.
     """
     from pathlib import Path
 
@@ -64,8 +80,14 @@ def test_compute_inline_csp_hashes_matches_the_real_committed_view_html():
 
     script_hash, style_hash = mcp_app.compute_inline_csp_hashes(html)
 
-    assert script_hash == "sha256-GmYj4/h8cqsCFNSbmoAHc8bFmqoPsUinvGKuTMx8r54="
-    assert style_hash == "sha256-BdYjgEa64Nrnt3d/4YnTxMrOeerwEZGyvCdA90rLIIQ="
+    # H1.3H: the script hash changed when format.ts's percentage fix
+    # changed the bundled JS - this asserts the CURRENT committed
+    # dist/view.html's own declared hash (proven self-consistent by
+    # mcp/apps/revenue/test/csp.test.mjs) rather than re-deriving it here,
+    # so this test can't silently drift from what's actually shipped.
+    declared_script_hash, declared_style_hash = _declared_hashes_in(html)
+    assert script_hash == declared_script_hash
+    assert style_hash == declared_style_hash
 
 
 def test_compute_inline_csp_hashes_returns_none_when_no_style_or_script_present():
