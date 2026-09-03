@@ -11,7 +11,29 @@ __pycache__/
 .venv/
 
 # Local dev artifacts
+# Azurite writes to whichever directory the emulator is started from. It was
+# started from the REPOSITORY ROOT, not mcp/, so `mcp/.azurite/` alone never
+# matched and the emulator state - including a plaintext azure-webjobs-secrets
+# blob holding Functions host/function/system keys - was tracked by mistake.
+# Ignore both locations, and the root-level artefacts by name.
 mcp/.azurite/
+.azurite/
+AzuriteConfig
+__azurite_db_*.json
+__blobstorage__/
+__queuestorage__/
+
+# Local conversation store - created at runtime by webchat/server.py
+# (_load_store returns {} when it is absent). It holds real conversation
+# transcripts and must never be committed.
+webchat/conversations.json
+
+# Build/deploy artefacts. The deploy package is a stale duplicate of the
+# source that is already in this repository.
+*.zip
+
+# Test caches
+.pytest_cache/
 
 # Node (View/Host build tooling only - see mcp/apps/revenue/ and
 # webchat/host-src/ - package-lock.json IS committed for determinism, only
