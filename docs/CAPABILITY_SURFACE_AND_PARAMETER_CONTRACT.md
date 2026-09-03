@@ -217,29 +217,70 @@ mismatch`).
 
 - **No new tool, no new parameter, no new query id.** The request contract is untouched.
 - Computed by governed deterministic execution alongside `computed_variance_value`.
-- **Requires an explicit rule for a null or zero denominator.** A percentage against a zero base is
-  **undefined** — not zero and not silently omitted. The repository already has the right vocabulary:
-  `Fact.reason` distinguishes `zero_baseline`, `insufficient_data` and `comparator_zero_base`, the last
-  of which exists precisely for "every comparator is exactly 0, so the variance is mathematically
-  correct but presenting it as a business comparison would mislead."
 - Absent for `comparator = none` (not requested) and wherever the comparison value is null (missing).
 - **The UI and the agent never derive it** — including in narrative wording (4C §10).
-- **Delta unit:** the percentage's meaning depends on the metric's governed `unit`. A change in a
-  `percentage`-unit metric (occupancy) is in **points**, not percent. Whether that is expressed as a
-  separate field or implied by `unit` is an open packet question (§24), but it must not be a UI choice.
 
-### 5.6 availableActions — recommended addition
+#### 5.5.1 Two distinct quantities — frozen now, because fixtures depend on it
 
-The digest publishes none today. Two actions are **already executable by this exact capability** and
-therefore satisfy the `ACTION_REGISTRY` rule without any new capability:
+**These are two different analytical values and they are never interchangeable.** Freezing the
+semantics (not the field names) is a Task 5 obligation, because N07 cannot write correct fixtures
+without it.
 
-| Action | Declared domain | Note |
+| | **Absolute delta** | **Relative percentage variance** |
 |---|---|---|
-| `change_timeframe` | `day` \| `mtd` \| `ytd` | Same tool, same view, same comparator |
-| `change_comparator` | `none` \| `last_year` \| `budget` \| `forecast` | **The declared domain must be timeframe-aware** — at `day`, `budget` and `forecast` must be published as *disabled with a reason*, never omitted (4C §15) |
+| Status | **Governed today** — `computed_variance_value` | **The C2 governed output extension** — does not exist yet |
+| Definition | `current − comparator` | `(current − comparator) / comparator` |
+| Unit | **the metric's own unit** | a dimensionless ratio, displayed as a percentage |
+| For a currency metric | e.g. `118246.0 − 264061.0 = −145815.0` (currency) | `−145815.0 / 264061.0 = −0.552` → **−55.2%** |
+| For a **percentage-unit** metric | `0.84 − 0.80 = 0.04` → display meaning **+4 percentage points** | `(0.84 − 0.80) / 0.80 = 0.05` → display meaning **+5%** |
+| Validity | Requires a non-null comparator | Requires a comparator that is **non-null *and* non-zero** |
+| Zero comparator | Delta is well defined and equals `current` | **Undefined** — never zero, never `Infinity`, never omitted silently |
 
-This is a bounded output extension, not a new capability. It is the mechanism 4C's Period Switcher and
-Comparator Toggle require. `open_trend` becomes publishable only once Metric Trend exists.
+**The worked case that makes the distinction unmissable:** occupancy moving from 80% to 84% is
+**+4 percentage points** *and* **+5% relative** at the same time. Reporting either number as the other
+misstates the result. A contract that carries only one of them, or that lets a consumer infer one from
+the other, is wrong.
+
+#### 5.5.2 Undefined and unavailable cases
+
+| Comparator state | Absolute delta | Relative percentage variance | Governed signal |
+|---|---|---|---|
+| Non-null, non-zero | computed | computed | — |
+| **Exactly `0.0`** (a real governed zero) | computed (equals `current`) | **undefined — not emitted as a number** | `comparator_zero_base` — the existing `Fact.reason` value that exists precisely for "the variance is mathematically correct but presenting it as a business comparison would mislead" |
+| **`null`** (missing) | unavailable | unavailable | missing / `insufficient_data`; null never becomes zero |
+| `comparator = none` | not requested | not requested | **absence by choice**, distinct from missing (4C §12, state 04) |
+
+#### 5.5.3 Display unit is metadata, not arithmetic
+
+Whether a relative percentage or a percentage-point delta is the right thing to *show* depends on the
+metric's governed `unit`. That is a **presentation-metadata** question — how the governed value's unit
+is communicated — and it is **never** a licence for the UI to convert one quantity into the other.
+Both quantities are governed; the UI formats whichever the contract supplies. The exact metadata field
+used to communicate display unit remains deferred (§24); the semantic distinction above does **not**.
+
+### 5.6 Interaction intents — proposed, not existing action contracts
+
+**The digest publishes no `availableActions` today, and no action id below exists in code.**
+`change_timeframe` and `change_comparator` appear in **neither** action registry (§17.1) — verified by
+search. They are **proposed capability interaction intents**, and Task 5 does not freeze their ids or
+payload schemas.
+
+What Task 5 *does* establish is the analytical half: **changing the timeframe or the comparator is
+already analytically executable** by re-invoking this same capability with another allowed parameter
+value. No new capability, query or parameter is needed for the analysis.
+
+| Proposed intent (working name) | Analytical basis | Constraint |
+|---|---|---|
+| change timeframe | re-invoke with `timeframe` ∈ `day` \| `mtd` \| `ytd` | same `view`, same `comparator` |
+| change comparator | re-invoke with `comparator` ∈ `none` \| `last_year` \| `budget` \| `forecast` | **the offered domain must be timeframe-aware** — at `day`, `budget` and `forecast` must be presented as *disabled with the reason*, never silently omitted (4C §15) |
+
+**What remains open, and belongs to the later interaction-contract work (N14 / Gate 6):** the exact
+action ids, the event payload schema, how a declared parameter domain is expressed for an enum
+(today's `allowed_parameters` shape carries only numeric `minimum`/`maximum`), and the execution
+mechanism. Every such interaction stays **host-mediated and re-authorized** regardless of its final
+shape.
+
+`open_trend` is not proposable at all until Metric Trend exists.
 
 ### 5.7 Current vs target-state metric coverage
 
@@ -330,10 +371,18 @@ its own declared semantics.
   range, slope, growth rate or volatility. If those are ever wanted they become governed output
   fields, never a rendering step (4C §7).
 
-### 6.5 availableActions
+### 6.5 Interaction intents — proposed
 
-`change_period` with a declared `{start_date, end_date}` domain bounded at 92 days. Cross-navigation
-to Performance for a single date is publishable once both exist.
+A **window-change** intent is the natural interaction for Trend: re-invoke this same capability with a
+different `start_date`/`end_date` pair inside the 92-day ceiling.
+
+**It must not reuse the existing `change_period` id.** That id exists today, but it is a
+**`days`-count legacy action** bound to `get_dmr_revenue_trend` and validated as an integer `days`
+between 1 and 92 (§17.1). A date-pair window is a materially different payload *and* a different
+mechanism, so redefining `change_period` in place would silently change an existing contract. A
+date-window intent is a **new, proposed typed action** whose id and payload belong to N14 / Gate 6.
+
+Cross-navigation to Performance for a single date becomes proposable once both capabilities exist.
 
 ---
 
@@ -405,10 +454,14 @@ parameter model as `revenue_stream` without a per-dimension branch, choose A. If
 - Category labels are **public dimension labels**; `Revenue_Group` / `Revenue_Type` stay internal and
   appear only in Evidence.
 
-### 7.4 availableActions
+### 7.4 Interaction intents — proposed
 
-`change_timeframe`, `change_comparator` (timeframe-aware domain), and — once Trend exists —
-`open_trend(metric)` for a category's metric.
+The same two intents as Performance (§5.6) — change timeframe, change comparator with a
+timeframe-aware offered domain — on the same analytical basis: re-invoking this capability with
+another allowed parameter value. Neither id exists in code, and neither is frozen here.
+
+A drill intent from a category into that metric's series becomes proposable only once Metric Trend
+exists.
 
 ---
 
@@ -486,11 +539,20 @@ Instead:
 **Never averaged across rows or days**, and **never computed by the UI** even though both inputs are
 on screen (4C §8.3).
 
-### 8.5 availableActions
+### 8.5 Interaction intents — proposed
 
-`change_snapshot_window` with a declared `{stay_start, stay_end}` domain bounded at 62 days.
-`change_as_of_date` is a candidate but should only be published once a bounded, meaningful domain for
-it is declared — an unbounded date picker over snapshots is not one.
+A **stay-window-change** intent: re-invoke with a different `stay_start`/`stay_end` pair inside the
+62-day ceiling.
+
+**It must not reuse the existing `change_snapshot_window` id.** That id exists in the MCP
+`ACTION_REGISTRY` bound to `get_dmr_revenue_snapshot` with a `days`-count domain, and it is **not**
+present in webchat's own action set at all (§17.1). A stay-window pair is a different payload against a
+different capability; reusing the id would conflate two unrelated contracts.
+
+An **as-of-date-change** intent is conceivable but should not be proposed until a bounded, meaningful
+domain for it is declared — an unbounded date picker over snapshots is not one.
+
+All ids and payloads here are proposed only; the typed contract belongs to N14 / Gate 6.
 
 ---
 
@@ -687,8 +749,8 @@ There is no cross-product.**
 
 | Domain | Metric | Breakdown | Status | Share | Reason |
 |---|---|---|---|---|---|
-| Hotel Performance | `total_revenue` | `revenue_stream` | **READY** | **Approved** | Full day/mtd/ytd + all comparators; share is a deterministic derived fact from a reconciled total |
-| Hotel Performance | `room_revenue` | `revenue_stream` | READY (v1.1) | Approved | Same semantics; held back for scope only |
+| Hotel Performance | `total_revenue` | `revenue_stream` | **READY** | **Approved** | `day`/`mtd`/`ytd` with all declared comparators **subject to the timeframe × comparator gate** (§5.2, §16.1 — `day + budget` and `day + forecast` are rejected); share is a deterministic derived fact from a reconciled total |
+| Hotel Performance | `room_revenue` | `revenue_stream` | READY (v1.1) | Approved | Same semantics, same gate; held back for scope only |
 | Hotel Performance | `total_fnb` · `total_other_misc` | `revenue_stream` | READY (v1.1) | Approved | Same |
 | Market Segments | `segment_revenue` | `market_segment` | **SEMANTIC DEPENDENCY** | **WITHHELD** | Metrics are **MTD-only**; `segment.pct_of_total.mtd` is `SEMANTIC_ONLY` with an inconsistently described cross-mart denominator → `SEMANTIC DEFINITION REQUIRED` |
 | Market Segments | `segment_rooms_occupied` | `market_segment` | SEMANTIC DEPENDENCY | WITHHELD | MTD-only |
@@ -705,9 +767,14 @@ There is no cross-product.**
 
 ---
 
-## 16. Invalid combination matrix
+## 16. Invalid combinations, semantic suppression, and security invariants
 
-Every one is **rejected before analytical execution**; none produces a result packet.
+Three genuinely different things, previously listed as one table. Only §16.1 is
+"rejected before execution".
+
+### 16.1 Invalid parameter values and combinations — rejected before analytical execution
+
+**No result packet is produced.** The request never reaches a query.
 
 | # | Capability | Invalid combination | Reason | Response |
 |---|---|---|---|---|
@@ -721,34 +788,110 @@ Every one is **rejected before analytical execution**; none produces a result pa
 | I‑8 | Holdings (all) | stay window > 62 days | `max_stay_window_days`; rejected, never clamped | Rejected |
 | I‑9 | Trend | `metric` outside the declared enum | Not a declared capability parameter value | Rejected |
 | I‑10 | Breakdown | an undeclared `(metric, breakdown)` pair | Declared pairs only — no cross-product | Rejected |
-| I‑11 | Breakdown | `market_segment` + a share request | Denominator not signed off | Values and ranking returned **without** share |
-| I‑12 | Evidence | `result_id` not matching `^res_[0-9a-f]{16}$`, or not the active authoritative result | `result_id` is not authorization | Refused locally, before MCP; identical response for all failure causes |
-| I‑13 | any | a `hotel_id`-shaped argument from the model | Scope is server-injected | Ignored — there is no field for it, and scope is unaffected |
-| I‑14 | Holdings | a single generic `date` in place of the two roles | `AuditDate` ≠ `SelDate` | Not expressible — no such parameter exists |
+| I‑11 | Evidence | `result_id` not matching `^res_[0-9a-f]{16}$`, or not the active authoritative result | `result_id` is not authorization | Refused locally, before MCP; identical response for all failure causes |
+| I‑12 | Holdings | a single generic `date` in place of the two roles | `AuditDate` ≠ `SelDate` | **Not expressible** — no such parameter exists in the declared schema |
+
+### 16.2 Semantic suppression — a valid request whose feature is unavailable
+
+**These are not invalid requests.** The analytical values are legitimate and are returned; one
+*feature* of the result is structurally unavailable and its absence is stated in place (4C §12,
+principle "a gap is always stated, never silently dropped").
+
+| # | Capability | Condition | What is returned | What is withheld, and why |
+|---|---|---|---|---|
+| **S‑1** | Breakdown | `breakdown = market_segment` | Category values **and** ranking — a complete, valid answer | **Share.** `segment.pct_of_total.mtd` is `SEMANTIC_ONLY`, its cross-mart denominator is described inconsistently in the registry, and it is therefore `SEMANTIC DEFINITION REQUIRED` (U‑3). Withheld until sign-off; the UI never derives it |
+| **S‑2** | Breakdown | the parts do not reconcile against the reconciled total | Values and ranking | **Share**, plus a quality condition is raised. The capability never emits a share it cannot stand behind |
+| **S‑3** | Performance | percentage variance before C2 ships | Absolute variance | **Relative percentage variance** — no field exists yet (§5.5) |
+| **S‑4** | Holdings | ADR / occupancy before E‑2 / E‑3 ship | The six governed pace metrics | **ADR and occupancy** — governed derivations not yet produced |
+
+**Requesting a suppressed feature is not an error.** There is no `share` request parameter to reject;
+share is simply present or absent according to governed semantics.
+
+### 16.3 Security invariants — not request validation
+
+**These are properties that hold regardless of what arrives**, and they must not be described as
+input rejection unless the code actually rejects.
+
+| # | Condition | Verified actual behaviour | Invariant |
+|---|---|---|---|
+| **X‑1** | The model supplies a `hotel_id`-shaped argument | **`hotel_id` is not a declared parameter of any tool** — no schema has a field for it. But the MCP SDK **does not enforce `additionalProperties: false`** on these schemas, so an unexpected `hotel_id` key **is accepted at the schema layer and passed through to the registered closure rather than rejected** — confirmed empirically and asserted by `test_unexpected_hotel_id_argument_can_never_change_authorized_scope` | **The invariant is that it has no effect on authorization, not that the SDK rejects it.** The closure resolves scope solely from the verified `ScopeContext`; the stray key is never read. A headerless call carrying `hotel_id: 999` still returns an error. `hotel_id` remains **server-injected only** (§14.2) |
+| **X‑2** | A scope token, function key or session id appears anywhere in a tool argument or result | No contract has a field for one, and a forbidden-field scan runs at the BFF→browser boundary | Never present; never reachable by browser or model |
+| **X‑3** | A returned row belongs to another hotel | Every row's `HotelId` is re-checked against `scope.hotel_id` per governed metric | **Fails closed**, sanitized — the other hotel's id is never echoed |
+
+> **Precision note.** An earlier draft described X‑1 as "ignored — there is no field for it". That
+> conflated two things: there is indeed **no declared field**, but the SDK's lack of
+> `additionalProperties: false` means an extra key is *accepted and passed through*, not rejected. The
+> security contract deliberately rests on **"cannot influence scope"** rather than on schema
+> rejection, and the test docstring says so explicitly. Stating it as rejection would misrepresent
+> what N07's validators can assert.
 
 ---
 
-## 17. availableActions by capability
+## 17. Actions — existing registry entries vs proposed interaction intents
 
-The governing rule is the repository's own: **an action is published only if the system can execute it
-today.** `compare_previous_period` is absent from `ACTION_REGISTRY` for exactly this reason.
+**The governing rule stands, and it has two halves that must not be confused:**
 
-| Capability | Actions today | Recommended additions | Blocked until |
+> *"An action is published only if the system can execute it."*
+
+- **Analytical executability** — can governed execution actually produce this answer? Task 5 answers
+  this, per capability.
+- **An existing typed action contract** — does an action id, a validated payload shape and an
+  execution mechanism already exist in code? **Task 5 does not freeze this**, and mostly it does not
+  yet exist.
+
+`compare_previous_period` is deliberately absent from **both** registries for the first reason: no
+deterministic implementation exists.
+
+### 17.1 Current action registries — exactly what exists in code
+
+**There are two, deliberately different, and neither is renamed or reinterpreted here.**
+
+| Registry | Location | Purpose (its own words) | Ids |
 |---|---|---|---|
-| **Performance Digest** | **none** (verified) | `change_timeframe` (`day\|mtd\|ytd`), `change_comparator` (timeframe-aware domain) | — both executable by this capability now |
-| **Metric Trend** | — | `change_period` (`{start_date, end_date}` ≤ 92 days) | Trend exists |
-| **Metric Breakdown** | — | `change_timeframe`, `change_comparator` | Breakdown exists |
-| | | `open_trend(metric)` | Trend exists |
-| **Holdings Position** | — | `change_snapshot_window` (`{stay_start, stay_end}` ≤ 62 days) | Position exists |
-| **Holdings Comparison** | — | `change_snapshot_window` | Comparison exists |
-| **Pickup / Pace** | — | — | Pickup semantics signed off |
-| **Scenario** | — | `run_scenario(exclude: approved category)` | Scenario capability + Skill |
-| **Evidence** | n/a | — | Not an analytical action; the "Why?" affordance is host-resolved |
-| **Legacy DMR** | `change_period`, `change_snapshot_window`, and five `show_*` cross-navigation actions | none | not re-exposed |
+| `ACTION_REGISTRY` | `mcp/analytics/actions.py` | *"what the MCP tool result offers as follow-ups"* | **7** — `change_period`, `change_snapshot_window`, `show_revenue_snapshot`, `show_revenue_trend`, `show_segment_mix`, `show_fnb_performance`, `show_holdings_outlook` |
+| `ACTIONS` | `webchat/actions_registry.py` | *"what webchat itself is willing to render as a clickable button and knows how to turn into a next chat message"* | **5** — `change_period`, `show_revenue_trend`, `show_segment_mix`, `show_fnb_performance`, `show_holdings_outlook` |
 
-**Rules.** A control may emit only a value inside the declared domain · a structurally invalid option
-renders **disabled with its reason**, not hidden · every action is host-mediated and re-authorized ·
-client state can never alter hotel authorization · a saved view stores **parameters, not numbers**.
+Three facts that constrain everything below, all verified:
+
+1. **The two sets differ.** `change_snapshot_window` and `show_revenue_snapshot` are in the MCP
+   registry but **not** in webchat's clickable set. The modules say this divergence is intentional and
+   *"they aren't guaranteed to always be identical."*
+2. **The existing parameterized actions are `days`-count based.** `allowed_parameters` carries only
+   numeric `minimum`/`maximum` (`change_period`: `days` 1–92; `change_snapshot_window`: `days` 1–31),
+   and webchat validates `change_period` as *"an integer `days` parameter"* between 1 and 92. **There
+   is no enum or date-pair payload shape in the current action contract.**
+3. **The current execution mechanism is a prompt fallback, not a typed capability call** — an action
+   id means *"webchat can actually execute this by sending its `promptFallback` as the next
+   message."*
+4. **Every action id proposed by Task 4C or Task 5 — `change_timeframe`, `change_comparator`,
+   `open_trend`, `run_scenario`, `save_view` — exists in neither registry.** Verified by search across
+   the repository.
+
+### 17.2 Proposed capability interaction intents
+
+Working names only. **No id, payload schema, or execution mechanism below is frozen by Task 5**; the
+typed interaction contract belongs to the later interaction work (N14 / Gate 6).
+
+| Capability | Proposed intent | Analytically executable? | Existing typed contract? | Notes |
+|---|---|---|---|---|
+| **Performance Digest** | change timeframe | **Yes, today** — re-invoke with another `timeframe` | **No** — id absent from both registries | Needs an enum payload shape the current `allowed_parameters` cannot express |
+| | change comparator | **Yes, today** — re-invoke with another `comparator` | **No** | Offered domain must be timeframe-aware; invalid options **disabled with the reason** |
+| **Metric Trend** | change window (`start_date`/`end_date`, ≤ 92 days) | Once Trend exists | **No** — and it **must not reuse `change_period`**, which is a `days`-count action bound to a different capability | A date pair is a different payload *and* a different mechanism |
+| **Metric Breakdown** | change timeframe · change comparator | Once Breakdown exists | **No** | Same shape as Performance |
+| | drill from a category into that metric's series | Once **Trend** exists | **No** | Not proposable before Trend |
+| **Holdings Position** | change stay window (`stay_start`/`stay_end`, ≤ 62 days) | Once Position exists | **No** — and it **must not reuse `change_snapshot_window`**, a `days`-count action bound to `get_dmr_revenue_snapshot` and absent from webchat's set | |
+| **Holdings Comparison** | change stay window | Once Comparison exists | **No** | Same |
+| **Pickup / Pace** | — | No | No | Blocked on Pickup semantics |
+| **Scenario** | run scenario over an approved category | No | No | Blocked on the Scenario capability + Skill |
+| **Evidence** | the "Why?" affordance | n/a — host-resolved, not an analytical action | n/a | The host identifies the active authoritative result; the client supplies no `result_id` |
+| **Legacy DMR** | — | The 7 / 5 registry ids above | **Yes** — these are the only real ones | Not re-exposed by this document |
+
+### 17.3 Rules that hold whatever the final contract looks like
+
+A control may emit only a value inside a declared domain · a structurally invalid option renders
+**disabled with its reason**, never hidden · **every interaction is host-mediated and re-authorized** ·
+client state can never alter hotel authorization · a saved view stores **parameters, not numbers** ·
+**an existing action id is never silently redefined with a new payload shape.**
 
 ---
 
@@ -758,10 +901,10 @@ Backend work on capabilities that exist or are ready. **Not implemented here.**
 
 | # | Extension | Capability | Formula / rule | Verified basis |
 |---|---|---|---|---|
-| **E‑1** | **Percentage variance** | Performance Digest | Deterministic, alongside `computed_variance_value`; undefined against a zero or null base — use the existing `Fact.reason` vocabulary | No percentage field exists in any contract |
+| **E‑1** | **Relative percentage variance** | Performance Digest | `(current − comparator) / comparator`, deterministic, emitted **alongside** — never instead of — the existing absolute `computed_variance_value`. Valid only when the comparator is non-null **and** non-zero; **undefined** (not zero, not `Infinity`, not silently omitted) against a zero base, signalled with the existing `comparator_zero_base` reason. **Distinct from a percentage-point delta** — see §5.5.1 | No percentage field exists in any contract |
 | **E‑2** | **Holdings ADR** | Holdings Position / Comparison | `SUM(Room_Revenue) / SUM(NoOfRooms)` — **never** `AVERAGE(ADR)` | **Formula already declared in `_PACE_METRIC_COLUMNS`**, which excludes the raw ADR column and defers computation to an execution layer |
 | **E‑3** | **Holdings occupancy** | Holdings Position / Comparison | governed `rooms ÷ rooms_available` | Both inputs are already governed pace outputs |
-| **E‑4** | **Digest `availableActions`** | Performance Digest | Publish two already-executable actions with declared domains | Digest publishes none today; `ACTION_REGISTRY` rule satisfied |
+| **E‑4** | **Digest interaction intents** | Performance Digest | Surface the two analytically-executable intents (change timeframe, change comparator) once a typed action contract exists. **Ids and payloads are not frozen here** (§17.2) | Digest publishes no actions today, and neither proposed id exists in either registry |
 | **E‑5** | **Structured quality codes** | all | Machine-readable code + human message, optional `metric_id` scope | Warnings are prose today, so per-metric suppression is impossible (4C §13.1) |
 
 None of these needs a new tool or a new model-selectable parameter. E‑1 through E‑4 are output-only.
@@ -862,11 +1005,49 @@ here.** For each `READY` capability, N07 will need at least these cases.
 | **Boundary window/date** | month-start and year-start for mtd/ytd | exactly 62 days ✅ and 63 ✗ | same | month boundary | exactly 92 days ✅ and 93 ✗ |
 | **Empty / no activity** | explicit governed empty envelope (`status: "empty"` / `NO_DATA`) — **distinct** from null metrics | no rows for the whole window | same | no categories | no rows in window |
 | **Partial quality** | `is_partial=true` with a warning | `surface_null` on some stay dates | same | parts do **not** reconcile → **share withheld** + quality raised | some points null |
-| **Comparison unavailable** | `comparator=none` (**not requested** ≠ missing); comparator value null; `comparator_zero_base` | comparator side fully unresolved | n/a — no comparator | comparator null per row | n/a in v1 |
+| **Comparison unavailable** | `comparator=none` (**not requested** ≠ missing); comparator value null; comparator exactly `0.0` → `comparator_zero_base` (see §22.2) | comparator side fully unresolved | n/a — no comparator | comparator null per row | n/a in v1 |
 | **Authorization scope invariant** | cross-hotel row → **fails closed**, other hotel's id never echoed; model-supplied `hotel_id` argument cannot change scope; no scope token/function key/`Hotel_ID` in any output | same | same | same | same |
 | **Domain-specific semantic blocker** | Avg Spend / Guest and Revenue POR **absent**, not zero (U‑1, U‑2) | holdings lineage thin (U‑4); ADR/occupancy **absent** until E‑2/E‑3 | same | `market_segment` → values + ranking, **no share** (U‑3) | non-enum metric rejected; `UNSUPPORTED` metric never admitted |
 
-### 22.2 Cross-cutting invariants every fixture set must assert
+### 22.2 C2 fixtures — absolute delta vs relative percentage variance
+
+**N07 must be able to build these as separate cases.** The two quantities are distinct governed values
+(§5.5.1); a fixture that carries only one, or that lets one be inferred from the other, is wrong.
+
+**Case A — a currency (or rate) metric, both quantities present**
+
+| Quantity | Value | Presentation meaning |
+|---|---|---|
+| current | `118246.0` | `$118,246` |
+| comparator (`last_year`) | `264061.0` | `$264,061` |
+| **absolute delta** | `−145815.0` | `−$145,815` — the metric's own unit |
+| **relative percentage variance** | `−0.552…` | `−55.2%` |
+
+**Case B — a percentage-unit metric, where the two diverge and must not be conflated**
+
+| Quantity | Value | Presentation meaning |
+|---|---|---|
+| current (`occupancy_pct`) | `0.84` | `84%` |
+| comparator | `0.80` | `80%` |
+| **absolute delta** | `0.04` | **`+4 pts`** — percentage *points*, because the metric's unit is a percentage |
+| **relative percentage variance** | `0.05` | **`+5%`** — a relative change |
+
+This is the single most important fixture in the C2 set: **+4 pts and +5% describe the same movement
+and are different numbers.** A validator that accepts one where the other belongs has not tested C2.
+
+**Cases C–E — the boundary states**
+
+| Case | `comparator` | Absolute delta | Relative percentage variance | Required governed signal |
+|---|---|---|---|---|
+| **C — zero base** | `0.0` (a real governed zero) | computed; equals `current` | **undefined — no number emitted** | `comparator_zero_base` |
+| **D — null base** | `null` (missing) | unavailable | unavailable | missing / `insufficient_data`; **null never becomes zero** |
+| **E — not requested** | `comparator = none` | not requested | not requested | absence **by choice**, distinct from missing |
+
+**Also required across the set:** a metric whose absolute delta is a real `0.0` (flat, not missing);
+and an assertion that the existing Revenue success shape and request schema are **unchanged** by E‑1,
+which is additive output only.
+
+### 22.3 Cross-cutting invariants every fixture set must assert
 
 1. **Null ≠ zero** — never interchangeable, in any direction, at any layer.
 2. **Reject, never clamp** — an out-of-range window produces a rejection, not a truncated answer.
@@ -890,7 +1071,7 @@ here.** For each `READY` capability, N07 will need at least these cases.
 | # | Decision | Resolution |
 |---|---|---|
 | **T5‑1** | Replace the Performance Digest? | **No.** It stays exactly as it is; C2 is an output extension only |
-| **T5‑2** | C2 percentage variance shape | **Output extension** — no new tool, no new parameter, governed computation, undefined against a zero/null base |
+| **T5‑2** | C2 percentage variance shape | **Output extension** — no new tool, no new parameter, governed computation, undefined against a zero/null base. **Additionally frozen (cleanup):** *absolute delta in the metric's own unit* and *relative percentage variance* are **two distinct governed quantities**, never interchangeable; for a percentage-unit metric the former is expressed in **percentage points** and the latter as a **relative percent** (§5.5.1) |
 | **T5‑3** | Trend window model | **Explicit `start_date`/`end_date`**, not a `days` count — a count is implicitly relative to "now" |
 | **T5‑4** | Trend maximum window | **92 days**, rejected not clamped. The 31-day snapshot ceiling is row-count driven and does not apply |
 | **T5‑5** | Trend metric enum | **Initial safe enum of five**, with four explicit expansion rules |
@@ -905,7 +1086,7 @@ here.** For each `READY` capability, N07 will need at least these cases.
 | **T5‑14** | Scenario | **Future.** Safe shape documented; approved categorical inputs only, no free text |
 | **T5‑15** | Evidence placement | **Supporting/internal, kept out of the analytical surface**, domain-agnostic, host-resolved active result |
 | **T5‑16** | Peer analytics | **Blocked.** Anonymous presentation does not grant access |
-| **T5‑17** | Digest `availableActions` | **Recommended addition** of two already-executable actions with a timeframe-aware comparator domain |
+| **T5‑17** | Digest interactions | Changing timeframe or comparator is **analytically executable today** by re-invoking the same capability. **Revised in cleanup:** the specific ids (`change_timeframe`, `change_comparator`) exist in **neither** action registry, so they are **proposed interaction intents** only — Task 5 freezes the analytical basis, not the typed action contract, which belongs to N14 / Gate 6 (§17) |
 | **T5‑18** | Initial surface size | **Five user-facing analytical capabilities plus one supporting** — derived, not fitted to a target number |
 | **T5‑19** | Implementation order | **C2 → Holdings Comparison → Holdings Position → Breakdown → Trend**, with Pickup and Scenario deferred; each placement justified by verified readiness |
 
@@ -919,7 +1100,8 @@ here.** For each `READY` capability, N07 will need at least these cases.
 | Whether Pickup joins a mode-parameterized Holdings capability | After Pickup semantics are signed off (§9.5) |
 | Trend metric enum beyond the initial five | Additive, per the §6.2 expansion rules |
 | Trend comparator series design | Future, with its own declared semantics |
-| Where percentage variance sits in the payload, and how the delta unit (percent vs points) is expressed | Task 4A packet work |
+| **Relative percentage variance — deferred only:** the exact field/property name, its exact placement in the future typed payload, and the exact metadata field used to communicate display unit | Task 4A packet work / N07 schema work. **The semantic distinction between absolute delta in metric units and relative percentage variance is NOT deferred — it is frozen in §5.5.1** |
+| Final typed interaction contract — exact action ids, event payload schemas, how an enum domain is expressed, and the execution mechanism | The later interaction task (N14 / Gate 6). Task 5 freezes only which interactions are analytically executable (§17.2) |
 | Final payload property names, casing convention, and typed-payload class shapes | Task 4A §22 |
 | Final fact-id syntax and which facts get addressable ids | Task 4A §9 |
 | Exact quality-code vocabulary | Grown from real conditions as capabilities land (E‑5) |
@@ -948,7 +1130,8 @@ Ask ARIEL Capability / Parameter Contract Check
 [ ] Weighted metrics (ADR, occupancy, share, avg spend) are governed, never averaged or UI-derived
 [ ] Null and zero remain distinct end to end
 [ ] Quality and provenance survive to presentation
-[ ] availableActions are published only when executable today, with declared domains
+[ ] An interaction is offered only when it is analytically executable, with a declared domain
+[ ] No existing action id is redefined with a new payload shape; proposed ids are marked proposed
 [ ] Actions are host-mediated and re-authorized; client state cannot alter authorization
 [ ] result_id is an identifier only; evidence targets the active authoritative result
 [ ] Evidence stays domain-agnostic and out of the analytical surface
