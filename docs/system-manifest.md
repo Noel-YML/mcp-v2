@@ -9,6 +9,7 @@ Companion documents:
 - [`docs/TRUSTED_VERTICAL_SLICE_BASELINE.md`](TRUSTED_VERTICAL_SLICE_BASELINE.md) — the frozen Revenue baseline: the 20 trust invariants, the file/test that guards each, and the PR regression checklist future work must pass
 - [`docs/EXPANSION_GUARDRAILS.md`](EXPANSION_GUARDRAILS.md) — the architecture contract for future expansion (new capabilities, packets, Skills, App components/templates, interactions): MUST/MUST NOT rules, the allowed-change matrix, and per-deliverable review checklists
 - [`docs/QUESTION_CAPABILITY_TAXONOMY.md`](QUESTION_CAPABILITY_TAXONOMY.md) — how hotel questions group into bounded governed capabilities: the inventory of what exists today, the question taxonomy, candidate capability boundaries, the capability map, and the recommended initial capability surface
+- [`docs/GOVERNED_RESULT_ARCHITECTURE.md`](GOVERNED_RESULT_ARCHITECTURE.md) — the result-contract architecture between governed analytical execution and any presentation layer: the current contract inventory, the common-envelope-plus-typed-payload recommendation, governed fact identity, quality/provenance survival, and the architecture decision table
 
 ---
 
