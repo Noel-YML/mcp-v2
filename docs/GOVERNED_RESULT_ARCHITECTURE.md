@@ -341,6 +341,130 @@ not be built:
 
 ---
 
+### 6.4 Implementation status — N05 foundation (built)
+
+The recommendation above is no longer only a proposal. The **envelope + first typed payload** exist in
+code, additively:
+
+| Module | Contents |
+|---|---|
+| `mcp/governed_result/contract.py` | `GovernedResultEnvelope[PayloadT]`, `MetricSet`, `GovernedMetric`, `MetricComparison`, `BusinessDateContext`, `GovernedQuality`, `ProvenanceSummary`, and the `payload_type` / `domain` / `question_type` / `ContextKind` literals. Standard library only |
+| `mcp/governed_result/projection.py` | `from_revenue_digest_result()` — the pure, non-computing projection, plus the declared `CAPABILITY_DESCRIPTORS` |
+| `mcp/tests/test_governed_result_contract.py`, `mcp/tests/test_governed_result_projection.py` | 52 tests |
+
+**What is deliberately *not* done:** `get_performance_digest`'s wire contract is untouched, nothing
+consumes the new envelope yet, and `RevenueDigestResult` / `AnalyticsResult` / `StoredResult` are
+unmodified. Only `payload_type = "metric_set"` is implemented; the other names in the literal are
+declared so the discriminator's domain is explicit, and constructing an envelope with one **raises**.
+
+**Three fields this document listed that the implementation omits**, because no current governed
+producer exists and a nullable placeholder would misrepresent availability:
+
+| Omitted | Why |
+|---|---|
+| `presentation hints` | `RevenueDigestResult` carries none; only the legacy `AnalyticsResult` has them. Inventing `compatibleVisualizations` for a `MetricSet` would be speculative |
+| `available_actions` | The digest publishes none, and no proposed action id exists in either action registry |
+| `hotel display name` | Absent from the digest result entirely. It belongs to trusted server context, not to an analytical result, so a projection cannot supply it without inventing it |
+
+**Wire format decision (pre-N07 interoperability review).** The envelope's public JSON keys are
+**camelCase**, following this repository's own established public convention rather than the new
+module's preference: `AnalyticsResult` states outright that its camelCase aliases *"are the actual
+wire contract"* while Python attribute names *"are never the tested surface"*, and `ToolError` and the
+Foundry-facing `AgentResponse` are camelCase too. `RevenueDigestResult` is snake_case only because
+`dataclasses.asdict()` happened to be its serializer — not a documented decision, and deliberately not
+propagated. camelCase is also the System.Text.Json default and the TypeScript idiom, so a C# DTO needs
+no per-member `[JsonPropertyName]`.
+
+Three consequences worth recording:
+
+- **Token *values* stay snake_case/lowercase.** Casing governs property names, not identifiers.
+  `timeframe`, `view`, `comparator`, `unit` and `query_id` values flow through from the trusted digest
+  and must not be rewritten, so `payloadType: "metric_set"` is the intended combination.
+- **The mapping is declared, not derived.** Each governed type has an explicit `to_wire()`; the
+  envelope no longer uses `asdict()`. A Python rename can therefore not silently change the external
+  contract, and a test asserts every dataclass field actually reaches the wire so the hand-written
+  mapping cannot drift behind the dataclasses.
+- **`to_json()` has no `default=` fallback**, so an unexpected type raises instead of being silently
+  stringified into the contract.
+
+**Versioning, stated for future OpenAPI/C# consumers.** `schemaVersion` is the version of *this*
+envelope schema. The delivery name "governed result packet v2" refers to this being the
+second-generation packet architecture; **"v2" never appears on the wire**. Because four unrelated
+contracts here each report `"1.0"`, a consumer identifies this one by the pair
+(`payloadType`, `schemaVersion`).
+
+Adding any of the three later is additive and does not break the envelope. Structured quality codes
+are likewise absent — `GovernedQuality` mirrors today's prose warnings exactly rather than redesigning
+quality in the same pass.
+
+### 6.5 Wire contract, schema and canonical fixtures (N07 — built)
+
+The JSON wire contract is now **project-owned and frozen** for the one implemented payload.
+
+| Artifact | Location |
+|---|---|
+| **Canonical JSON Schema** | `mcp/governed_result/wire/governed_result_envelope.schema.json` — Draft **2020-12**, `$id` = `urn:ask-ariel:schema:governed-result-envelope:1.0` |
+| **Canonical fixtures** (9 valid) | `mcp/governed_result/wire/fixtures/*.json` |
+| **Negative fixtures** (10) | `mcp/governed_result/wire/fixtures/invalid/*.json` |
+| **Semantic validator** | `mcp/governed_result/validation.py` — **standard library only** |
+| **Fixture regenerator** | `mcp/scripts/regenerate_governed_result_fixtures.py` |
+| **Tests** | `mcp/tests/test_governed_result_wire_freeze.py`, `mcp/tests/test_governed_result_validation.py` |
+
+**The `$id` is a URN, not an `https://` URL**, deliberately: inventing a hostname we do not control
+would imply a resolvable published schema that does not exist. The filename carries no "v2" — that is
+a project name and never appears on the wire.
+
+**`additionalProperties: false`, with a producer/consumer split.** A naive strict schema would
+contradict §15's rule that additive optional fields do not bump `schemaVersion`. The resolution is
+*be strict in what you send, liberal in what you accept*:
+
+- The schema is the **producer conformance** contract — Ask ARIEL's own output must contain exactly
+  these keys. That is what catches a snake_case key, a stray `hotelId`, or a typo.
+- **Consumers must ignore unknown fields** (System.Text.Json and TypeScript interfaces do so by
+  default). This is a documented consumer rule, not a schema rule.
+- When governed execution adds a field, it is added here, fixtures are regenerated, `schemaVersion`
+  stays `"1.0"`, and existing consumers keep working.
+
+**Two validation layers, and why both exist.** The schema owns shape and can even express the
+comparator cross-field invariant via root-level `if`/`then`/`else`. The stdlib validator exists for
+three things the schema cannot do: **uniqueness of `metricId`** (not expressible in 2020-12), specific
+actionable error messages, and validation at a runtime boundary **with no new dependency**. A test
+asserts the two layers agree on every fixture, and another pins duplicate-`metricId` as the one case
+only the validator catches. `jsonschema` is a **test-only** dependency (`mcp/requirements-dev.txt`).
+
+**Neither layer asserts arithmetic.** `absoluteVariance == value − comparison.value` is never checked
+anywhere. The projection is non-computing and must carry governed execution faithfully, so the
+`inconsistent_governed_variance` fixture — a governed variance that disagrees with a naive
+subtraction — is deliberately **valid**.
+
+**Fixtures are a freeze, not examples.** Valid fixtures are generated by the producer's own
+`to_dict()` with fixed opaque demo identity (no clock, no randomness), and a test asserts the on-disk
+files are byte-identical to a fresh build. A serialization change therefore fails loudly and has to be
+deliberate. No fixture contains a hotel id, scope token, session identifier, credential, DAX, or mart
+name — a test enforces that too.
+
+**Validation boundary.** Nothing consumes the envelope yet, so the validator is **not wired in** —
+attaching it to `get_performance_digest` would change nothing about that tool's trusted output while
+making every call pay to validate a contract no consumer reads. The requirement belongs downstream:
+**UI binding (N11) MUST validate a governed-result-v2 packet before consuming or rendering it.** The
+one existing non-user-facing boundary where it could later run without touching a published contract
+is a post-projection assertion inside `from_revenue_digest_result` — proposed, not implemented.
+
+**Only `metric_set` is implemented and frozen today.** `domain` and `questionType` are constrained to
+`const` values in the schema, because a frozen wire contract must not accept a token no producer can
+emit — even though the Python `Literal`s declare future members for typing honesty.
+
+**C# / TypeScript mapping note.** `schemaVersion`/`payloadType` → `string` (stable tokens);
+`businessDate` → `DateOnly` (`format: date`); `value`, `absoluteVariance`, `sourceVariance` →
+`double?` / `number | null`; `comparison` → a nullable object where `null` means *comparator not
+requested*; `warnings` → a **non-null** list, possibly empty. For the current contract JSON numbers
+are IEEE-754 values and map naturally to C# `double` / TypeScript `number` — the
+`floating_point_fidelity` fixture carries `0.18499999999999994` exactly. If a future monetary-precision
+requirement introduces a different numeric contract, that is an explicit versioned decision, not an
+assumption to make now.
+
+---
+
 ## 7. The common envelope
 
 `NON-NORMATIVE / ILLUSTRATIVE` — concepts, not final field names.

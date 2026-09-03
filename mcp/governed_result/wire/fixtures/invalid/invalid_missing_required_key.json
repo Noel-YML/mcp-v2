@@ -1,0 +1,52 @@
+{
+  "schemaVersion": "1.0",
+  "payloadType": "metric_set",
+  "domain": "hotel_performance",
+  "questionType": "performance",
+  "status": "success",
+  "queryId": "revenue_performance_digest_v1",
+  "queryVersion": "1",
+  "traceId": "0000trace0000demo",
+  "context": {
+    "kind": "business_date",
+    "businessDate": "2026-08-16",
+    "timeframe": "mtd",
+    "view": "headline",
+    "comparator": "last_year"
+  },
+  "quality": {
+    "isPartial": false,
+    "warnings": []
+  },
+  "provenance": {
+    "semanticModelRef": "dmr-v3"
+  },
+  "payload": {
+    "metrics": [
+      {
+        "metricId": "total_revenue",
+        "label": "Total Revenue",
+        "unit": "currency",
+        "value": 118246.0,
+        "sourceRowCount": 1,
+        "comparison": {
+          "value": 264061.0,
+          "absoluteVariance": -145815.0,
+          "sourceVariance": -145815.0
+        }
+      },
+      {
+        "metricId": "room_revenue",
+        "label": "Room Revenue",
+        "unit": "currency",
+        "value": 91101.0,
+        "sourceRowCount": 1,
+        "comparison": {
+          "value": 180000.0,
+          "absoluteVariance": -88899.0,
+          "sourceVariance": -88899.0
+        }
+      }
+    ]
+  }
+}
