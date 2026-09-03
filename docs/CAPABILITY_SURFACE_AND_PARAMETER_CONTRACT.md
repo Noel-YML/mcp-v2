@@ -762,8 +762,10 @@ There is no cross-product.**
 | any | `adr` · `occupancy_pct` · `revpar` | any | **NOT DECLARABLE** | — | A rate or non-additive percentage does not decompose additively across a dimension |
 | Hotel Performance | any revenue metric | `market_segment` \| `fnb_outlet` | **NOT DECLARABLE** | — | Wrong mart and wrong grain — a cross-product artefact, never a real question |
 
-**A breakdown may return values and ranking with no share column.** That is the required behaviour for
-`market_segment`, not a degraded mode (4C §5.2).
+**A breakdown may return values and ranking with no share column** — that is a legitimate result
+shape, not a degraded mode (4C §5.2). It is the behaviour that will be **required of `market_segment`
+once that pair is admitted**, and it is **not** a v1 request: `market_segment` is outside the declared
+v1 pair set and is rejected as an undeclared pair before execution (§16.1, I‑10; §16.2.1).
 
 ---
 
@@ -799,13 +801,29 @@ principle "a gap is always stated, never silently dropped").
 
 | # | Capability | Condition | What is returned | What is withheld, and why |
 |---|---|---|---|---|
-| **S‑1** | Breakdown | `breakdown = market_segment` | Category values **and** ranking — a complete, valid answer | **Share.** `segment.pct_of_total.mtd` is `SEMANTIC_ONLY`, its cross-mart denominator is described inconsistently in the registry, and it is therefore `SEMANTIC DEFINITION REQUIRED` (U‑3). Withheld until sign-off; the UI never derives it |
-| **S‑2** | Breakdown | the parts do not reconcile against the reconciled total | Values and ranking | **Share**, plus a quality condition is raised. The capability never emits a share it cannot stand behind |
-| **S‑3** | Performance | percentage variance before C2 ships | Absolute variance | **Relative percentage variance** — no field exists yet (§5.5) |
-| **S‑4** | Holdings | ADR / occupancy before E‑2 / E‑3 ship | The six governed pace metrics | **ADR and occupancy** — governed derivations not yet produced |
+| **S‑1** | Breakdown | the parts do not reconcile against the reconciled total | Values and ranking | **Share**, plus a quality condition is raised. The capability never emits a share it cannot stand behind |
+| **S‑2** | Performance | relative percentage variance before C2 ships | Absolute variance | **Relative percentage variance** — no field exists yet (§5.5) |
+| **S‑3** | Holdings | ADR / occupancy before E‑2 / E‑3 ship | The six governed pace metrics | **ADR and occupancy** — governed derivations not yet produced |
 
 **Requesting a suppressed feature is not an error.** There is no `share` request parameter to reject;
 share is simply present or absent according to governed semantics.
+
+#### 16.2.1 Future semantic-suppression rule — once `market_segment` is admitted
+
+**Not a current v1 behaviour, and not an N07 fixture.** In Breakdown v1, `breakdown = market_segment`
+is **outside the declared pair set and is rejected before execution** as an undeclared pair
+(§16.1, I‑10). It is not admitted by the v1 request schema, so it cannot reach a suppression rule.
+
+The rule below is recorded because it is already decided, and it becomes binding **at the moment a
+governed `market_segment` breakdown pair is explicitly admitted** — which requires its own review and
+depends on U‑3 and U‑6:
+
+| Condition | What may be returned | What must be withheld |
+|---|---|---|
+| A `market_segment` breakdown pair has been admitted, **and** the share denominator is still unsigned | Governed category values **and** governed ranking — a complete, valid answer | **Share.** `segment.pct_of_total.mtd` is `SEMANTIC_ONLY`, its cross-mart denominator is described inconsistently in the registry, and it is therefore `SEMANTIC DEFINITION REQUIRED` (U‑3). Withheld until sign-off — **and the UI must never derive it** |
+
+The same rule applies to `fnb_outlet` if a share is ever defined for it. **Admitting the pair and
+signing off the denominator are two separate steps**; neither implies the other.
 
 ### 16.3 Security invariants — not request validation
 
@@ -851,7 +869,7 @@ deterministic implementation exists.
 | `ACTION_REGISTRY` | `mcp/analytics/actions.py` | *"what the MCP tool result offers as follow-ups"* | **7** — `change_period`, `change_snapshot_window`, `show_revenue_snapshot`, `show_revenue_trend`, `show_segment_mix`, `show_fnb_performance`, `show_holdings_outlook` |
 | `ACTIONS` | `webchat/actions_registry.py` | *"what webchat itself is willing to render as a clickable button and knows how to turn into a next chat message"* | **5** — `change_period`, `show_revenue_trend`, `show_segment_mix`, `show_fnb_performance`, `show_holdings_outlook` |
 
-Three facts that constrain everything below, all verified:
+Four facts that constrain everything below, all verified:
 
 1. **The two sets differ.** `change_snapshot_window` and `show_revenue_snapshot` are in the MCP
    registry but **not** in webchat's clickable set. The modules say this divergence is intentional and
@@ -904,10 +922,12 @@ Backend work on capabilities that exist or are ready. **Not implemented here.**
 | **E‑1** | **Relative percentage variance** | Performance Digest | `(current − comparator) / comparator`, deterministic, emitted **alongside** — never instead of — the existing absolute `computed_variance_value`. Valid only when the comparator is non-null **and** non-zero; **undefined** (not zero, not `Infinity`, not silently omitted) against a zero base, signalled with the existing `comparator_zero_base` reason. **Distinct from a percentage-point delta** — see §5.5.1 | No percentage field exists in any contract |
 | **E‑2** | **Holdings ADR** | Holdings Position / Comparison | `SUM(Room_Revenue) / SUM(NoOfRooms)` — **never** `AVERAGE(ADR)` | **Formula already declared in `_PACE_METRIC_COLUMNS`**, which excludes the raw ADR column and defers computation to an execution layer |
 | **E‑3** | **Holdings occupancy** | Holdings Position / Comparison | governed `rooms ÷ rooms_available` | Both inputs are already governed pace outputs |
-| **E‑4** | **Digest interaction intents** | Performance Digest | Surface the two analytically-executable intents (change timeframe, change comparator) once a typed action contract exists. **Ids and payloads are not frozen here** (§17.2) | Digest publishes no actions today, and neither proposed id exists in either registry |
+| **E‑4** | **Digest interaction intents** | Performance Digest | **Deferred to N14 / Gate 6 — not part of the capability implementation slice.** Task 5 records only that changing timeframe or comparator is *analytically executable* by re-invoking this capability. Ids, payload schemas, enum-domain representation and execution mechanism are **not frozen here** (§17.2) | Digest publishes no actions today, and neither proposed id exists in either registry |
 | **E‑5** | **Structured quality codes** | all | Machine-readable code + human message, optional `metric_id` scope | Warnings are prose today, so per-metric suppression is impossible (4C §13.1) |
 
-None of these needs a new tool or a new model-selectable parameter. E‑1 through E‑4 are output-only.
+None of these needs a new tool or a new model-selectable parameter. E‑1, E‑2, E‑3 and E‑5 are
+governed-output work and are schedulable (§21). **E‑4 is not backend output work at all** — it is a
+typed interaction contract, and it is deferred (§21 note).
 
 ---
 
@@ -970,7 +990,7 @@ Derived from verified readiness and dependency, with a reason for each placement
 
 | Step | Work | Why here |
 |---|---|---|
-| **1** | **Performance Digest — E‑1 percentage variance** (+ E‑4 actions, E‑5 quality codes) | Lowest risk of anything on the list: **output-only**, no new tool, parameter, query or enum. It closes the single most-referenced presentation gap — percentage variance appears in both KPI cards *and* narrative — and until it lands the model has a standing incentive to divide. Touches the trusted slice, so it goes first while the surface is otherwise stable |
+| **1** | **Performance Digest — E‑1 relative percentage variance** (+ E‑5 structured quality codes) | Lowest risk of anything on the list: **output-only**, no new tool, parameter, query or enum. It closes the single most-referenced presentation gap — percentage variance appears in both KPI cards *and* narrative — and until it lands the model has a standing incentive to divide. Touches the trusted slice, so it goes first while the surface is otherwise stable. **E‑4 is deliberately not in this step** — see the note below |
 | **2** | **Holdings Comparison** — result contract + tool for `HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1` | **The hardest analytical work is already done and validated**: per-stay-date snapshot-resolution DAX, a reference implementation with a golden fixture, live acceptance, declared params, limits and quality rules. Remaining work is a payload type and a registration. Nothing else offers this ratio of value to remaining risk. *Caveat:* U‑4 means deep Evidence for holdings is thin until registry entries land — a provenance-quality gap, not a correctness blocker, and the provenance *summary* still survives |
 | **3** | **Holdings Position** | Reuses step 2's validated resolution machinery rather than the legacy single-global-`MAX` shortcut, and is the *current side* of the same shape. Building it after Comparison — not before — means the per-stay-date rule is already proven in production code. Carries E‑2/E‑3 (ADR, occupancy) for both capabilities |
 | **4** | **Metric Breakdown — `revenue_stream` only** | Entirely inside the revenue domain, which has 43 registry entries and complete lineage, so no upstream dependency gates it. `revenue_snapshot`'s row-per-group/type query is a close template and the reconciled-total-plus-share pattern already exists in the analytics layer. Unlocks Variance Drivers and, later, the Scenario Skill. Held to one dimension so the A-vs-B decision stays open (§7.1) |
@@ -978,6 +998,14 @@ Derived from verified readiness and dependency, with a reason for each placement
 | **6** | **Pickup / Pace** | **Deferred**, not scheduled. Needs a signed-off definition of "the previous snapshot" and confirmation of snapshot retention (U‑8) |
 | **7** | **Scenario capability + Skill** | **Future.** Depends on step 4 extended to `market_segment`, which depends on U‑3 and U‑6 |
 | **∥** | **Upstream track — U‑1…U‑8** | Runs in parallel, owned separately. U‑4 improves step 2/3's Evidence depth; U‑3 and U‑6 gate Breakdown's second dimension; U‑1 and U‑2 gate two target KPI cards |
+| **⊘** | **E‑4 typed interaction contract** | **Not scheduled by this order.** Deferred to the later interaction task (N14 / Gate 6) |
+
+> **Do not implement E‑4 action ids or payloads during N07 / N08.** Task 5 records only that the
+> underlying parameter changes (timeframe, comparator, window) are **analytically executable** by
+> re-invoking the relevant capability. The typed action ids, payload schemas, enum-domain
+> representation and execution mechanism are N14 / Gate 6 work (§17.2), and no existing action id may
+> be redefined with a new payload shape (§17.3). E‑4 remains a valid future interaction requirement —
+> it is deferred, not dropped.
 
 **Why not Trend before Holdings:** Trend has no built query, while Holdings Comparison's query is
 complete and independently reconciled. Readiness, not question popularity, sets the order.
@@ -1001,13 +1029,13 @@ here.** For each `READY` capability, N07 will need at least these cases.
 | **Governed zero** | a metric with a real `0.0` (e.g. other & misc) | a stay date with 0 rooms on books | same | a category with `0.0` and a real `0.0%` share | a point with value `0.0` |
 | **Null / missing** | `value: null`, `source_row_count: 0`, entry **retained** | stay date with no snapshot ≤ as-of → nulls, `source_row_count: 0` | same | a category row present with a null value | a **null point retained in position**, not dropped |
 | **Invalid parameter** | `date="2026-13-45"`, `"today"`, `""`, non-string | `stay_end < stay_start` | same | `metric` outside the enum | `end_date < start_date`; `metric` outside the enum |
-| **Invalid combination** | `day` + `budget`; `day` + `forecast` | — | — | undeclared `(metric, breakdown)` pair | — |
+| **Invalid combination** | `day` + `budget`; `day` + `forecast` | — | — | undeclared `(metric, breakdown)` pair — including **any** `breakdown` other than `revenue_stream` and **any** `metric` other than `total_revenue` in v1 | — |
 | **Boundary window/date** | month-start and year-start for mtd/ytd | exactly 62 days ✅ and 63 ✗ | same | month boundary | exactly 92 days ✅ and 93 ✗ |
 | **Empty / no activity** | explicit governed empty envelope (`status: "empty"` / `NO_DATA`) — **distinct** from null metrics | no rows for the whole window | same | no categories | no rows in window |
 | **Partial quality** | `is_partial=true` with a warning | `surface_null` on some stay dates | same | parts do **not** reconcile → **share withheld** + quality raised | some points null |
 | **Comparison unavailable** | `comparator=none` (**not requested** ≠ missing); comparator value null; comparator exactly `0.0` → `comparator_zero_base` (see §22.2) | comparator side fully unresolved | n/a — no comparator | comparator null per row | n/a in v1 |
 | **Authorization scope invariant** | cross-hotel row → **fails closed**, other hotel's id never echoed; model-supplied `hotel_id` argument cannot change scope; no scope token/function key/`Hotel_ID` in any output | same | same | same | same |
-| **Domain-specific semantic blocker** | Avg Spend / Guest and Revenue POR **absent**, not zero (U‑1, U‑2) | holdings lineage thin (U‑4); ADR/occupancy **absent** until E‑2/E‑3 | same | `market_segment` → values + ranking, **no share** (U‑3) | non-enum metric rejected; `UNSUPPORTED` metric never admitted |
+| **Domain-specific semantic blocker** | Avg Spend / Guest and Revenue POR **absent**, not zero (U‑1, U‑2) | holdings lineage thin (U‑4); ADR/occupancy **absent** until E‑2/E‑3 | same | **`market_segment` is rejected as an undeclared pair in v1** — it is *not* a values-and-ranking case. The future no-share rule (§16.2.1) is **not** a v1 fixture | non-enum metric rejected; `UNSUPPORTED` metric never admitted |
 
 ### 22.2 C2 fixtures — absolute delta vs relative percentage variance
 
@@ -1078,7 +1106,7 @@ which is additive output only.
 | **T5‑6** | Trend comparator | **Explicit absence in v1** — only `last_year` has a day-grain measure, so the invalid region would exceed the valid one |
 | **T5‑7** | Trend null points | **Retained in position** — never dropped, interpolated, or zeroed |
 | **T5‑8** | Breakdown A-vs-B | **Not frozen. Smallest safe initial surface chosen instead**: one capability, `revenue_stream` only, compatible with either future. Decision criterion for A-vs-B recorded |
-| **T5‑9** | Breakdown share | **Governed and domain-conditional.** Approved for `revenue_stream`; withheld for `market_segment`; withheld plus a quality condition when parts do not reconcile |
+| **T5‑9** | Breakdown share | **Governed and domain-conditional.** Approved for `revenue_stream`; withheld plus a quality condition when parts do not reconcile. For `market_segment` the share stays withheld pending U‑3 — **but that pair is not admitted by the v1 request schema at all**, so the withholding rule is future behaviour (§16.2.1), not a v1 response |
 | **T5‑10** | Holdings one capability or siblings | **Siblings** — Position and Comparison. Grounded in the pace definition's own words, Pickup's different resolution, and Position needing no comparator |
 | **T5‑11** | Holdings future-`as_of_date` policy | **No wall-clock check.** The DAX already never selects a later snapshot; unresolved stay dates surface null; a materially older effective snapshot raises a quality condition |
 | **T5‑12** | Holdings ADR / occupancy | **Governed output extensions with declared formulas** (E‑2 already specified in code). Never UI-computed, never averaged |
@@ -1086,7 +1114,7 @@ which is additive output only.
 | **T5‑14** | Scenario | **Future.** Safe shape documented; approved categorical inputs only, no free text |
 | **T5‑15** | Evidence placement | **Supporting/internal, kept out of the analytical surface**, domain-agnostic, host-resolved active result |
 | **T5‑16** | Peer analytics | **Blocked.** Anonymous presentation does not grant access |
-| **T5‑17** | Digest interactions | Changing timeframe or comparator is **analytically executable today** by re-invoking the same capability. **Revised in cleanup:** the specific ids (`change_timeframe`, `change_comparator`) exist in **neither** action registry, so they are **proposed interaction intents** only — Task 5 freezes the analytical basis, not the typed action contract, which belongs to N14 / Gate 6 (§17) |
+| **T5‑17** | Digest interactions | Changing timeframe or comparator is **analytically executable today** by re-invoking the same capability. **Revised in cleanup:** the specific ids (`change_timeframe`, `change_comparator`) exist in **neither** action registry, so they are **proposed interaction intents** only — Task 5 freezes the analytical basis, not the typed action contract, which belongs to N14 / Gate 6 (§17). **E‑4 is therefore not part of the implementation order** (§21) |
 | **T5‑18** | Initial surface size | **Five user-facing analytical capabilities plus one supporting** — derived, not fitted to a target number |
 | **T5‑19** | Implementation order | **C2 → Holdings Comparison → Holdings Position → Breakdown → Trend**, with Pickup and Scenario deferred; each placement justified by verified readiness |
 
