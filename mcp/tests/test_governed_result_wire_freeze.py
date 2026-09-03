@@ -296,6 +296,116 @@ def test_no_governed_status_or_presentation_or_actions_key_is_frozen_in():
             assert forbidden not in flat, f"{path.name} contains {forbidden}"
 
 
+def test_the_governed_envelope_has_no_agent_narrative_section():
+    """N06's central boundary: the governed packet must not contain an AGENT
+    NARRATIVE SECTION or agent-authored interpretation.
+
+    This protects OWNERSHIP, not English vocabulary. It bans only concepts that
+    are unambiguously agent-authored interpretation and have no governed
+    meaning - a narrative section, an insight, an observation, a
+    recommendation, a headline, chip wording.
+
+    It deliberately does NOT ban generic metadata names such as `message`,
+    `code`, `text` or `title`, even though `AgentResponse` also uses some of
+    them. GOVERNED_RESULT_ARCHITECTURE.md's recommended future structured
+    quality shape is `quality.entries[] = {code, message, metricId}` - that
+    `message` is governed metadata emitted by analytical execution, not
+    narrative, and a vocabulary ban would make the documented architecture
+    impossible. What matters is who PRODUCES a field, not what English word
+    names it. See the forward-compatibility test below.
+    """
+    agent_authored_concepts = (
+        "narrative",
+        "agentresponse",
+        "agent_response",
+        "insight",
+        "insights",
+        "observation",
+        "observations",
+        "recommendation",
+        "recommendations",
+        "headline",
+        "chipwording",
+        "chip_wording",
+        "commentary",
+    )
+    for name in _VALID_NAMES:
+        packet = _load(_FIXTURE_DIR / f"{name}.json")
+
+        def walk(node, path="$"):
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    assert key.lower() not in agent_authored_concepts, (
+                        f"{name}: {path}.{key} is an agent-authored interpretation concept - "
+                        "narrative belongs to AgentResponse, never to the governed packet"
+                    )
+                    walk(child, f"{path}.{key}")
+            elif isinstance(node, list):
+                for index, child in enumerate(node):
+                    walk(child, f"{path}[{index}]")
+
+        walk(packet)
+
+
+def test_future_structured_quality_metadata_is_not_blocked_by_the_narrative_rule():
+    """Forward-compatibility guard on the test above, so it cannot quietly grow
+    into a vocabulary ban.
+
+    GOVERNED_RESULT_ARCHITECTURE.md recommends that structured quality
+    eventually carry `entries[] = {code, message, metricId}`. That is governed
+    metadata with a governed producer. This test asserts the narrative rule
+    accepts it - if someone later adds `message` to the banned list, this fails
+    and says why.
+    """
+    documented_future_quality = {
+        "isPartial": True,
+        "warnings": ["No physical row found for governed metric 'guests' at the requested date."],
+        "entries": [
+            {
+                "code": "missing_canonical_metric_row",
+                "message": "No physical row found for governed metric 'guests' at the requested date.",
+                "metricId": "guests",
+            }
+        ],
+    }
+
+    agent_authored_concepts = (
+        "narrative", "agentresponse", "agent_response", "insight", "insights",
+        "observation", "observations", "recommendation", "recommendations",
+        "headline", "chipwording", "chip_wording", "commentary",
+    )
+
+    def keys(node):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                yield key
+                yield from keys(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from keys(child)
+
+    offending = [k for k in keys(documented_future_quality) if k.lower() in agent_authored_concepts]
+    assert offending == [], (
+        f"the narrative rule rejects documented future governed metadata {offending} - it must "
+        "protect ownership, not ban generic metadata names like 'message'"
+    )
+
+
+def test_metric_and_comparison_objects_carry_no_free_text_field_today():
+    """The narrow, targeted version of "analytical objects must not acquire
+    agent-authored free text".
+
+    Rather than banning words globally, this pins the exact key sets of the two
+    ANALYTICAL objects. Adding any field to them - free text or otherwise -
+    fails here and has to be a deliberate, reviewed change with a named
+    deterministic producer. `label` is the one governed display string, and it
+    is governed metadata, not narrative.
+    """
+    metric = _load(_FIXTURE_DIR / "success_standard.json")["payload"]["metrics"][0]
+    assert set(metric) == {"metricId", "label", "unit", "value", "sourceRowCount", "comparison"}
+    assert set(metric["comparison"]) == {"value", "absoluteVariance", "sourceVariance"}
+
+
 def test_json_round_trip_is_stable():
     for name in _VALID_NAMES:
         raw = (_FIXTURE_DIR / f"{name}.json").read_text(encoding="utf-8")
