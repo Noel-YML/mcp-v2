@@ -11,6 +11,7 @@ Companion documents:
 - [`docs/QUESTION_CAPABILITY_TAXONOMY.md`](QUESTION_CAPABILITY_TAXONOMY.md) — how hotel questions group into bounded governed capabilities: the inventory of what exists today, the question taxonomy, candidate capability boundaries, the capability map, and the recommended initial capability surface
 - [`docs/GOVERNED_RESULT_ARCHITECTURE.md`](GOVERNED_RESULT_ARCHITECTURE.md) — the result-contract architecture between governed analytical execution and any presentation layer: the current contract inventory, the common-envelope-plus-typed-payload recommendation, governed fact identity, quality/provenance survival, and the architecture decision table
 - [`docs/RESULT_UI_MAPPING_CONTRACT.md`](RESULT_UI_MAPPING_CONTRACT.md) — the governed result ↔ UI component mapping contract: per-component ownership and data requirements, value/quality/provenance state mapping, the rendering-only allowlist, action and evidence flows, and the review checklist
+- [`docs/CAPABILITY_SURFACE_AND_PARAMETER_CONTRACT.md`](CAPABILITY_SURFACE_AND_PARAMETER_CONTRACT.md) — the frozen bounded capability surface: exact parameter contracts and enums per capability, declared pair and invalid-combination matrices, parameter ownership (model-selectable vs server-injected), availableActions, governed output extensions, implementation order, and canonical-fixture requirements
 
 ---
 
