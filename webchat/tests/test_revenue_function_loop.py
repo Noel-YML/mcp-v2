@@ -108,3 +108,40 @@ def test_summarize_response_result_id_is_none_when_no_prior_result_exists():
     final = message_response("resp_2", agent_json())
     result = server._summarize_response(final, last_analytics_result=None, last_result_id=None)
     assert result["result_id"] is None
+
+
+def test_a_tool_name_outside_the_allowlist_is_refused_and_never_reaches_mcp(monkeypatch):
+    """Baseline invariant 6/7 at the BROKER layer: `FUNCTION_TOOL_NAMES` is
+    the fixed allowlist of tools webchat will execute on the model's behalf,
+    and a name outside it must be refused locally - never brokered to MCP,
+    and never turned into an ad hoc analytical execution path. The MCP
+    server's own registry (mcp/tests/test_apps_registration.py,
+    test_tool_scope_enforcement.py) and the agent's published tool surface
+    (test_f1_agent_tool_surface.py) are both already asserted; this covers
+    the runtime path between them, which nothing else exercised.
+    """
+    calls = []
+    monkeypatch.setattr(server, "_call_mcp_tool", lambda *a: calls.append(a) or "{}")
+    monkeypatch.setattr(server._client.responses, "create", lambda **kwargs: message_response("resp_2", agent_json()))
+
+    initial = function_call_response("resp_1", "execute_dax", {"dax": "EVALUATE mart_dmr_revenue_matrix"})
+
+    server._run_function_call_loop(initial, hotel_id=39, session_id="sess-a", last_result_id=None)
+
+    assert calls == [], "a tool outside FUNCTION_TOOL_NAMES must never be brokered to the MCP server"
+
+
+def test_a_refused_tool_never_establishes_or_changes_the_authoritative_result_id(monkeypatch):
+    """The refusal path must also be inert for continuation state - a
+    rejected tool call cannot mint, advance, or clear the conversation's
+    governed result_id."""
+    monkeypatch.setattr(server, "_call_mcp_tool", lambda *a: json.dumps({"status": "success", "result_id": "res_dddddddddddddddd"}))
+    monkeypatch.setattr(server._client.responses, "create", lambda **kwargs: message_response("resp_2", agent_json()))
+
+    initial = function_call_response("resp_1", "run_sql", {"sql": "select * from revenue"})
+
+    _, _, last_result_id = server._run_function_call_loop(
+        initial, hotel_id=39, session_id="sess-a", last_result_id="res_aaaaaaaaaaaaaaaa",
+    )
+
+    assert last_result_id == "res_aaaaaaaaaaaaaaaa"

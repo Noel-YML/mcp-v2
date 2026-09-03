@@ -133,9 +133,22 @@ The DMR semantic model is a star schema. The pieces that matter to this flow:
 
 ### No generic DAX executor
 
-`dmr/dax_query_builder.py` has a single `build()` entry point that raises immediately if it is not
-handed a verified `ScopeContext`. The LLM cannot reach DAX, cannot author DAX, and has no tool that
-accepts DAX.
+`dmr/dax_query_builder.py` exposes exactly **two** entry points, and both refuse to produce a query
+without a verified `ScopeContext`:
+
+| Entry point | Serves | Dispatches on |
+|---|---|---|
+| `build(spec, scope)` | the five **legacy DMR reports** (revenue trend, revenue snapshot, segment mix, F&B performance, holdings outlook) | `spec.report` (`Report` enum) |
+| `build_named(query_id, request, scope)` | the **governed named queries**, including Revenue Performance Digest | `query_id` (`QueryId` enum) |
+
+They are deliberately separate rather than folded together: the legacy reports are
+`QuerySpec`/`REPORT_DEFINITIONS`-shaped, while a named query carries its own declared params, limits,
+and comparator semantics from `NAMED_QUERY_DEFINITIONS`. **Revenue work belongs on the `build_named`
+path** — a new governed capability adds a `QueryId`, never a new branch or free-form parameter on the
+legacy `build()` path.
+
+Neither entry point accepts query text. The LLM cannot reach DAX, cannot author DAX, and has no tool
+that accepts DAX.
 
 ### Named queries
 
@@ -261,16 +274,35 @@ MCP protocol `2026-07-28` over **Streamable HTTP** (`mcp==2.0.0`). A fresh short
 opened **per call** — headers are never mutated on a shared client, which is what prevents one
 hotel's token leaking into a concurrent session's request.
 
+On the server side this is the MCP SDK's own ASGI application: `function_app.py` builds
+`streamable_http_app(streamable_http_path="/api/mcp", json_response=True, stateless_http=True, …)`
+and serves it through Azure Functions' `AsgiMiddleware` behind a single `FUNCTION`-auth route.
+`stateless_http=True` because no in-process MCP session affinity can be assumed across Function
+worker instances. The app is constructed with `TransportSecuritySettings(enable_dns_rebinding_protection=True,
+allowed_hosts=["ariel-mcp-server-v2.azurewebsites.net"], allowed_origins=[])` — no wildcard host, and
+an empty origin allowlist because the only legitimate callers (the web app, the acceptance harness)
+are server-to-server and never send an `Origin` header at all.
+
 ### Step 6 — MCP validates scope and executes
 
-1. `_resolve_scope` extracts `X-Ariel-Scope` from the transport headers, and **rejects any transport
-   other than `http-streamable`** — on the legacy SSE transport those headers would be the
-   long-lived handshake's, not this call's.
-2. The JWT is verified against `ARIEL_SCOPE_PUBLIC_KEYS` (a fixed `kid` → PEM map). Bad signature,
-   expired, wrong audience, or unknown `kid` → fail closed.
+1. Inside the tool, `dmr_tools.resolve_scope_from_ctx(ctx, public_keys, tool_name)` reads
+   `X-Ariel-Scope` from the MCP `Context.headers` of **this** request (matched case-insensitively).
+   Because the deployed hosting is Streamable HTTP, those are the current call's own real HTTP
+   headers, forwarded faithfully into the ASGI scope — not a long-lived handshake's. Both Revenue
+   tools and all five DMR tools call this one shared resolver; there is no second JWT verifier
+   anywhere in the codebase.
+2. It delegates to `scope_token.verify_detailed`, which checks the JWT against
+   `ARIEL_SCOPE_PUBLIC_KEYS` (a fixed `kid` → PEM map) plus issuer, audience, algorithm, lifetime
+   ceiling, and the required `dmr:read` permission. Bad signature, expired, wrong audience, unknown
+   `kid`, or missing permission → fail closed, and the caller always receives the **same** generic
+   `PERMISSION_DENIED` message regardless of which check failed (the more specific
+   expired-vs-invalid classification goes only to the audit log).
 3. The verified `hotel_id` becomes a `ScopeContext` and is **injected** into the query builder. It
    was never a tool argument.
-4. `dax_query_builder.build()` produces deterministic DAX for `REVENUE_PERFORMANCE_DIGEST_V1`.
+4. `dax_query_builder.build_named(QueryId.REVENUE_PERFORMANCE_DIGEST_V1, request, scope)` produces
+   deterministic DAX — the named-query path, not the legacy `build()` path the five DMR reports use
+   (see "No generic DAX executor" above). It validates the request against the query's declared
+   limits and comparator semantics before emitting anything.
 5. `FabricQueryService` POSTs to `executeQueries` using the service-principal token. The HTTP layer
    is hardened: a pooled `requests.Session`; up to **3 attempts total** (`total=2`); retries only on
    429/500/502/503/504 and connect-level failures; **`read=0` deliberately**, because a read timeout
@@ -279,7 +311,10 @@ hotel's token leaking into a concurrent session's request.
    timeouts. Worst case is roughly 91 s, comfortably under `host.json`'s 150 s `functionTimeout`.
    The response body is streamed and size-capped **while reading**, never by trusting a
    `Content-Length` header.
-6. Every returned row's `Hotel_ID` is verified against scope before anything is handed back.
+6. Every returned row's projected `HotelId` field is compared against `scope.hotel_id` from the
+   verified `ScopeContext`, per governed metric, before anything is handed back. A mismatch fails
+   closed as a sanitized data-integrity error — the offending hotel id is written to the internal log
+   only, never echoed to the caller.
 7. Deterministic shaping into the governed envelope:
 
 ```json
