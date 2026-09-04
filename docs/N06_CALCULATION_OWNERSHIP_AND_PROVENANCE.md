@@ -52,12 +52,18 @@ added.
 | `resultId` | `analytics.contract.new_result_id()`, server-side. **Identity only, never authorization** |
 | `queryId` · `queryVersion` | `dmr.named_queries.QueryId` and its derived `.version` |
 | `traceId` | `fabric_client.result.new_trace_id()` |
+| `recommendedPresentation` | `CAPABILITY_DESCRIPTORS` — **class D, not B**: declarative rendering only. See §12.3 |
 
 ### Context — all class B
 
 `kind` (contract literal) · `businessDate` (request echo, strict-parsed, **never coerced, never
 defaulted to today**) · `timeframe` · `view` · `comparator` (request echoes, `Literal`-constrained at
 the tool boundary).
+
+A `date_range` context (trend) carries `startDate` · `endDate` · `grain` · `comparator` on the same
+terms. It is a **separate type**, not a nullable extension of the business-date one: a trend's
+resolved period is a range, and overloading `businessDate` into "the last date in the window" is how a
+typed temporal model quietly becomes a generic one.
 
 ### Quality — all class B
 
@@ -79,8 +85,11 @@ second hand-typed copy.
 | `value` | **A** | Fabric via `execute_revenue_performance_digest` |
 | `sourceRowCount` | B | governed row count — lets a consumer see *why* a value is missing |
 | `comparison` present/absent | B | structural, derived from `context.comparator` |
+| `comparison.state` | B | structural — which of the three requested outcomes occurred. See §12.2 |
 | `comparison.value` | **A** | governed comparison measure |
-| `comparison.absoluteVariance` | **A** | `revenue_digest_execution.py` — `value - comparison_value`, the single authoritative variance |
+| `comparison.absoluteVariance` | **A** | `revenue_digest_execution.py` — `value - comparison_value`, the single authoritative variance, in the metric's **own unit** |
+| `comparison.variancePct` | **A** | `revenue_digest_execution.compute_variance_pct` — the governed **relative** change, a different quantity. See §12.1 |
+| `comparison.variancePctReason` | B | bounded token saying why a computable percentage is null. See §12.2 |
 | `comparison.sourceVariance` | **A** | the mart's own `Value_Vs_*` column |
 
 ### Narrative — `AgentResponse` (a separate contract, in a separate package)
@@ -219,7 +228,6 @@ field would misrepresent availability.
 
 | Value | Why absent | Unblocked by |
 |---|---|---|
-| **`variancePct`** (relative percentage variance) | No governed producer. Distinct from `absoluteVariance`: for a percentage-unit metric, 0.84 vs 0.80 is **+4 percentage points** absolutely and **+5%** relatively | E‑1 / C2, an output-only extension |
 | **Governed status** (Healthy / At Risk) | No governed producer. A threshold applied outside governed execution is a business classification wearing a style attribute | An explicit governed status field |
 | **Avg Spend / Guest** | **No semantic-registry key of any kind** — excluded from R1 for lack of a governed mapping | Upstream semantic work |
 | **Revenue POR** | Same | Upstream semantic work |
@@ -275,5 +283,77 @@ added** — fields such as `ownership: "governed"` or `computationOwner: …` wo
 structure and the tests above do not already enforce, and would invite the "derived from governed
 packet" tier this model exists to prevent.
 
-**N06 is closed.** The next analytical value to enter a governed packet is `variancePct` via E‑1, and
-§9 is the gate it must pass.
+**N06 is closed, and re-confirmed at Gate 3.** `variancePct` — which §8 previously listed as
+deliberately unbuilt — has since entered the governed packet, and it did so by passing the §9 gate
+rather than around it: see §12. Nothing else about the four-class model changed.
+
+
+---
+
+## 12. Gate 3 addendum — the values packet v2 added, and how they were classified
+
+Packet v2 (`schemaVersion` `"2.0"`) introduced four new fields. Each was put through §9's gate before
+it was allowed in, and each is recorded here with its class and its named deterministic producer. The
+four-class model is unchanged; no fifth "derived from governed packet" tier was introduced, and no
+per-field runtime ownership metadata was added.
+
+### 12.1 `comparison.variancePct` — CLASS A (governed analytical value)
+
+| §9 gate | Answer |
+|---|---|
+| Named deterministic producer? | `revenue_digest_execution.compute_variance_pct` — the governed execution module that already owns `value − comparison_value` |
+| Computed inside governed execution? | Yes. The projection **calls** that function; it does not restate the formula. `test_variance_pct_is_delegated_to_the_governed_owner_not_computed_here` asserts equality against the owner, so an inlined divergent division fails |
+| Undefined behaviour stated? | Yes. Comparator exactly `0` → **no division**, `variancePct: null`, `variancePctReason: "comparator_zero_base"`, absolute variance preserved. Never `0`, never `Infinity`, never omitted |
+| Distinct from what already exists? | Yes, and this is the reason it needed its own field rather than a consumer's division. `absoluteVariance` is a delta in the metric's **own unit** — percentage POINTS for a percentage-unit metric — while `variancePct` is a **relative** change. 0.985 vs 0.80 is **+18.5 points** and **+23.1%**; neither is inferable from the other |
+
+**Scale is part of the contract**: a 0–1 fraction, matching this repository's existing `percentage`
+unit convention (`mcp/apps/revenue/src/format.ts` documents `occupancy_pct` as a fraction, not an
+already-scaled 0–100 number). **Denominator is the comparator's magnitude**, so the sign of
+`variancePct` always agrees with the sign of `absoluteVariance` — a signed negative base would
+otherwise report an improvement from −100 to −50 as −50%.
+
+§4 is unchanged and still binding: **relative percentage variance remains forbidden outside governed
+execution.** Its existence as a governed field is precisely what removes the standing incentive for
+the agent, the BFF, the MCP App or the browser to divide — it is now supplied, so deriving it is
+never necessary and never permitted.
+
+### 12.2 `comparison.state` and `comparison.variancePctReason` — CLASS B (governed metadata)
+
+Neither is a business number. `state` names which of the three requested-comparator outcomes occurred
+(`available` / `unavailable` / `unsupported`), and `variancePctReason` names why a percentage that
+could have been computed was not (`comparator_zero_base` / `insufficient_data`). Both are emitted by
+deterministic analytical execution and both are **bounded token sets**, not free text.
+
+They exist for the same reason `sourceRowCount` does: so a consumer can see *why* a value is absent
+without guessing. `state == "available"` **if and only if** `value is not null`, enforced in the
+contract, the schema and the validator — the two can never disagree, and a consumer never has to infer
+intent from a null.
+
+### 12.3 `recommendedPresentation` — CLASS D (rendering-only)
+
+The one field in v2 that is not analytical at all. It is a single token from a bounded registry
+(`performance` | `trend` | `breakdown`), **declared per capability** in `CAPABILITY_DESCRIPTORS`, not
+chosen per result and never chosen by the model.
+
+It stays class D because it carries no business fact: no HTML, no CSS, no chart configuration, no
+template identifier, no model-authored content, and **a consumer that ignores it must still render a
+correct result**. An unknown token fails validation rather than reaching a renderer, and mapping a
+token to an allowlisted rendering resource is a later deliverable that this field does not
+pre-empt.
+
+This is the field most at risk of drifting into class A later — a presentation token that started
+encoding a threshold, an emphasis or a verdict would be a business classification wearing a style
+attribute, which §8 already names as the reason governed status stays out. The bounded registry and
+the "ignoring it still renders correctly" rule are what hold that line.
+
+### 12.4 `breakdown.rows[].share` and `reconciledTotal` — CLASS A, and why the total travels
+
+Both are governed analytical values on the (contract-only) breakdown payload. `reconciledTotal` is
+stated on the payload **so that no consumer ever computes `value / total`** — that division is
+precisely how a presentation layer becomes an analytical one. A null `share` where share is not
+semantically approved for the dimension is a legitimate governed answer, not a degraded one, and a
+consumer must not fill it in.
+
+`TimeSeries` carries **no** summary statistics — no high, low, mean, range, slope or growth rate — for
+the same reason. If one is ever wanted it becomes a governed output field passing §9's gate, never a
+rendering step.

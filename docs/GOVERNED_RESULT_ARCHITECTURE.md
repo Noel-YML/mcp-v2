@@ -341,30 +341,103 @@ not be built:
 
 ---
 
-### 6.4 Implementation status — N05 foundation (built)
+### 6.4 Implementation status — N05 foundation (built, packet v2 / `schemaVersion` `"2.0"`)
 
-The recommendation above is no longer only a proposal. The **envelope + first typed payload** exist in
-code, additively:
+The recommendation above is no longer only a proposal. The **envelope + three typed payloads** exist
+in code, additively:
 
 | Module | Contents |
 |---|---|
-| `mcp/governed_result/contract.py` | `GovernedResultEnvelope[PayloadT]`, `MetricSet`, `GovernedMetric`, `MetricComparison`, `BusinessDateContext`, `GovernedQuality`, `ProvenanceSummary`, and the `payload_type` / `domain` / `question_type` / `ContextKind` literals. Standard library only |
+| `mcp/governed_result/contract.py` | `GovernedResultEnvelope[PayloadT]`; the payloads `MetricSet` / `TimeSeries` / `Breakdown` and their members `GovernedMetric`, `MetricComparison`, `SeriesPoint`, `BreakdownRow`; the temporal contexts `BusinessDateContext` and `DateRangeContext`; `GovernedQuality`, `ProvenanceSummary`; and the `payload_type` / `domain` / `question_type` / `ContextKind` / `PresentationHint` / `ComparisonState` literals. Standard library only |
 | `mcp/governed_result/projection.py` | `from_revenue_digest_result()` — the pure, non-computing projection, plus the declared `CAPABILITY_DESCRIPTORS` |
-| `mcp/tests/test_governed_result_contract.py`, `mcp/tests/test_governed_result_projection.py` | 52 tests |
+| `mcp/revenue_digest_execution.py` | `compute_variance_pct()` — the governed owner of the relative-change formula, beside the `value − comparison_value` it already owned |
+| `mcp/tests/test_governed_result_contract.py`, `mcp/tests/test_governed_result_projection.py` | 80 tests |
 
-**What is deliberately *not* done:** `get_performance_digest`'s wire contract is untouched, nothing
-consumes the new envelope yet, and `RevenueDigestResult` / `AnalyticsResult` / `StoredResult` are
-unmodified. Only `payload_type = "metric_set"` is implemented; the other names in the literal are
-declared so the discriminator's domain is explicit, and constructing an envelope with one **raises**.
+**Three question-family shapes on one envelope.** N05's claim was that a common envelope serves more
+than one analytical question family, and that is now demonstrated rather than asserted: a `metric_set`
+(family A/D₁, performance), a `time_series` (family B, trend) and a `breakdown` (family C) differ only
+in `payloadType`, `context` and `payload`. Every governed identity, quality and provenance field is
+byte-identical across the three, and a test asserts the envelope's key set does not vary by payload.
 
-**Three fields this document listed that the implementation omits**, because no current governed
+**What is deliberately *not* done:**
+
+- `get_performance_digest`'s wire contract is **untouched**, and `RevenueDigestResult` /
+  `AnalyticsResult` / `StoredResult` are unmodified.
+- **Nothing consumes the new envelope.** No MCP tool emits it, no Foundry tool exposes it, and the
+  agent surface is unchanged.
+- **Only `metric_set` has a live producer.** `time_series` and `breakdown` are frozen CONTRACT shapes
+  with synthetic canonical fixtures — there is no capability behind them, and building one is N08+.
+- `holdings_position`, `scenario_result` and `variance_decomposition` remain declared-but-undefined so
+  the discriminator's domain is explicit; constructing one **raises**.
+
+**Why `schemaVersion` moved `"1.0"` → `"2.0"`.** v2 adds three *required* keys — `state`,
+`variancePct` and `variancePctReason` on a comparison, plus `recommendedPresentation` on the envelope
+— and two further payload families. New required keys are a breaking change under §15, so the version
+moves rather than staying put. **Correction to the previous statement in this section:** it used to
+read that *"v2 never appears on the wire"*, on the basis that "packet v2" was only a delivery name.
+That is no longer true — the schema version now literally *is* `"2.0"`, and the delivery name and the
+wire version coincide. A consumer still identifies this contract by the pair
+(`payloadType`, `schemaVersion`), because several unrelated contracts here report a version of their
+own.
+
+**Governed relative percentage variance (E‑1 / C2), now implemented in the envelope.** This closes the
+gap §6.4 previously recorded as absent, and it is implemented the way §5.5.1 of the capability
+contract froze it:
+
+- `absoluteVariance` is a delta **in the metric's own unit** — percentage POINTS for a
+  percentage-unit metric. `variancePct` is a **relative** change. They are two distinct governed
+  quantities and neither is inferable from the other; both travel, and the `floating_point_fidelity`
+  fixture carries a case (0.985 vs 0.80 → +18.5 pts, +23.1%) that makes the difference explicit.
+- **Scale:** a 0–1 fraction, matching this repository's existing `percentage` unit convention
+  (`mcp/apps/revenue/src/format.ts` documents `occupancy_pct` as a fraction, not an already-scaled
+  0–100 number). +5% is `0.05`.
+- **Denominator:** the *magnitude* of the comparator, so the sign of `variancePct` always agrees with
+  the sign of `absoluteVariance`. A signed negative base would otherwise report an improvement from
+  −100 to −50 as −50%.
+- **Denominator zero:** no division is performed. `variancePct` is `null` and `variancePctReason` is
+  `comparator_zero_base`; the absolute variance is preserved. Never `0`, never `Infinity`, never
+  silently omitted.
+- **One owner.** The formula lives in `revenue_digest_execution.compute_variance_pct`, the governed
+  execution module that already owns `value − comparison_value`. The projection **calls** it rather
+  than restating the arithmetic, and a test asserts equality against that function so an inlined
+  divergent division fails.
+
+**Five comparison states, structurally distinct.** v1 distinguished four value states; v2 splits the
+"requested but nothing came back" case in two, because *"this metric does not participate in this
+comparator"* and *"this metric should have a comparator value and does not"* are different facts, and
+collapsing them makes a data gap look like a design decision:
+
+| State | Shape |
+|---|---|
+| not requested | `comparison` is `null` (`context.comparator == "none"`) |
+| requested and available | `state: "available"`, `value` non-null |
+| requested, comparator unsupported for this metric | `state: "unsupported"`, `value` null |
+| requested, source value missing | `state: "unavailable"`, `value` null |
+| comparator value is a governed zero | `state: "available"`, `value: 0.0`, `variancePct: null`, reason `comparator_zero_base` |
+
+`state == "available"` **if and only if** `value is not null` — enforced in the contract, in the
+schema and in the validator, so the two can never disagree.
+
+**`recommendedPresentation` — declarative only.** One token from a bounded registry
+(`performance` | `trend` | `breakdown`), declared per *capability* rather than chosen per result and
+never chosen by the model. It carries no HTML, no CSS, no chart configuration, no template identifier
+and no model-authored content, and **a consumer that ignores it must still render a correct result**.
+An unknown token fails validation rather than reaching a renderer. Mapping a token to an allowlisted
+resource is N10 and is deliberately not here. It is intentionally *not* pinned to `questionType`: the
+two are 1:1 today, but pinning them would force a schema break to express a capability that later
+wants a different presentation for the same question type.
+
+**Two fields this document listed that the implementation still omits**, because no current governed
 producer exists and a nullable placeholder would misrepresent availability:
 
 | Omitted | Why |
 |---|---|
-| `presentation hints` | `RevenueDigestResult` carries none; only the legacy `AnalyticsResult` has them. Inventing `compatibleVisualizations` for a `MetricSet` would be speculative |
 | `available_actions` | The digest publishes none, and no proposed action id exists in either action registry |
 | `hotel display name` | Absent from the digest result entirely. It belongs to trusted server context, not to an analytical result, so a projection cannot supply it without inventing it |
+
+Structured quality codes are likewise still absent — `GovernedQuality` mirrors today's prose warnings
+exactly rather than redesigning quality in the same pass. Adding either omitted field later is
+additive.
 
 **Wire format decision (pre-N07 interoperability review).** The envelope's public JSON keys are
 **camelCase**, following this repository's own established public convention rather than the new
@@ -375,7 +448,7 @@ Foundry-facing `AgentResponse` are camelCase too. `RevenueDigestResult` is snake
 propagated. camelCase is also the System.Text.Json default and the TypeScript idiom, so a C# DTO needs
 no per-member `[JsonPropertyName]`.
 
-Three consequences worth recording:
+Four consequences worth recording:
 
 - **Token *values* stay snake_case/lowercase.** Casing governs property names, not identifiers.
   `timeframe`, `view`, `comparator`, `unit` and `query_id` values flow through from the trusted digest
@@ -386,33 +459,25 @@ Three consequences worth recording:
   mapping cannot drift behind the dataclasses.
 - **`to_json()` has no `default=` fallback**, so an unexpected type raises instead of being silently
   stringified into the contract.
-
-**Versioning, stated for future OpenAPI/C# consumers.** `schemaVersion` is the version of *this*
-envelope schema. The delivery name "governed result packet v2" refers to this being the
-second-generation packet architecture; **"v2" never appears on the wire**. Because four unrelated
-contracts here each report `"1.0"`, a consumer identifies this one by the pair
-(`payloadType`, `schemaVersion`).
-
-Adding any of the three later is additive and does not break the envelope. Structured quality codes
-are likewise absent — `GovernedQuality` mirrors today's prose warnings exactly rather than redesigning
-quality in the same pass.
+- **NaN and ±Infinity cannot enter the contract.** They are rejected at *construction*, so the failure
+  names the field, and `to_json()` additionally passes `allow_nan=False`. They are not representable
+  in JSON, and `System.Text.Json` refuses to read the non-standard literals at all.
 
 ### 6.5 Wire contract, schema and canonical fixtures (N07 — built)
 
-The JSON wire contract is now **project-owned and frozen** for the one implemented payload.
+The JSON wire contract is **project-owned and frozen** for the three implemented payloads.
 
 | Artifact | Location |
 |---|---|
-| **Canonical JSON Schema** | `mcp/governed_result/wire/governed_result_envelope.schema.json` — Draft **2020-12**, `$id` = `urn:ask-ariel:schema:governed-result-envelope:1.0` |
-| **Canonical fixtures** (9 valid) | `mcp/governed_result/wire/fixtures/*.json` |
-| **Negative fixtures** (10) | `mcp/governed_result/wire/fixtures/invalid/*.json` |
+| **Canonical JSON Schema** | `mcp/governed_result/wire/governed_result_envelope.schema.json` — Draft **2020-12**, `$id` = `urn:ask-ariel:schema:governed-result-envelope:2.0` |
+| **Canonical fixtures** (15 valid) | `mcp/governed_result/wire/fixtures/*.json` |
+| **Negative fixtures** (24) | `mcp/governed_result/wire/fixtures/invalid/*.json` |
 | **Semantic validator** | `mcp/governed_result/validation.py` — **standard library only** |
 | **Fixture regenerator** | `mcp/scripts/regenerate_governed_result_fixtures.py` |
-| **Tests** | `mcp/tests/test_governed_result_wire_freeze.py`, `mcp/tests/test_governed_result_validation.py` |
+| **Tests** | `mcp/tests/test_governed_result_wire_freeze.py` (123), `mcp/tests/test_governed_result_validation.py` (69) |
 
 **The `$id` is a URN, not an `https://` URL**, deliberately: inventing a hostname we do not control
-would imply a resolvable published schema that does not exist. The filename carries no "v2" — that is
-a project name and never appears on the wire.
+would imply a resolvable published schema that does not exist.
 
 **`additionalProperties: false`, with a producer/consumer split.** A naive strict schema would
 contradict §15's rule that additive optional fields do not bump `schemaVersion`. The resolution is
@@ -422,46 +487,84 @@ contradict §15's rule that additive optional fields do not bump `schemaVersion`
   these keys. That is what catches a snake_case key, a stray `hotelId`, or a typo.
 - **Consumers must ignore unknown fields** (System.Text.Json and TypeScript interfaces do so by
   default). This is a documented consumer rule, not a schema rule.
-- When governed execution adds a field, it is added here, fixtures are regenerated, `schemaVersion`
-  stays `"1.0"`, and existing consumers keep working.
+- When governed execution adds an **optional** field, it is added here, fixtures are regenerated,
+  `schemaVersion` stays put, and existing consumers keep working. A new **required** key is a
+  breaking change and moves the version — which is exactly what happened between 1.0 and 2.0.
 
-**Two validation layers, and why both exist.** The schema owns shape and can even express the
-comparator cross-field invariant via root-level `if`/`then`/`else`. The stdlib validator exists for
-three things the schema cannot do: **uniqueness of `metricId`** (not expressible in 2020-12), specific
-actionable error messages, and validation at a runtime boundary **with no new dependency**. A test
-asserts the two layers agree on every fixture, and another pins duplicate-`metricId` as the one case
-only the validator catches. `jsonschema` is a **test-only** dependency (`mcp/requirements-dev.txt`).
+**Two validation layers, and why both exist.** The schema owns shape and expresses the cross-field
+invariants it can: the comparator relationship, the discriminator↔payload↔context relationship, and
+the comparison state/value/percentage rules, all via `if`/`then`/`else`. The stdlib validator exists
+for four things the schema **cannot** express in 2020-12, each pinned by name in
+`_VALIDATOR_ONLY_CASES`:
+
+| Case | Why the schema cannot catch it |
+|---|---|
+| duplicate `metricId` / `categoryId` | `uniqueItems` compares whole items; there is no `uniqueItemProperties` keyword |
+| unordered `points[]` | ordering across array items is not expressible |
+| inverted `startDate`/`endDate` | an ordering relationship between two sibling values is not expressible |
+| `NaN` / `Infinity` | JSON Schema has no notion of them, and Python's `json.loads` accepts the non-standard literals by default |
+
+Plus specific actionable error messages, and validation at a runtime boundary **with no new
+dependency**. A test asserts the two layers agree on every valid fixture; a second asserts each of the
+four cases above is caught by the validator and *not* by the schema; a third asserts every **other**
+negative fixture is caught by the schema alone, so a C#/TypeScript port gets those for free.
+`jsonschema` is a **test-only** dependency (`mcp/requirements-dev.txt`).
 
 **Neither layer asserts arithmetic.** `absoluteVariance == value − comparison.value` is never checked
-anywhere. The projection is non-computing and must carry governed execution faithfully, so the
-`inconsistent_governed_variance` fixture — a governed variance that disagrees with a naive
-subtraction — is deliberately **valid**.
+anywhere, and neither is `variancePct` against a recomputed division. The projection is non-computing
+and must carry governed execution faithfully, so the `inconsistent_governed_variance` fixture — a
+governed variance that disagrees with a naive subtraction — is deliberately **valid**. A validator
+that recomputed a metric would be a second opinion about analytical truth.
 
 **Fixtures are a freeze, not examples.** Valid fixtures are generated by the producer's own
 `to_dict()` with fixed opaque demo identity (no clock, no randomness), and a test asserts the on-disk
 files are byte-identical to a fresh build. A serialization change therefore fails loudly and has to be
-deliberate. No fixture contains a hotel id, scope token, session identifier, credential, DAX, or mart
-name — a test enforces that too.
+deliberate. The `time_series` and `breakdown` fixtures are additionally **synthetic**: no capability
+produces those payloads, so they freeze the contract shape rather than a live producer's output. No
+fixture contains a hotel id, scope token, session identifier, credential, DAX, or mart name — a test
+enforces that too, and every figure in them is invented.
 
 **Validation boundary.** Nothing consumes the envelope yet, so the validator is **not wired in** —
 attaching it to `get_performance_digest` would change nothing about that tool's trusted output while
 making every call pay to validate a contract no consumer reads. The requirement belongs downstream:
-**UI binding (N11) MUST validate a governed-result-v2 packet before consuming or rendering it.** The
+**UI binding (N11) MUST validate a governed-result packet before consuming or rendering it.** The
 one existing non-user-facing boundary where it could later run without touching a published contract
 is a post-projection assertion inside `from_revenue_digest_result` — proposed, not implemented.
 
-**Only `metric_set` is implemented and frozen today.** `domain` and `questionType` are constrained to
-`const` values in the schema, because a frozen wire contract must not accept a token no producer can
-emit — even though the Python `Literal`s declare future members for typing honesty.
+**`domain` is still a `const`.** It is pinned to `hotel_performance` because no capability exists in
+`fnb`, `market_segments` or `holdings` — a frozen wire contract must not accept a token no producer
+can emit, even though the Python `Literal` declares them for typing honesty. `payloadType` and
+`questionType` are now enums rather than consts, because three payload families are frozen.
 
-**C# / TypeScript mapping note.** `schemaVersion`/`payloadType` → `string` (stable tokens);
-`businessDate` → `DateOnly` (`format: date`); `value`, `absoluteVariance`, `sourceVariance` →
-`double?` / `number | null`; `comparison` → a nullable object where `null` means *comparator not
-requested*; `warnings` → a **non-null** list, possibly empty. For the current contract JSON numbers
-are IEEE-754 values and map naturally to C# `double` / TypeScript `number` — the
-`floating_point_fidelity` fixture carries `0.18499999999999994` exactly. If a future monetary-precision
-requirement introduces a different numeric contract, that is an explicit versioned decision, not an
-assumption to make now.
+**C# / TypeScript mapping note.** `schemaVersion`/`payloadType`/`state`/`recommendedPresentation` →
+`string` (stable tokens); `businessDate`/`startDate`/`endDate`/`points[].date` → `DateOnly`
+(`format: date`); `value`, `absoluteVariance`, `variancePct`, `sourceVariance`, `share`,
+`reconciledTotal` → `double?` / `number | null`; `rank` → `int?`; `comparison` → a nullable object
+where `null` means *comparator not requested*; `warnings` → a **non-null** list, possibly empty. For
+the current contract JSON numbers are IEEE-754 values and map naturally to C# `double` / TypeScript
+`number` — the `floating_point_fidelity` fixture carries `0.18499999999999994` exactly. If a future
+monetary-precision requirement introduces a different numeric contract, that is an explicit versioned
+decision, not an assumption to make now.
+
+### 6.6 Gate 3 boundary — what is NOT implemented until N08+
+
+Recorded explicitly so the freeze is legible and nobody reads a frozen contract shape as a shipped
+capability:
+
+| Not implemented | Deliverable |
+|---|---|
+| Any MCP tool or Foundry tool that emits a governed envelope | N08+ |
+| A capability producing a `time_series` or a `breakdown` (the payload shapes are frozen; no producer exists) | N08+ |
+| `holdings_position`, `scenario_result`, `variance_decomposition` payloads | N08+ |
+| Domains `fnb`, `market_segments`, `holdings`; question types `variance_drivers`, `outlook`, `scenario` | N08+ |
+| Mapping `recommendedPresentation` to an allowlisted rendering resource | N10 |
+| UI binding and the mandatory pre-render validation call | N11 |
+| Structured machine-readable quality codes (`quality.entries[]`) | additive, unscheduled |
+| Wiring the validator into any live tool path | see *Validation boundary* above |
+
+No change in this gate widens the model-facing surface: no new tool is registered, no allowlist is
+widened, no parameter is added to an exposed tool, and hotel authentication and server-side
+`Hotel_ID` injection are untouched.
 
 ---
 

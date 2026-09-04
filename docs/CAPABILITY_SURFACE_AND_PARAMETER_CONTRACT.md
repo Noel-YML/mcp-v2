@@ -919,11 +919,26 @@ Backend work on capabilities that exist or are ready. **Not implemented here.**
 
 | # | Extension | Capability | Formula / rule | Verified basis |
 |---|---|---|---|---|
-| **E‑1** | **Relative percentage variance** | Performance Digest | `(current − comparator) / comparator`, deterministic, emitted **alongside** — never instead of — the existing absolute `computed_variance_value`. Valid only when the comparator is non-null **and** non-zero; **undefined** (not zero, not `Infinity`, not silently omitted) against a zero base, signalled with the existing `comparator_zero_base` reason. **Distinct from a percentage-point delta** — see §5.5.1 | No percentage field exists in any contract |
+| **E‑1** *(landed in the governed envelope at Gate 3 — see the note under §17)* | **Relative percentage variance** | Performance Digest | `(current − comparator) / comparator`, deterministic, emitted **alongside** — never instead of — the existing absolute `computed_variance_value`. Valid only when the comparator is non-null **and** non-zero; **undefined** (not zero, not `Infinity`, not silently omitted) against a zero base, signalled with the existing `comparator_zero_base` reason. **Distinct from a percentage-point delta** — see §5.5.1 | No percentage field exists in any contract |
 | **E‑2** | **Holdings ADR** | Holdings Position / Comparison | `SUM(Room_Revenue) / SUM(NoOfRooms)` — **never** `AVERAGE(ADR)` | **Formula already declared in `_PACE_METRIC_COLUMNS`**, which excludes the raw ADR column and defers computation to an execution layer |
 | **E‑3** | **Holdings occupancy** | Holdings Position / Comparison | governed `rooms ÷ rooms_available` | Both inputs are already governed pace outputs |
 | **E‑4** | **Digest interaction intents** | Performance Digest | **Deferred to N14 / Gate 6 — not part of the capability implementation slice.** Task 5 records only that changing timeframe or comparator is *analytically executable* by re-invoking this capability. Ids, payload schemas, enum-domain representation and execution mechanism are **not frozen here** (§17.2) | Digest publishes no actions today, and neither proposed id exists in either registry |
 | **E‑5** | **Structured quality codes** | all | Machine-readable code + human message, optional `metric_id` scope | Warnings are prose today, so per-metric suppression is impossible (4C §13.1) |
+
+> **Gate 3 status update (N05/N07).** **E‑1 has landed**, in the governed result envelope
+> (`comparison.variancePct` + `variancePctReason`, packet `schemaVersion` `"2.0"`), and it landed
+> exactly as frozen above: computed in governed execution
+> (`revenue_digest_execution.compute_variance_pct`), emitted **alongside** the absolute variance,
+> and **undefined against a zero base** — no division, `null`, reason `comparator_zero_base`,
+> absolute variance preserved. Two clarifications this row did not fix, now frozen: the value is a
+> **0–1 fraction** (matching this repository's `percentage` unit convention), and the denominator is
+> the comparator's **magnitude**, so the sign of the relative change always agrees with the sign of
+> the absolute one.
+>
+> Scope of the landing: **the envelope only**. `get_performance_digest`'s live wire contract is
+> unchanged, and nothing consumes the envelope — so the rendering prohibitions elsewhere in this
+> document still hold, and E‑5 (structured quality codes) is still unbuilt. The last column of the
+> E‑1 row above (*"No percentage field exists in any contract"*) was the pre-Gate-3 state.
 
 None of these needs a new tool or a new model-selectable parameter. E‑1, E‑2, E‑3 and E‑5 are
 governed-output work and are schedulable (§21). **E‑4 is not backend output work at all** — it is a
@@ -990,7 +1005,7 @@ Derived from verified readiness and dependency, with a reason for each placement
 
 | Step | Work | Why here |
 |---|---|---|
-| **1** | **Performance Digest — E‑1 relative percentage variance** (+ E‑5 structured quality codes) | Lowest risk of anything on the list: **output-only**, no new tool, parameter, query or enum. It closes the single most-referenced presentation gap — percentage variance appears in both KPI cards *and* narrative — and until it lands the model has a standing incentive to divide. Touches the trusted slice, so it goes first while the surface is otherwise stable. **E‑4 is deliberately not in this step** — see the note below |
+| **1** | **Performance Digest — E‑1 relative percentage variance** *(done in the governed envelope at Gate 3; not yet in the live tool)* (+ E‑5 structured quality codes — **still unbuilt**) | Lowest risk of anything on the list: **output-only**, no new tool, parameter, query or enum. It closes the single most-referenced presentation gap — percentage variance appears in both KPI cards *and* narrative — and until it lands the model has a standing incentive to divide. Touches the trusted slice, so it goes first while the surface is otherwise stable. **E‑4 is deliberately not in this step** — see the note below |
 | **2** | **Holdings Comparison** — result contract + tool for `HOLDINGS_PACE_SAME_POINT_LAST_YEAR_V1` | **The hardest analytical work is already done and validated**: per-stay-date snapshot-resolution DAX, a reference implementation with a golden fixture, live acceptance, declared params, limits and quality rules. Remaining work is a payload type and a registration. Nothing else offers this ratio of value to remaining risk. *Caveat:* U‑4 means deep Evidence for holdings is thin until registry entries land — a provenance-quality gap, not a correctness blocker, and the provenance *summary* still survives |
 | **3** | **Holdings Position** | Reuses step 2's validated resolution machinery rather than the legacy single-global-`MAX` shortcut, and is the *current side* of the same shape. Building it after Comparison — not before — means the per-stay-date rule is already proven in production code. Carries E‑2/E‑3 (ADR, occupancy) for both capabilities |
 | **4** | **Metric Breakdown — `revenue_stream` only** | Entirely inside the revenue domain, which has 43 registry entries and complete lineage, so no upstream dependency gates it. `revenue_snapshot`'s row-per-group/type query is a close template and the reconciled-total-plus-share pattern already exists in the analytics layer. Unlocks Variance Drivers and, later, the Scenario Skill. Held to one dimension so the A-vs-B decision stays open (§7.1) |
