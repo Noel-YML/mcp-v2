@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:ask-ariel:schema:governed-result-envelope:1.0",
-  "title": "Ask ARIEL governed result envelope (metric_set)",
-  "description": "The JSON wire contract for GovernedResultEnvelope carrying a MetricSet payload. THIS FILE, not the Python dataclasses, is the cross-language contract. PRODUCER CONFORMANCE SCHEMA: additionalProperties is false throughout, so Ask ARIEL's own output must contain exactly these keys - that is what catches a snake_case key, a stray hotelId, or a typo. CONSUMERS must instead ignore unknown fields (System.Text.Json and TypeScript interfaces do so by default), because additive optional fields do not bump schemaVersion. When a field such as a relative percentage variance is added by governed execution, it is added here, the fixtures are regenerated, schemaVersion stays 1.0, and existing consumers keep working. Only payload_type metric_set exists today; no other payload contract is defined, so none is accepted here.",
+  "$id": "urn:ask-ariel:schema:governed-result-envelope:2.0",
+  "title": "Ask ARIEL governed result envelope",
+  "description": "The JSON wire contract for GovernedResultEnvelope. THIS FILE, not the Python dataclasses, is the cross-language contract. PRODUCER CONFORMANCE SCHEMA: additionalProperties is false throughout, so Ask ARIEL's own output must contain exactly these keys - that is what catches a snake_case key, a stray hotelId, or a typo. CONSUMERS must instead ignore unknown fields (System.Text.Json and TypeScript interfaces do so by default), because additive OPTIONAL fields do not bump schemaVersion. Version 2.0 adds three required things to 1.0 - an explicit comparison state, a governed relative variance, and a declarative presentation hint - and two further payload families, so it is a breaking change and the version moves. Three payload types are defined here: metric_set, time_series and breakdown. Only metric_set has a live producer; the other two are frozen contract shapes with synthetic canonical fixtures. holdings_position, scenario_result and variance_decomposition are named in the Python Literal for typing honesty but are NOT accepted here, because a frozen wire schema must not accept a token no producer can emit.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,6 +15,7 @@
     "queryId",
     "queryVersion",
     "traceId",
+    "recommendedPresentation",
     "context",
     "quality",
     "provenance",
@@ -22,20 +23,20 @@
   ],
   "properties": {
     "schemaVersion": {
-      "description": "The version of THIS envelope schema. The delivery name 'governed result packet v2' is a project name and never appears on the wire. Because several unrelated contracts in this repository each report '1.0', a consumer identifies this one by the pair (payloadType, schemaVersion).",
-      "const": "1.0"
+      "description": "The version of THIS envelope schema. Because several unrelated contracts in this repository each report a version, a consumer identifies this one by the pair (payloadType, schemaVersion).",
+      "const": "2.0"
     },
     "payloadType": {
       "description": "The single discriminator a consumer switches on. Token values are snake_case identifiers; only property NAMES are camelCase.",
-      "const": "metric_set"
+      "enum": ["metric_set", "time_series", "breakdown"]
     },
     "domain": {
-      "description": "The analytical domain. Constrained to the only implemented value - the Python Literal declares future domains for typing honesty, but a frozen wire schema must not accept a value no producer can emit.",
+      "description": "The analytical domain. Constrained to the only implemented value - the Python Literal declares fnb, market_segments and holdings for typing honesty, but no capability in those domains exists, so the wire schema does not accept them yet.",
       "const": "hotel_performance"
     },
     "questionType": {
-      "description": "The analytical operation. Constrained to the only implemented value, for the same reason as domain.",
-      "const": "performance"
+      "description": "The analytical operation. variance_drivers, outlook and scenario are declared in Python but have no capability and no payload, so they are not accepted here.",
+      "enum": ["performance", "trend", "breakdown"]
     },
     "status": {
       "description": "Governed success. Failures and empty results travel as a separate ToolError envelope ('error' / 'empty'), never as this contract.",
@@ -60,22 +61,87 @@
       "type": "string",
       "minLength": 1
     },
-    "context": { "$ref": "#/$defs/businessDateContext" },
+    "recommendedPresentation": {
+      "description": "DECLARATIVE ONLY. A single token from a bounded registry naming an intended presentation family. It carries no HTML, no CSS, no chart configuration, no template identifier and no model-authored content, and a consumer that ignores it must still render a correct result. It is deliberately NOT pinned to questionType: the two are 1:1 today, but a governed capability may later choose a different presentation for the same question type, and pinning them would force a schema break to express that.",
+      "enum": ["performance", "trend", "breakdown"]
+    },
+    "context": {
+      "description": "Temporal context is TYPED per temporal model, discriminated by 'kind'. The per-payloadType branches below pin which kind each payload requires.",
+      "oneOf": [
+        { "$ref": "#/$defs/businessDateContext" },
+        { "$ref": "#/$defs/dateRangeContext" }
+      ]
+    },
     "quality": { "$ref": "#/$defs/governedQuality" },
     "provenance": { "$ref": "#/$defs/provenanceSummary" },
-    "payload": { "$ref": "#/$defs/metricSet" }
+    "payload": {
+      "description": "Pinned to the payloadType discriminator by the branches below.",
+      "oneOf": [
+        { "$ref": "#/$defs/metricSet" },
+        { "$ref": "#/$defs/timeSeries" },
+        { "$ref": "#/$defs/breakdown" }
+      ]
+    }
   },
   "allOf": [
     {
-      "description": "COMPARATOR CROSS-FIELD INVARIANT. comparator 'none' means the caller did not ask for a comparison, which is a different answer from asking and finding nothing. So: comparator == 'none' implies every metric's comparison is null, and comparator != 'none' implies every metric carries a comparison object (whose members may individually be null). This is what gives 'comparison is null' exactly one meaning, so a consumer never has to read the context to disambiguate. governed_result/validation.py enforces the same rule with a specific error message.",
+      "description": "DISCRIMINATOR INTEGRITY - metric_set. The discriminator must actually describe the payload, or switching on it is worse than not having it. A metric_set answers a performance question at ONE resolved business date, and its context.view is non-null because view names the governed metric bundle the result represents.",
+      "if": {
+        "properties": { "payloadType": { "const": "metric_set" } },
+        "required": ["payloadType"]
+      },
+      "then": {
+        "properties": {
+          "questionType": { "const": "performance" },
+          "payload": { "$ref": "#/$defs/metricSet" },
+          "context": {
+            "allOf": [
+              { "$ref": "#/$defs/businessDateContext" },
+              { "properties": { "view": { "type": "string" } }, "required": ["view"] }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "description": "DISCRIMINATOR INTEGRITY - time_series. A trend's resolved period is a RANGE, so it requires a dateRangeContext. Letting it travel on a business-date context would overload businessDate into 'the last date in the window', which is how a typed temporal model quietly becomes a generic one.",
+      "if": {
+        "properties": { "payloadType": { "const": "time_series" } },
+        "required": ["payloadType"]
+      },
+      "then": {
+        "properties": {
+          "questionType": { "const": "trend" },
+          "payload": { "$ref": "#/$defs/timeSeries" },
+          "context": { "$ref": "#/$defs/dateRangeContext" }
+        }
+      }
+    },
+    {
+      "description": "DISCRIMINATOR INTEGRITY - breakdown. A breakdown decomposes one metric across one dimension at one resolved business date, so it uses a businessDateContext. It carries no view: a breakdown is not a metric bundle, so context.view is null.",
+      "if": {
+        "properties": { "payloadType": { "const": "breakdown" } },
+        "required": ["payloadType"]
+      },
+      "then": {
+        "properties": {
+          "questionType": { "const": "breakdown" },
+          "payload": { "$ref": "#/$defs/breakdown" },
+          "context": { "$ref": "#/$defs/businessDateContext" }
+        }
+      }
+    },
+    {
+      "description": "COMPARATOR CROSS-FIELD INVARIANT (metric_set only - it is the only payload carrying per-metric comparisons). comparator 'none' means the caller did not ask for a comparison, which is a different answer from asking and finding nothing. So: comparator == 'none' implies every metric's comparison is null, and comparator != 'none' implies every metric carries a comparison object (whose members may individually be null). This is what gives 'comparison is null' exactly one meaning, so a consumer never has to read the context to disambiguate. governed_result/validation.py enforces the same rule with a specific error message.",
       "if": {
         "properties": {
+          "payloadType": { "const": "metric_set" },
           "context": {
             "properties": { "comparator": { "const": "none" } },
             "required": ["comparator"]
           }
         },
-        "required": ["context"]
+        "required": ["payloadType", "context"]
       },
       "then": {
         "properties": {
@@ -91,12 +157,18 @@
         }
       },
       "else": {
-        "properties": {
-          "payload": {
-            "properties": {
-              "metrics": {
-                "items": {
-                  "properties": { "comparison": { "$ref": "#/$defs/metricComparison" } }
+        "if": {
+          "properties": { "payloadType": { "const": "metric_set" } },
+          "required": ["payloadType"]
+        },
+        "then": {
+          "properties": {
+            "payload": {
+              "properties": {
+                "metrics": {
+                  "items": {
+                    "properties": { "comparison": { "$ref": "#/$defs/metricComparison" } }
+                  }
                 }
               }
             }
@@ -107,7 +179,7 @@
   ],
   "$defs": {
     "businessDateContext": {
-      "description": "Temporal context is TYPED, not one generic period object. Holdings' as-of (snapshot) date and stay date are different semantic roles and must never share a field, so 'kind' is the discriminator that lets a future snapshot context coexist rather than overloading this one.",
+      "description": "Resolved temporal context for a business-date capability. 'kind' is the discriminator that lets other context types coexist rather than overloading this one. Holdings' as-of (snapshot) date and stay date are different semantic roles and must never share a field, which is why a snapshot context will be its own definition rather than a nullable field here.",
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "businessDate", "timeframe", "view", "comparator"],
@@ -120,15 +192,34 @@
           "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
         },
         "timeframe": { "enum": ["day", "mtd", "ytd"] },
-        "view": { "enum": ["headline", "rooms", "fnb_revenue", "other"] },
+        "view": {
+          "description": "The governed metric-bundle selector. Meaningful only for a metric_set payload, where the branch above requires it non-null; null on a breakdown, which is not a metric bundle.",
+          "oneOf": [{ "enum": ["headline", "rooms", "fnb_revenue", "other"] }, { "type": "null" }]
+        },
         "comparator": {
           "description": "The comparator SELECTION for the request, not a comparison value. 'none' is absence by choice.",
           "enum": ["none", "last_year", "budget", "forecast"]
         }
       }
     },
+    "dateRangeContext": {
+      "description": "Resolved temporal context for an ordered series over a date window. A trend is not a business-date question with an extra field - its resolved period is a range, and 'grain' states what one point represents. endDate is on or after startDate; the validator enforces that ordering, which JSON Schema cannot express between two sibling values.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "startDate", "endDate", "grain", "comparator"],
+      "properties": {
+        "kind": { "const": "date_range" },
+        "startDate": { "type": "string", "format": "date", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "endDate": { "type": "string", "format": "date", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "grain": {
+          "description": "What one point represents. Only 'day' is implemented; week/month arrive with a capability that produces them.",
+          "enum": ["day"]
+        },
+        "comparator": { "enum": ["none", "last_year", "budget", "forecast"] }
+      }
+    },
     "governedQuality": {
-      "description": "Mirrors the governed producer exactly: a partial flag plus human-readable warnings. Warnings are prose today and must not be matched on. Structured machine-readable codes are a future additive field.",
+      "description": "Mirrors the governed producer exactly: a partial flag plus human-readable warnings. Warnings are prose today and must not be matched on. They are GOVERNED metadata emitted by deterministic analytical execution, never agent narrative. Structured machine-readable codes are a future additive field.",
       "type": "object",
       "additionalProperties": false,
       "required": ["isPartial", "warnings"],
@@ -198,19 +289,154 @@
       }
     },
     "metricComparison": {
-      "description": "A comparison for ONE metric, present only when a comparator was requested. value null means the comparator was requested and this metric has no comparison value - unavailable, not zero. All three members are INDEPENDENTLY nullable: a present comparator value with an uncomputed variance is a real state, so a consumer must not treat this object as all-or-nothing.",
+      "description": "A comparison for ONE metric, present only when a comparator was requested. 'state' names which of the three requested outcomes this is, so a consumer never has to infer intent from a null. All numeric members are INDEPENDENTLY nullable: a present comparator value with an uncomputed variance is a real state, so a consumer must not treat this object as all-or-nothing. NOTE: no arithmetic relationship between the metric's value, comparison.value, absoluteVariance and variancePct is asserted anywhere - the projection is non-computing and carries governed execution faithfully, so a governed variance that disagrees with a naive subtraction is still valid.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["value", "absoluteVariance", "sourceVariance"],
+      "required": [
+        "state",
+        "value",
+        "absoluteVariance",
+        "variancePct",
+        "variancePctReason",
+        "sourceVariance"
+      ],
       "properties": {
+        "state": {
+          "description": "'available' - a comparator value was obtained. 'unavailable' - the comparator was requested and applies, but no source value exists. 'unsupported' - this metric does not participate in this comparator. The last two are different facts, and collapsing them into one null is what makes a data gap look like a design decision.",
+          "enum": ["available", "unavailable", "unsupported"]
+        },
         "value": { "type": ["number", "null"] },
         "absoluteVariance": {
-          "description": "The governed delta in the METRIC'S OWN UNIT. For a percentage-unit metric that is percentage POINTS. A relative percentage variance is a different quantity and is deliberately not a field in this version. NOTE: no arithmetic relationship between value, comparison.value and absoluteVariance is asserted anywhere - the projection is non-computing and carries governed execution faithfully, so a governed variance that disagrees with a naive subtraction is still valid.",
+          "description": "The governed delta in the METRIC'S OWN UNIT. For a percentage-unit metric that is percentage POINTS - a different quantity from variancePct, and neither is inferable from the other.",
           "type": ["number", "null"]
+        },
+        "variancePct": {
+          "description": "The governed RELATIVE change, as a 0-1 fraction matching this contract's existing 'percentage' unit convention (+5% is 0.05). Owned and computed by governed execution (revenue_digest_execution.compute_variance_pct); no UI, BFF, MCP App or model may derive it. Null when it could not be computed, and variancePctReason then says why - never 0, never infinity, never silently omitted.",
+          "type": ["number", "null"]
+        },
+        "variancePctReason": {
+          "description": "Why variancePct is null on an otherwise available comparison. 'comparator_zero_base': the comparator value is exactly 0, so no division is performed - a zero base is a real governed value, not a missing one. 'insufficient_data': an input was missing. Null when variancePct is present, and null when state is not 'available' because the state already explains the absence.",
+          "oneOf": [{ "enum": ["comparator_zero_base", "insufficient_data"] }, { "type": "null" }]
         },
         "sourceVariance": {
           "description": "The mart-provided Value_Vs_* figure where one exists - only for mtd/ytd comparators. Its reconciliation verdict against absoluteVariance lives in the evidence document, not here.",
           "type": ["number", "null"]
+        }
+      },
+      "allOf": [
+        {
+          "description": "STATE AND VALUE CAN NEVER DISAGREE: state is 'available' if and only if a comparator value is present. Without this, the five comparison states stop being distinguishable.",
+          "if": {
+            "properties": { "state": { "const": "available" } },
+            "required": ["state"]
+          },
+          "then": { "properties": { "value": { "type": "number" } } },
+          "else": { "properties": { "value": { "type": "null" } } }
+        },
+        {
+          "description": "A NULL PERCENTAGE ON AN AVAILABLE COMPARISON IS NEVER UNEXPLAINED: if it could have been computed and was not, the packet says why.",
+          "if": {
+            "properties": {
+              "state": { "const": "available" },
+              "variancePct": { "type": "null" }
+            },
+            "required": ["state", "variancePct"]
+          },
+          "then": {
+            "properties": {
+              "variancePctReason": { "enum": ["comparator_zero_base", "insufficient_data"] }
+            }
+          }
+        },
+        {
+          "description": "A REASON CANNOT ACCOMPANY A PRESENT PERCENTAGE - it would be a second explanation free to contradict the first.",
+          "if": {
+            "properties": {
+              "state": { "const": "available" },
+              "variancePct": { "type": "number" }
+            },
+            "required": ["state", "variancePct"]
+          },
+          "then": { "properties": { "variancePctReason": { "type": "null" } } }
+        },
+        {
+          "description": "AN UNAVAILABLE OR UNSUPPORTED COMPARISON CARRIES NO PERCENTAGE AND NO REASON - the state already explains the absence.",
+          "if": {
+            "properties": { "state": { "enum": ["unavailable", "unsupported"] } },
+            "required": ["state"]
+          },
+          "then": {
+            "properties": {
+              "variancePct": { "type": "null" },
+              "variancePctReason": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "timeSeries": {
+      "description": "The payload_type 'time_series' payload: ONE approved metric over an ordered date window. CONTRACT ONLY - no capability produces this today, and its canonical fixtures are synthetic. The payload carries NO summary statistics: no high, low, mean, range, slope or growth rate. If one is ever wanted it becomes a governed output field, never a rendering step.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metricId", "label", "unit", "points"],
+      "properties": {
+        "metricId": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "label": { "type": "string", "minLength": 1 },
+        "unit": { "enum": ["currency", "count", "percentage", "rate", "ratio"] },
+        "points": {
+          "description": "Ordered ascending by date, with no duplicate dates. The ORDERING IS GOVERNED - a consumer renders the order given and never re-sorts into a different meaning. The validator enforces ordering and uniqueness, which JSON Schema cannot express across array items.",
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/seriesPoint" }
+        }
+      }
+    },
+    "seriesPoint": {
+      "description": "One governed point. A null value is a genuine gap and is retained IN POSITION - never dropped (which would silently shorten the window and change what the series means), never interpolated, never zero-filled.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date", "value"],
+      "properties": {
+        "date": { "type": "string", "format": "date", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
+        "value": { "type": ["number", "null"] }
+      }
+    },
+    "breakdown": {
+      "description": "The payload_type 'breakdown' payload: ONE approved metric decomposed across ONE approved dimension. CONTRACT ONLY - no capability produces this today, and its canonical fixtures are synthetic. reconciledTotal is stated so that no consumer ever divides to obtain a share; that division is what would make a presentation layer an analytical one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metricId", "label", "unit", "dimension", "reconciledTotal", "rows"],
+      "properties": {
+        "metricId": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "label": { "type": "string", "minLength": 1 },
+        "unit": { "enum": ["currency", "count", "percentage", "rate", "ratio"] },
+        "dimension": {
+          "description": "The approved PUBLIC dimension identifier - never a mart column name.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "reconciledTotal": { "type": ["number", "null"] },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/breakdownRow" }
+        }
+      }
+    },
+    "breakdownRow": {
+      "description": "One governed category row. 'share' is a GOVERNED analytical value, never derived by a consumer from value / reconciledTotal. It is null where share is not semantically approved for the dimension - a legitimate result shape, not a degraded one, and a consumer must not fill it in.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["categoryId", "label", "value", "share", "rank"],
+      "properties": {
+        "categoryId": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "label": { "type": "string", "minLength": 1 },
+        "value": { "type": ["number", "null"] },
+        "share": { "type": ["number", "null"] },
+        "rank": {
+          "description": "Governed 1-based rank where ranking is analytically meaningful; null otherwise.",
+          "type": ["integer", "null"],
+          "minimum": 1
         }
       }
     }
