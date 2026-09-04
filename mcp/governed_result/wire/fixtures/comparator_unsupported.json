@@ -12,9 +12,9 @@
   "context": {
     "kind": "business_date",
     "businessDate": "2026-08-16",
-    "timeframe": "mtd",
+    "timeframe": "day",
     "view": "headline",
-    "comparator": "forecast"
+    "comparator": "budget"
   },
   "quality": {
     "isPartial": false,
@@ -32,7 +32,7 @@
         "value": 118246.0,
         "sourceRowCount": 1,
         "comparison": {
-          "state": "unavailable",
+          "state": "unsupported",
           "value": null,
           "absoluteVariance": null,
           "variancePct": null,
@@ -45,7 +45,7 @@
         "label": "Occupancy %",
         "unit": "percentage",
         "value": 0.985,
-        "sourceRowCount": 0,
+        "sourceRowCount": 1,
         "comparison": {
           "state": "unsupported",
           "value": null,

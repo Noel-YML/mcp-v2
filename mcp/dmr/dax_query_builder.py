@@ -630,6 +630,30 @@ class RevenueDigestRequest:
 # surfaced as a runtime quality condition.
 _UNSUPPORTED_REVENUE_TIMEFRAME_COMPARATOR: frozenset[tuple[str, str]] = frozenset({("day", "budget"), ("day", "forecast")})
 
+
+def revenue_digest_comparator_is_supported(timeframe: str, comparator: str) -> bool:
+    """The AUTHORITATIVE, capability-level answer to "does this comparator
+    structurally exist for this timeframe?" - the single owner of that verdict.
+
+    Support is a property of the (timeframe, comparator) PAIR, not of a metric
+    and never of a row: `_REVENUE_DIGEST_COMPARISON_MEASURE` above is keyed by
+    that pair alone, so every metric in a view shares one answer.
+
+    "Structurally unsupported" and "no data came back" are different facts.
+    This function answers only the first. A missing physical row is a
+    data-availability gap and must never be read as a support verdict - it is
+    the mart being empty, not the model lacking a measure.
+
+    `comparator == "none"` is supported trivially: not asking for a comparison
+    is always a valid request.
+
+    Exposed (rather than left as a private frozenset) so that a consumer of a
+    result - notably the governed-result projection - can read the SAME rule
+    the request validator applies, instead of re-deriving a support verdict
+    from whatever the result happens to contain.
+    """
+    return (timeframe, comparator) not in _UNSUPPORTED_REVENUE_TIMEFRAME_COMPARATOR
+
 _REVENUE_DIGEST_VALUE_MEASURE_BY_TIMEFRAME: dict[str, "Measure"] = {
     "day": Measure.REVENUE_CURRENT,
     "mtd": Measure.REVENUE_MTD,
@@ -672,7 +696,7 @@ def _validate_revenue_digest_request(request: RevenueDigestRequest) -> None:
         raise ValueError(f"Unknown view: {request.view!r}")
     if request.comparator not in ("none", "last_year", "budget", "forecast"):
         raise ValueError(f"Unknown comparator: {request.comparator!r}")
-    if (request.timeframe, request.comparator) in _UNSUPPORTED_REVENUE_TIMEFRAME_COMPARATOR:
+    if not revenue_digest_comparator_is_supported(request.timeframe, request.comparator):
         raise ValueError(
             f"comparator {request.comparator!r} is not supported for timeframe {request.timeframe!r} - "
             "no Value_Budget_Current/Value_Forecast_Current measure exists in this mart."

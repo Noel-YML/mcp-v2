@@ -163,13 +163,19 @@ def build_valid_fixtures() -> dict[str, dict]:
 
     # 3. A missing metric: no source row exists at all. The entry is RETAINED
     #    with a null value - dropping it is how a missing measurement becomes
-    #    invisible. With no row, the comparator does not apply: `unsupported`.
+    #    invisible.
+    #
+    #    The comparison is `unavailable`, NOT `unsupported`. A missing row means
+    #    the mart had nothing at this date; it says nothing about whether the
+    #    semantic layer supports the comparator. `sourceRowCount` is what tells
+    #    a consumer which kind of gap this is, so nothing is lost by refusing to
+    #    let a row count answer a support question.
     fixtures["missing_value"] = _metric_set_envelope(
         comparator="last_year",
         metrics=(
             _metric(
                 "guests", "Guests", "count", None, source_row_count=0,
-                comparison=MetricComparison(state="unsupported"),
+                comparison=MetricComparison(state="unavailable"),
             ),
         ),
     ).to_dict()
@@ -198,19 +204,32 @@ def build_valid_fixtures() -> dict[str, dict]:
         ),
     ).to_dict()
 
-    # 6. Comparator requested but UNSUPPORTED for this metric - a different
-    #    fact from unavailable, and worth distinguishing: "this metric does not
-    #    participate in this comparator" is a design statement, while
-    #    "unavailable" is a data gap.
+    # 6. SYNTHETIC - CONTRACT ONLY. Comparator requested but STRUCTURALLY
+    #    UNSUPPORTED. `day` + `budget` is a genuinely unsupported Revenue pair -
+    #    no Value_Budget_Current measure exists in the mart at all - which is
+    #    why this fixture uses exactly that pair rather than inventing a
+    #    per-metric fiction.
+    #
+    #    No Revenue request can produce this packet: `_validate_revenue_digest_request`
+    #    REJECTS day+budget before any DAX is built, and `named_queries.py`
+    #    classifies `unsupported_comparator` as a `policy="block"` rule - an
+    #    error, not a result state. The fixture exists to freeze the contract's
+    #    ability to EXPRESS the state, for a future capability that surfaces it
+    #    instead of rejecting it.
+    #
+    #    Note what is NOT the reason for `unsupported`: row absence. Both metrics
+    #    here have a source row. Support is a property of the (timeframe,
+    #    comparator) pair, so it applies uniformly to every metric in the view.
     fixtures["comparator_unsupported"] = _metric_set_envelope(
-        comparator="forecast",
+        comparator="budget",
+        timeframe="day",
         metrics=(
             _metric(
                 "total_revenue", "Total Revenue", "currency", 118246.0,
-                comparison=MetricComparison(state="unavailable"),
+                comparison=MetricComparison(state="unsupported"),
             ),
             _metric(
-                "occupancy_pct", "Occupancy %", "percentage", 0.985, source_row_count=0,
+                "occupancy_pct", "Occupancy %", "percentage", 0.985,
                 comparison=MetricComparison(state="unsupported"),
             ),
         ),
@@ -578,11 +597,37 @@ def build_invalid_fixtures() -> dict[str, dict]:
     }
 
 
+# The one negative fixture that CANNOT be written by the strict serializer,
+# because being unserializable as strict JSON is the entire point of it.
+_NON_STRICT_FIXTURES = frozenset({"invalid_non_finite_number"})
+
+
 def serialize(packet: dict) -> str:
-    """One canonical serialization, so byte-comparison is meaningful:
+    """The canonical wire serialization, so byte-comparison is meaningful:
     2-space indent, keys in the producer's declared order (never re-sorted),
-    trailing newline."""
-    return json.dumps(packet, indent=2) + "\n"
+    trailing newline.
+
+    `allow_nan=False` because this is a WIRE SERIALIZATION BOUNDARY, and NaN and
+    Infinity are not JSON. Python's default would happily emit the non-standard
+    `NaN` / `Infinity` literals, producing a file Python can read back and
+    `System.Text.Json` cannot parse at all - the worst failure mode available,
+    because it is invisible on the producing side. Enforcing strictness here
+    means no path in this repository can write a non-finite number into a
+    governed wire artifact.
+    """
+    return json.dumps(packet, indent=2, allow_nan=False) + "\n"
+
+
+def serialize_non_conformant(packet: dict) -> str:
+    """Deliberately NON-strict, for negative fixtures whose whole purpose is to
+    be un-emittable by the real producer.
+
+    A separate, explicitly named function rather than a flag on `serialize`, so
+    the strict path has no bypass parameter and cannot be reached by accident.
+    Its only caller is the negative-fixture writer, and only for the names in
+    `_NON_STRICT_FIXTURES`.
+    """
+    return json.dumps(packet, indent=2, allow_nan=True) + "\n"
 
 
 def main() -> int:
@@ -597,7 +642,8 @@ def main() -> int:
         (FIXTURE_DIR / f"{name}.json").write_text(serialize(packet), encoding="utf-8", newline="\n")
         written += 1
     for name, packet in build_invalid_fixtures().items():
-        (INVALID_DIR / f"{name}.json").write_text(serialize(packet), encoding="utf-8", newline="\n")
+        writer = serialize_non_conformant if name in _NON_STRICT_FIXTURES else serialize
+        (INVALID_DIR / f"{name}.json").write_text(writer(packet), encoding="utf-8", newline="\n")
         written += 1
     print(f"wrote {written} fixtures under {FIXTURE_DIR}")
     return 0

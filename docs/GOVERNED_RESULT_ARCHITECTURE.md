@@ -391,9 +391,19 @@ contract froze it:
 - **Scale:** a 0–1 fraction, matching this repository's existing `percentage` unit convention
   (`mcp/apps/revenue/src/format.ts` documents `occupancy_pct` as a fraction, not an already-scaled
   0–100 number). +5% is `0.05`.
-- **Denominator:** the *magnitude* of the comparator, so the sign of `variancePct` always agrees with
-  the sign of `absoluteVariance`. A signed negative base would otherwise report an improvement from
-  −100 to −50 as −50%.
+- **Denominator:** the *magnitude* of the comparator — `abs(comparison_value)`. This is a semantic
+  choice, not a stylistic one, because **a negative comparator is genuinely reachable**: nothing in
+  the governed Revenue contract constrains a value to be non-negative, and a revenue line goes
+  negative when credits, rebates or period corrections outweigh takings (`total_other_misc` most
+  realistically, with `adr`/`revpar` inheriting the sign). The invariant it buys is
+  `sign(variancePct) == sign(absoluteVariance)`, **always** — a signed denominator would report a
+  genuine improvement from −100 to −50 as −50%, contradicting the absolute figure printed beside it
+  and pointing the KPI arrow the wrong way. The cost, stated so no consumer is misled: this is a
+  *magnitude-relative* change, not the textbook *signed growth rate*. For a non-negative base — every
+  case in practice today — the two are identical; for a negative base they differ in sign, so this
+  figure must not be compared against a growth rate computed elsewhere from a signed base.
+  `mcp/tests/test_variance_pct_semantics.py` pins both the invariant and the domain premise, so if a
+  non-negativity constraint is ever introduced the decision is revisited rather than inherited.
 - **Denominator zero:** no division is performed. `variancePct` is `null` and `variancePctReason` is
   `comparator_zero_base`; the absolute variance is preserved. Never `0`, never `Infinity`, never
   silently omitted.
@@ -411,12 +421,30 @@ collapsing them makes a data gap look like a design decision:
 |---|---|
 | not requested | `comparison` is `null` (`context.comparator == "none"`) |
 | requested and available | `state: "available"`, `value` non-null |
-| requested, comparator unsupported for this metric | `state: "unsupported"`, `value` null |
-| requested, source value missing | `state: "unavailable"`, `value` null |
+| requested, comparator structurally unsupported | `state: "unsupported"`, `value` null |
+| requested, governed value missing | `state: "unavailable"`, `value` null |
 | comparator value is a governed zero | `state: "available"`, `value: 0.0`, `variancePct: null`, reason `comparator_zero_base` |
 
 `state == "available"` **if and only if** `value is not null` — enforced in the contract, in the
 schema and in the validator, so the two can never disagree.
+
+**Where the `unsupported` verdict comes from — and where it must not.** Support is a property of the
+**capability**, keyed by the `(timeframe, comparator)` pair, and it is READ from
+`dax_query_builder.revenue_digest_comparator_is_supported` — the single owner of that rule, which the
+request validator also uses. It is never inferred from a result's contents.
+
+In particular **a missing source row is `unavailable`, never `unsupported`.** `sourceRowCount == 0`
+means the mart had nothing at that date; that is a data-availability gap and says nothing about
+whether the semantic layer has a measure. Publishing a gap as "unsupported" makes a data problem read
+as a deliberate design limit, which is how it stops being investigated. `sourceRowCount` still travels
+on the metric, so a consumer can tell the two kinds of gap apart without the packet guessing.
+
+For the Revenue digest, `unsupported` is in fact **unreachable**: the only unsupported pairs are
+`day+budget` and `day+forecast`, `_validate_revenue_digest_request` rejects them before any DAX is
+built, and `named_queries.py` classifies `unsupported_comparator` as a `policy="block"` rule — an
+error, not a result state. The branch is still written, and still reads the authoritative rule rather
+than hard-coding `True`, so a future capability that surfaces the state instead of rejecting it is
+correct without a rewrite. Its canonical fixture is therefore explicitly synthetic.
 
 **`recommendedPresentation` — declarative only.** One token from a bounded registry
 (`performance` | `trend` | `breakdown`), declared per *capability* rather than chosen per result and
@@ -459,9 +487,15 @@ Four consequences worth recording:
   mapping cannot drift behind the dataclasses.
 - **`to_json()` has no `default=` fallback**, so an unexpected type raises instead of being silently
   stringified into the contract.
-- **NaN and ±Infinity cannot enter the contract.** They are rejected at *construction*, so the failure
-  names the field, and `to_json()` additionally passes `allow_nan=False`. They are not representable
-  in JSON, and `System.Text.Json` refuses to read the non-standard literals at all.
+- **NaN and ±Infinity cannot cross the wire boundary — at four independent layers.**
+  `_validate_numeric_field` rejects them at the governed *execution* boundary; the contract rejects
+  them at *construction*, so the failure names the field; `to_json()` passes `allow_nan=False`; and
+  the canonical fixture serializer passes `allow_nan=False` too. That last one was a real gap —
+  `json.dumps` defaults to `allow_nan=True`, so the fixture writer could emit the non-standard `NaN`
+  literal, producing a file Python reads back happily and `System.Text.Json` cannot parse at all. The
+  one negative fixture that must be non-strict is written through a separately named
+  `serialize_non_conformant`, so the strict path has no bypass parameter, and a test pins that it is
+  the only non-strict artifact in the repository.
 
 ### 6.5 Wire contract, schema and canonical fixtures (N07 — built)
 
@@ -535,6 +569,22 @@ is a post-projection assertion inside `from_revenue_digest_result` — proposed,
 `fnb`, `market_segments` or `holdings` — a frozen wire contract must not accept a token no producer
 can emit, even though the Python `Literal` declares them for typing honesty. `payloadType` and
 `questionType` are now enums rather than consts, because three payload families are frozen.
+
+**Deterministic deserialization.** `payloadType` is a single top-level string discriminator,
+serialized *before* `payload`, and it maps 1:1 onto payload shape — so a `JsonConverter` reads one
+token from a streaming `Utf8JsonReader` and dispatches to one concrete type without ever probing
+payload fields or buffering the document. `context` is separately polymorphic and carries its own
+leading `kind` discriminator, so a consumer never infers the context type from the payload type even
+though the two correlate today.
+
+`questionType` (analytical question family) and `payloadType` (result shape) are **separate fields**,
+and conceptually different — families A and D₁ both answer as `performance`, so question family is
+already coarser than capability. In v2 the schema's per-payloadType branches **pin them 1:1**, so
+`questionType` carries no independent information today, and a `breakdown` payload answering a
+`variance_drivers` question would be rejected. That is deliberate for the freeze: **relaxing a
+constraint later is backward-compatible for existing consumers, whereas tightening one is not**, so
+freezing the stricter form keeps the option open at no cost. (`recommendedPresentation` is
+deliberately *not* pinned this way — a test enforces that asymmetry.)
 
 **C# / TypeScript mapping note.** `schemaVersion`/`payloadType`/`state`/`recommendedPresentation` →
 `string` (stable tokens); `businessDate`/`startDate`/`endDate`/`points[].date` → `DateOnly`

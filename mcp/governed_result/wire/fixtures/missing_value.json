@@ -32,7 +32,7 @@
         "value": null,
         "sourceRowCount": 0,
         "comparison": {
-          "state": "unsupported",
+          "state": "unavailable",
           "value": null,
           "absoluteVariance": null,
           "variancePct": null,

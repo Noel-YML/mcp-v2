@@ -272,9 +272,29 @@ def _variance_reconciles(source_value: float, computed_value: float) -> bool:
 # convention (mcp/apps/revenue/src/format.ts documents that occupancy_pct is a
 # fraction, not an already-scaled 0-100 number). +5% is 0.05.
 #
-# DENOMINATOR: the MAGNITUDE of the comparator, so the sign of the relative
-# change always agrees with the sign of the absolute variance. Dividing by a
-# signed negative base would report an improvement from -100 to -50 as -50%.
+# DENOMINATOR: the MAGNITUDE of the comparator - `abs(comparison_value)`.
+#
+# This is a deliberate SEMANTIC choice, not a style one, because a negative
+# comparator is genuinely reachable in this metric domain. Nothing in the
+# governed Revenue contract constrains a value to be non-negative:
+# `_validate_numeric_field` accepts any finite number, and a revenue line
+# legitimately goes negative when credits, rebates, refunds or period
+# corrections outweigh takings - `total_other_misc` most realistically, with the
+# derived rates `adr`/`revpar` inheriting the sign. `test_variance_pct_semantics`
+# pins that premise, so if a non-negativity invariant is ever introduced this
+# decision gets revisited rather than silently inherited.
+#
+# THE INVARIANT THIS BUYS: sign(variance_pct) == sign(absolute variance), always.
+# With a signed denominator, a genuine improvement from -100 to -50 (absolute
+# variance +50) would be reported as -50% - a relative figure contradicting the
+# absolute one directly beside it on the same KPI card, with the arrow pointing
+# the wrong way.
+#
+# THE COST, stated so a consumer is not misled: this is a magnitude-relative
+# change, NOT the textbook signed growth rate. For a non-negative base the two
+# are identical, which is every case in practice today. For a negative base they
+# differ in sign, so this figure must not be compared against a growth rate
+# computed elsewhere from a signed base.
 #
 # DIVISION BY ZERO: there is no division. A zero comparator is a real governed
 # value, not a missing one, so the answer is not "0%", not infinity and not an
@@ -287,6 +307,10 @@ def compute_variance_pct(
 
     `reason` is `insufficient_data` when an input is missing, and
     `comparator_zero_base` when the comparator is exactly zero.
+
+    See the comment block above for the denominator semantic: the divisor is the
+    comparator's MAGNITUDE, so the result always agrees in sign with
+    `value - comparison_value`.
     """
     if value is None or comparison_value is None:
         return None, "insufficient_data"

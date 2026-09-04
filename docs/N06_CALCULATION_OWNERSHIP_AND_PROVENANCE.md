@@ -85,10 +85,10 @@ second hand-typed copy.
 | `value` | **A** | Fabric via `execute_revenue_performance_digest` |
 | `sourceRowCount` | B | governed row count — lets a consumer see *why* a value is missing |
 | `comparison` present/absent | B | structural, derived from `context.comparator` |
-| `comparison.state` | B | structural — which of the three requested outcomes occurred. See §12.2 |
+| `comparison.state` | B | `dax_query_builder.revenue_digest_comparator_is_supported` (support verdict) plus the presence of a governed comparison value — **never row absence**. See §12.2 |
 | `comparison.value` | **A** | governed comparison measure |
 | `comparison.absoluteVariance` | **A** | `revenue_digest_execution.py` — `value - comparison_value`, the single authoritative variance, in the metric's **own unit** |
-| `comparison.variancePct` | **A** | `revenue_digest_execution.compute_variance_pct` — the governed **relative** change, a different quantity. See §12.1 |
+| `comparison.variancePct` | **A** | `revenue_digest_execution.compute_variance_pct` — the governed **relative** change, a different quantity, divided by the comparator's **magnitude** so its sign agrees with the absolute variance. See §12.1 |
 | `comparison.variancePctReason` | B | bounded token saying why a computable percentage is null. See §12.2 |
 | `comparison.sourceVariance` | **A** | the mart's own `Value_Vs_*` column |
 
@@ -323,6 +323,15 @@ Neither is a business number. `state` names which of the three requested-compara
 (`available` / `unavailable` / `unsupported`), and `variancePctReason` names why a percentage that
 could have been computed was not (`comparator_zero_base` / `insufficient_data`). Both are emitted by
 deterministic analytical execution and both are **bounded token sets**, not free text.
+
+**`state` has a named authoritative producer, like any class-B field.** The `unsupported` verdict is
+READ from `dax_query_builder.revenue_digest_comparator_is_supported` — the capability's own
+`(timeframe, comparator)` support rule, which the request validator uses too. It is **never inferred
+from the result's contents**, and specifically **a missing source row is `unavailable`, never
+`unsupported`**: `sourceRowCount == 0` is a data gap, while `unsupported` is a claim about the
+semantic layer, and a row count cannot support that claim. Letting it do so would be a derivation
+performed outside governed execution — precisely the §4 boundary — and it would make a data problem
+read as a deliberate design limit.
 
 They exist for the same reason `sourceRowCount` does: so a consumer can see *why* a value is absent
 without guessing. `state == "available"` **if and only if** `value is not null`, enforced in the

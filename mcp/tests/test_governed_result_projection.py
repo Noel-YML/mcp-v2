@@ -24,7 +24,15 @@ from dmr.named_queries import NAMED_QUERY_DEFINITIONS, QueryId
 from dmr.revenue_performance_digest_reference import REVENUE_METRIC_MAPPINGS, VIEW_METRICS
 from fabric_client.result import FabricQueryResult
 from governed_result.contract import MetricSet
-from governed_result.projection import CAPABILITY_DESCRIPTORS, from_revenue_digest_result
+from dmr.dax_query_builder import (
+    _validate_revenue_digest_request,
+    revenue_digest_comparator_is_supported,
+)
+from governed_result.projection import (
+    CAPABILITY_DESCRIPTORS,
+    _comparison_for,
+    from_revenue_digest_result,
+)
 from revenue_digest_execution import compute_variance_pct
 from results.repository import InMemoryResultRepository
 from scope.scope_context import ScopeContext
@@ -50,7 +58,7 @@ def _metric_result(metric_id="total_revenue", **overrides):
     return rde.RevenueDigestMetricResult(**fields)
 
 
-def _digest_result(*, metrics=None, comparator="none", is_partial=False, warnings=(), query_id=_QUERY_ID):
+def _digest_result(*, metrics=None, comparator="none", timeframe="day", is_partial=False, warnings=(), query_id=_QUERY_ID):
     return rde.RevenueDigestResult(
         schema_version="1.0",
         result_id="res_aaaaaaaaaaaaaaaa",
@@ -58,7 +66,7 @@ def _digest_result(*, metrics=None, comparator="none", is_partial=False, warning
         query_id=query_id,
         query_version="1",
         context=rde.RevenueDigestRequestContext(
-            business_date="2026-08-16", timeframe="day", view="headline", comparator=comparator
+            business_date="2026-08-16", timeframe=timeframe, view="headline", comparator=comparator
         ),
         metrics=metrics if metrics is not None else (_metric_result(),),
         quality=rde.RevenueDigestQuality(is_partial=is_partial, warnings=tuple(warnings)),
@@ -249,17 +257,25 @@ def test_a_zero_comparator_yields_a_null_percentage_with_a_reason_not_a_zero():
     assert comparison.absolute_variance == 100.0
 
 
-def test_a_requested_comparator_with_no_source_row_is_unsupported_not_unavailable():
-    """The two requested-but-absent outcomes are distinguished: a metric with
-    no physical row at all did not participate in the comparator, which is a
-    different fact from a present row that carries no comparison value."""
+def test_a_missing_source_row_is_unavailable_never_unsupported():
+    """REGRESSION. The projection previously read `source_row_count == 0` as
+    `unsupported`, which is wrong in a way that matters.
+
+    A missing physical row means the mart had nothing at this date - a
+    data-availability gap. `unsupported` is a claim that the semantic layer has
+    no measure for the requested (timeframe, comparator) pair. A row count
+    cannot support that claim, and letting it do so turns a data problem into
+    something that reads as a deliberate design limit and stops being
+    investigated.
+    """
     no_row = from_revenue_digest_result(
         _digest_result(
             metrics=(_metric_result(value=None, comparison_value=None, source_row_count=0),),
             comparator="last_year",
         )
     ).payload.metrics[0].comparison
-    assert no_row.state == "unsupported"
+    assert no_row.state == "unavailable"
+    assert no_row.value is None
 
     row_without_comparison = from_revenue_digest_result(
         _digest_result(
@@ -268,8 +284,74 @@ def test_a_requested_comparator_with_no_source_row_is_unsupported_not_unavailabl
         )
     ).payload.metrics[0].comparison
     assert row_without_comparison.state == "unavailable"
-    assert row_without_comparison.value is None
-    assert row_without_comparison.variance_pct is None
+
+    # Both gaps are `unavailable`; `sourceRowCount` is what still distinguishes
+    # them, so no information is lost by refusing to guess.
+    assert no_row.state == row_without_comparison.state
+
+
+@pytest.mark.parametrize(
+    "timeframe,comparator",
+    [("day", "last_year"), ("mtd", "last_year"), ("ytd", "budget"), ("mtd", "forecast")],
+)
+def test_the_support_verdict_is_read_from_the_capability_rule_not_the_result(timeframe, comparator):
+    """`unsupported` must come from the authoritative (timeframe, comparator)
+    rule, which is a property of the CAPABILITY - never re-derived from
+    whatever a result happens to contain.
+
+    Every pair here is supported, so no amount of missing data may produce
+    `unsupported`.
+    """
+    assert revenue_digest_comparator_is_supported(timeframe, comparator)
+    comparison = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=None, comparison_value=None, source_row_count=0),),
+            comparator=comparator,
+            timeframe=timeframe,
+        )
+    ).payload.metrics[0].comparison
+    assert comparison.state == "unavailable"
+
+
+@pytest.mark.parametrize("timeframe,comparator", [("day", "budget"), ("day", "forecast")])
+def test_the_only_unsupported_pairs_are_rejected_before_a_result_can_exist(timeframe, comparator):
+    """Why `unsupported` is unreachable for this capability, asserted rather
+    than assumed.
+
+    `day+budget` and `day+forecast` are the only unsupported Revenue pairs -
+    no Value_Budget_Current / Value_Forecast_Current measure exists - and the
+    request validator REJECTS them before any DAX is built.
+    `named_queries.py` classifies `unsupported_comparator` as a `policy="block"`
+    rule: an error, not a returned result state.
+
+    So a RevenueDigestResult that exists at all came from a supported pair, and
+    the projection's `unsupported` branch cannot fire for this capability. It is
+    still written, and still reads the authoritative rule, so that a future
+    capability which surfaces the state instead of rejecting it is correct
+    without a rewrite.
+    """
+    assert not revenue_digest_comparator_is_supported(timeframe, comparator)
+    with pytest.raises(ValueError, match="not supported for timeframe"):
+        _validate_revenue_digest_request(
+            RevenueDigestRequest(
+                date=date(2026, 8, 16), timeframe=timeframe, view="headline", comparator=comparator
+            )
+        )
+
+
+def test_the_unsupported_branch_still_produces_a_correct_packet_if_it_ever_fires():
+    """The branch is unreachable for Revenue today but must not be dead-wrong.
+    Driven directly, it yields a well-formed `unsupported` comparison: no
+    comparator value, no percentage, and no reason (the state already explains
+    the absence)."""
+    comparison = _comparison_for(
+        _metric_result(value=100.0, comparison_value=None, source_row_count=1),
+        comparator_supported=False,
+    )
+    assert comparison.state == "unsupported"
+    assert comparison.value is None
+    assert comparison.variance_pct is None
+    assert comparison.variance_pct_reason is None
 
 
 def test_recommended_presentation_is_declared_per_capability_not_derived():
