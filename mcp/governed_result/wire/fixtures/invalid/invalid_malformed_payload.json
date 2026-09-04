@@ -23,23 +23,8 @@
   "provenance": {
     "semanticModelRef": "dmr-v3"
   },
-  "payload": {
-    "metrics": [
-      {
-        "metricId": "total_revenue",
-        "label": "Total Revenue",
-        "unit": "currency",
-        "value": 100.0,
-        "sourceRowCount": 1,
-        "comparison": {
-          "state": "available",
-          "value": 40.0,
-          "absoluteVariance": 999.0,
-          "variancePct": 888.0,
-          "variancePctReason": null,
-          "sourceVariance": null
-        }
-      }
-    ]
-  }
+  "payload": [
+    "total_revenue",
+    118246.0
+  ]
 }

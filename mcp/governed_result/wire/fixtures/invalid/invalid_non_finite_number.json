@@ -4,6 +4,7 @@
   "domain": "hotel_performance",
   "questionType": "performance",
   "status": "success",
+  "resultId": "res_0123456789abcdef",
   "queryId": "revenue_performance_digest_v1",
   "queryVersion": "1",
   "traceId": "0000trace0000demo",
@@ -28,7 +29,7 @@
         "metricId": "total_revenue",
         "label": "Total Revenue",
         "unit": "currency",
-        "value": 118246.0,
+        "value": NaN,
         "sourceRowCount": 1,
         "comparison": {
           "state": "available",
@@ -55,6 +56,5 @@
         }
       }
     ]
-  },
-  "result_id": "res_0123456789abcdef"
+  }
 }

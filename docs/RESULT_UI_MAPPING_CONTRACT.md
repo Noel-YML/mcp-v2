@@ -241,6 +241,9 @@ Source Label, semantic binding (§11), and the full state machine (§12).
 in that template is renderable. Three target-state presentation requirements on the Performance
 template are **not** available through the governed digest today:
 
+
+> **Gate 3 status update (N05/N07, packet `schemaVersion` `"2.0"`).** A governed relative percentage variance now EXISTS — `comparison.variancePct`, with `variancePctReason`, owned by `revenue_digest_execution.compute_variance_pct`. It exists **only in the governed result envelope**. `get_performance_digest`'s live wire contract (`RevenueDigestResult`) is unchanged and still carries no percentage field, and **nothing consumes the envelope yet**. So statements below that a percentage variance is unavailable remain accurate *for what renders today*; the prohibition on the UI or the agent deriving one is **unchanged and permanent**. See `docs/GOVERNED_RESULT_ARCHITECTURE.md` §6.4 and `docs/N06_CALCULATION_OWNERSHIP_AND_PROVENANCE.md` §12.1.
+
 | Target-state requirement | Why it is not renderable today | Classification |
 |---|---|---|
 | **Percentage variance** | No percentage variance field exists in any contract; the model and the UI are both forbidden from producing one | **Backend governed output extension** — arrives with taxonomy C2 (output-only, no new tool or parameter) |

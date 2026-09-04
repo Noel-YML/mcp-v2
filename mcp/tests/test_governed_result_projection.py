@@ -24,7 +24,16 @@ from dmr.named_queries import NAMED_QUERY_DEFINITIONS, QueryId
 from dmr.revenue_performance_digest_reference import REVENUE_METRIC_MAPPINGS, VIEW_METRICS
 from fabric_client.result import FabricQueryResult
 from governed_result.contract import MetricSet
-from governed_result.projection import CAPABILITY_DESCRIPTORS, from_revenue_digest_result
+from dmr.dax_query_builder import (
+    _validate_revenue_digest_request,
+    revenue_digest_comparator_is_supported,
+)
+from governed_result.projection import (
+    CAPABILITY_DESCRIPTORS,
+    _comparison_for,
+    from_revenue_digest_result,
+)
+from revenue_digest_execution import compute_variance_pct
 from results.repository import InMemoryResultRepository
 from scope.scope_context import ScopeContext
 
@@ -49,7 +58,7 @@ def _metric_result(metric_id="total_revenue", **overrides):
     return rde.RevenueDigestMetricResult(**fields)
 
 
-def _digest_result(*, metrics=None, comparator="none", is_partial=False, warnings=(), query_id=_QUERY_ID):
+def _digest_result(*, metrics=None, comparator="none", timeframe="day", is_partial=False, warnings=(), query_id=_QUERY_ID):
     return rde.RevenueDigestResult(
         schema_version="1.0",
         result_id="res_aaaaaaaaaaaaaaaa",
@@ -57,7 +66,7 @@ def _digest_result(*, metrics=None, comparator="none", is_partial=False, warning
         query_id=query_id,
         query_version="1",
         context=rde.RevenueDigestRequestContext(
-            business_date="2026-08-16", timeframe="day", view="headline", comparator=comparator
+            business_date="2026-08-16", timeframe=timeframe, view="headline", comparator=comparator
         ),
         metrics=metrics if metrics is not None else (_metric_result(),),
         quality=rde.RevenueDigestQuality(is_partial=is_partial, warnings=tuple(warnings)),
@@ -177,20 +186,184 @@ def test_projection_does_not_recompute_a_deliberately_inconsistent_variance():
     assert envelope.payload.metrics[0].comparison.absolute_variance == 999.0
 
 
-def test_projection_manufactures_no_percentage_share_or_rank():
-    serialized = json.dumps(
-        from_revenue_digest_result(
-            _digest_result(
-                metrics=(_metric_result(value=100.0, comparison_value=80.0, computed_variance_value=20.0),),
-                comparator="last_year",
-            )
-        ).to_dict()
+def test_projection_manufactures_no_analytical_quantity_the_digest_lacks():
+    """The projection may re-express governed values; it may not invent new
+    analytical quantities.
+
+    Asserted on the KEY SETS of the analytical objects rather than by searching
+    the serialized JSON for words. A substring search is the wrong instrument:
+    `total_revenue` is a legitimate metric id and `ratio` is a legitimate unit
+    token, so a word ban would fail on correct output while still missing a
+    field named something unexpected. Pinning the key sets catches every added
+    field, whatever it is called.
+
+    `variancePct` is deliberately INSIDE the allowed set now - packet v2 carries
+    it as a governed value. What guards it is delegation to the governed owner,
+    asserted by the test below, not absence.
+    """
+    envelope = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=80.0, computed_variance_value=20.0),),
+            comparator="last_year",
+        )
     )
-    for forbidden in ("variance_pct", "percentage", "percent", "share", "rank", "contribution", "ratio"):
-        assert forbidden not in serialized.lower()
-    # The relative variance a naive adapter would have produced (20/80 = 0.25)
-    # must appear nowhere.
-    assert "0.25" not in serialized
+    metric = envelope.to_dict()["payload"]["metrics"][0]
+    assert set(metric) == {"metricId", "label", "unit", "value", "sourceRowCount", "comparison"}
+    assert set(metric["comparison"]) == {
+        "state",
+        "value",
+        "absoluteVariance",
+        "variancePct",
+        "variancePctReason",
+        "sourceVariance",
+    }
+
+
+def test_variance_pct_is_delegated_to_the_governed_owner_not_computed_here():
+    """The projection must not restate the relative-change formula.
+
+    Asserted by equality against `revenue_digest_execution.compute_variance_pct`
+    itself, so if someone inlines a division here that disagrees with the
+    governed owner - a different denominator, a *100 rescale, a rounding step -
+    this fails.
+    """
+    envelope = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=80.0, computed_variance_value=20.0),),
+            comparator="last_year",
+        )
+    )
+    expected_pct, expected_reason = compute_variance_pct(100.0, 80.0)
+    comparison = envelope.payload.metrics[0].comparison
+    assert comparison.variance_pct == expected_pct
+    assert comparison.variance_pct_reason is expected_reason
+
+
+def test_a_zero_comparator_yields_a_null_percentage_with_a_reason_not_a_zero():
+    """A zero comparator is a real governed value, so the answer is neither
+    "0%" nor an error nor infinity - no division happens at all, and the
+    absolute variance is preserved."""
+    envelope = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=0.0, computed_variance_value=100.0),),
+            comparator="last_year",
+        )
+    )
+    comparison = envelope.payload.metrics[0].comparison
+    assert comparison.state == "available"
+    assert comparison.value == 0.0
+    assert comparison.variance_pct is None
+    assert comparison.variance_pct_reason == "comparator_zero_base"
+    assert comparison.absolute_variance == 100.0
+
+
+def test_a_missing_source_row_is_unavailable_never_unsupported():
+    """REGRESSION. The projection previously read `source_row_count == 0` as
+    `unsupported`, which is wrong in a way that matters.
+
+    A missing physical row means the mart had nothing at this date - a
+    data-availability gap. `unsupported` is a claim that the semantic layer has
+    no measure for the requested (timeframe, comparator) pair. A row count
+    cannot support that claim, and letting it do so turns a data problem into
+    something that reads as a deliberate design limit and stops being
+    investigated.
+    """
+    no_row = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=None, comparison_value=None, source_row_count=0),),
+            comparator="last_year",
+        )
+    ).payload.metrics[0].comparison
+    assert no_row.state == "unavailable"
+    assert no_row.value is None
+
+    row_without_comparison = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=None, source_row_count=1),),
+            comparator="last_year",
+        )
+    ).payload.metrics[0].comparison
+    assert row_without_comparison.state == "unavailable"
+
+    # Both gaps are `unavailable`; `sourceRowCount` is what still distinguishes
+    # them, so no information is lost by refusing to guess.
+    assert no_row.state == row_without_comparison.state
+
+
+@pytest.mark.parametrize(
+    "timeframe,comparator",
+    [("day", "last_year"), ("mtd", "last_year"), ("ytd", "budget"), ("mtd", "forecast")],
+)
+def test_the_support_verdict_is_read_from_the_capability_rule_not_the_result(timeframe, comparator):
+    """`unsupported` must come from the authoritative (timeframe, comparator)
+    rule, which is a property of the CAPABILITY - never re-derived from
+    whatever a result happens to contain.
+
+    Every pair here is supported, so no amount of missing data may produce
+    `unsupported`.
+    """
+    assert revenue_digest_comparator_is_supported(timeframe, comparator)
+    comparison = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=None, comparison_value=None, source_row_count=0),),
+            comparator=comparator,
+            timeframe=timeframe,
+        )
+    ).payload.metrics[0].comparison
+    assert comparison.state == "unavailable"
+
+
+@pytest.mark.parametrize("timeframe,comparator", [("day", "budget"), ("day", "forecast")])
+def test_the_only_unsupported_pairs_are_rejected_before_a_result_can_exist(timeframe, comparator):
+    """Why `unsupported` is unreachable for this capability, asserted rather
+    than assumed.
+
+    `day+budget` and `day+forecast` are the only unsupported Revenue pairs -
+    no Value_Budget_Current / Value_Forecast_Current measure exists - and the
+    request validator REJECTS them before any DAX is built.
+    `named_queries.py` classifies `unsupported_comparator` as a `policy="block"`
+    rule: an error, not a returned result state.
+
+    So a RevenueDigestResult that exists at all came from a supported pair, and
+    the projection's `unsupported` branch cannot fire for this capability. It is
+    still written, and still reads the authoritative rule, so that a future
+    capability which surfaces the state instead of rejecting it is correct
+    without a rewrite.
+    """
+    assert not revenue_digest_comparator_is_supported(timeframe, comparator)
+    with pytest.raises(ValueError, match="not supported for timeframe"):
+        _validate_revenue_digest_request(
+            RevenueDigestRequest(
+                date=date(2026, 8, 16), timeframe=timeframe, view="headline", comparator=comparator
+            )
+        )
+
+
+def test_the_unsupported_branch_still_produces_a_correct_packet_if_it_ever_fires():
+    """The branch is unreachable for Revenue today but must not be dead-wrong.
+    Driven directly, it yields a well-formed `unsupported` comparison: no
+    comparator value, no percentage, and no reason (the state already explains
+    the absence)."""
+    comparison = _comparison_for(
+        _metric_result(value=100.0, comparison_value=None, source_row_count=1),
+        comparator_supported=False,
+    )
+    assert comparison.state == "unsupported"
+    assert comparison.value is None
+    assert comparison.variance_pct is None
+    assert comparison.variance_pct_reason is None
+
+
+def test_recommended_presentation_is_declared_per_capability_not_derived():
+    """It comes from the capability descriptor, so it cannot vary with a
+    result's contents - and it is a bare token, never markup or a template."""
+    envelope = from_revenue_digest_result(_digest_result())
+    assert envelope.recommended_presentation == "performance"
+    assert (
+        CAPABILITY_DESCRIPTORS[QueryId.REVENUE_PERFORMANCE_DIGEST_V1.value].recommended_presentation
+        == "performance"
+    )
+    assert "<" not in envelope.to_dict()["recommendedPresentation"]
 
 
 def test_quality_is_copied_verbatim_including_prose_warnings():

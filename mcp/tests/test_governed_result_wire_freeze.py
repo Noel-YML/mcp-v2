@@ -65,7 +65,7 @@ def test_the_schema_file_is_itself_a_valid_json_schema():
     schema = _schema()
     jsonschema.validators.validator_for(schema).check_schema(schema)
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
-    assert schema["$id"] == "urn:ask-ariel:schema:governed-result-envelope:1.0"
+    assert schema["$id"] == "urn:ask-ariel:schema:governed-result-envelope:2.0"
 
 
 def test_at_least_the_expected_canonical_fixtures_exist():
@@ -77,10 +77,18 @@ def test_at_least_the_expected_canonical_fixtures_exist():
         "missing_value",
         "comparator_not_requested",
         "comparator_requested_unavailable",
+        "comparator_unsupported",
+        "comparator_zero_base",
         "partial_quality",
         "independent_variance_nullability",
         "floating_point_fidelity",
         "inconsistent_governed_variance",
+        # The other two implemented payload families. Synthetic - no capability
+        # produces them - but the contract shape is frozen all the same.
+        "trend_standard",
+        "trend_with_gap",
+        "breakdown_standard",
+        "breakdown_share_not_approved",
     ):
         assert required in _VALID_NAMES, f"missing canonical fixture {required!r}"
 
@@ -132,14 +140,53 @@ def test_every_invalid_fixture_fails_the_json_schema_or_the_semantic_validator(n
     assert schema_errors or semantic_errors, f"{name} was accepted by both layers"
 
 
-def test_duplicate_metric_id_is_the_case_only_the_semantic_validator_catches():
+# The invalid fixtures that JSON Schema 2020-12 CANNOT express, and why. Listed
+# explicitly rather than discovered, so that the division of labour between the
+# schema and validation.py is asserted instead of assumed - if the schema later
+# grows able to catch one of these, or the validator stops catching it, the two
+# tests below say which and why.
+_VALIDATOR_ONLY_CASES = {
+    "invalid_duplicate_metric_id": (
+        "duplicates",
+        "uniqueItems compares whole items, and there is no uniqueItemProperties keyword",
+    ),
+    "invalid_unordered_series": (
+        "ordered ascending",
+        "ordering across array items is not expressible",
+    ),
+    "invalid_inverted_date_range": (
+        "before startDate",
+        "an ordering relationship between two sibling values is not expressible",
+    ),
+    "invalid_non_finite_number": (
+        "expected a number or null",
+        "JSON Schema has no notion of NaN, and Python's json.loads accepts the "
+        "non-standard literal by default",
+    ),
+}
+
+
+@pytest.mark.parametrize("name,expected,reason", [(k, v[0], v[1]) for k, v in _VALIDATOR_ONLY_CASES.items()])
+def test_the_cases_only_the_semantic_validator_can_catch(name, expected, reason):
     """Documents the exact division of labour, so nobody later assumes the
-    schema alone is sufficient. `uniqueItems` compares whole items and there is
-    no `uniqueItemProperties` keyword in 2020-12."""
-    packet = _load(_INVALID_DIR / "invalid_duplicate_metric_id.json")
-    assert not list(_validator().iter_errors(packet)), "schema unexpectedly caught duplicate metricId"
+    schema alone is sufficient. These four are the whole reason validation.py
+    exists alongside the schema."""
+    packet = _load(_INVALID_DIR / f"{name}.json")
+    assert not list(_validator().iter_errors(packet)), (
+        f"the schema unexpectedly caught {name} - if it can now express this, "
+        f"move it out of _VALIDATOR_ONLY_CASES ({reason})"
+    )
     violations = validate_governed_result_wire(packet)
-    assert any("duplicates" in v for v in violations), violations
+    assert any(expected in v for v in violations), violations
+
+
+@pytest.mark.parametrize("name", [n for n in _INVALID_NAMES if n not in _VALIDATOR_ONLY_CASES])
+def test_every_other_invalid_fixture_is_caught_by_the_schema_itself(name):
+    """The complement of the list above: everything a cross-language consumer
+    can reject with the schema alone, no Python required. A C# or TypeScript
+    port gets these for free."""
+    packet = _load(_INVALID_DIR / f"{name}.json")
+    assert list(_validator().iter_errors(packet)), f"the schema accepted invalid fixture {name}"
 
 
 # --- C. the two layers agree on every valid fixture -------------------------
@@ -161,12 +208,17 @@ def test_validator_key_sets_match_the_schema_exactly():
     defs = schema["$defs"]
     assert set(schema["properties"]) == set(v.ENVELOPE_KEYS)
     assert set(schema["required"]) == set(v.ENVELOPE_KEYS)
-    assert set(defs["businessDateContext"]["properties"]) == set(v.CONTEXT_KEYS)
+    assert set(defs["businessDateContext"]["properties"]) == set(v.BUSINESS_DATE_CONTEXT_KEYS)
+    assert set(defs["dateRangeContext"]["properties"]) == set(v.DATE_RANGE_CONTEXT_KEYS)
     assert set(defs["governedQuality"]["properties"]) == set(v.QUALITY_KEYS)
     assert set(defs["provenanceSummary"]["properties"]) == set(v.PROVENANCE_KEYS)
-    assert set(defs["metricSet"]["properties"]) == set(v.PAYLOAD_KEYS)
+    assert set(defs["metricSet"]["properties"]) == set(v.METRIC_SET_KEYS)
     assert set(defs["governedMetric"]["properties"]) == set(v.METRIC_KEYS)
     assert set(defs["metricComparison"]["properties"]) == set(v.COMPARISON_KEYS)
+    assert set(defs["timeSeries"]["properties"]) == set(v.TIME_SERIES_KEYS)
+    assert set(defs["seriesPoint"]["properties"]) == set(v.SERIES_POINT_KEYS)
+    assert set(defs["breakdown"]["properties"]) == set(v.BREAKDOWN_KEYS)
+    assert set(defs["breakdownRow"]["properties"]) == set(v.BREAKDOWN_ROW_KEYS)
 
 
 def test_validator_token_domains_match_the_schema_exactly():
@@ -175,16 +227,58 @@ def test_validator_token_domains_match_the_schema_exactly():
     schema = _schema()
     defs = schema["$defs"]
     assert schema["properties"]["schemaVersion"]["const"] == v.EXPECTED_SCHEMA_VERSION
-    assert schema["properties"]["payloadType"]["const"] == v.EXPECTED_PAYLOAD_TYPE
+    assert tuple(schema["properties"]["payloadType"]["enum"]) == v.PAYLOAD_TYPES
     assert schema["properties"]["domain"]["const"] == v.EXPECTED_DOMAIN
-    assert schema["properties"]["questionType"]["const"] == v.EXPECTED_QUESTION_TYPE
+    assert tuple(schema["properties"]["questionType"]["enum"]) == v.QUESTION_TYPES
     assert schema["properties"]["status"]["const"] == v.EXPECTED_STATUS
+    assert tuple(schema["properties"]["recommendedPresentation"]["enum"]) == v.PRESENTATIONS
+
     ctx = defs["businessDateContext"]["properties"]
-    assert ctx["kind"]["const"] == v.EXPECTED_CONTEXT_KIND
+    assert ctx["kind"]["const"] == "business_date"
     assert tuple(ctx["timeframe"]["enum"]) == v.TIMEFRAMES
-    assert tuple(ctx["view"]["enum"]) == v.VIEWS
+    # `view` is nullable, so its enum lives inside the oneOf's string branch.
+    assert tuple(ctx["view"]["oneOf"][0]["enum"]) == v.VIEWS
     assert tuple(ctx["comparator"]["enum"]) == v.COMPARATORS
-    assert tuple(defs["governedMetric"]["properties"]["unit"]["enum"]) == v.UNITS
+
+    range_ctx = defs["dateRangeContext"]["properties"]
+    assert range_ctx["kind"]["const"] == "date_range"
+    assert tuple(range_ctx["grain"]["enum"]) == v.GRAINS
+    assert tuple(range_ctx["comparator"]["enum"]) == v.COMPARATORS
+
+    assert set(v.CONTEXT_KINDS) == {
+        defs["businessDateContext"]["properties"]["kind"]["const"],
+        defs["dateRangeContext"]["properties"]["kind"]["const"],
+    }
+
+    comparison = defs["metricComparison"]["properties"]
+    assert tuple(comparison["state"]["enum"]) == v.COMPARISON_STATES
+    assert tuple(comparison["variancePctReason"]["oneOf"][0]["enum"]) == v.VARIANCE_PCT_REASONS
+
+    for definition in ("governedMetric", "timeSeries", "breakdown"):
+        assert tuple(defs[definition]["properties"]["unit"]["enum"]) == v.UNITS
+
+
+def test_the_discriminator_rules_agree_between_the_schema_and_the_validator():
+    """Three places declare which payload each discriminator requires and which
+    context kind that payload uses: contract.py, the schema's per-payloadType
+    branches, and validation.py. This is what keeps them from drifting."""
+    from governed_result import contract as c
+    from governed_result import validation as v
+
+    schema = _schema()
+    branches = {}
+    for branch in schema["allOf"]:
+        condition = branch["if"]["properties"].get("payloadType", {})
+        if "const" not in condition or "context" in branch["if"]["properties"]:
+            continue  # the comparator invariant, not a discriminator branch
+        branches[condition["const"]] = branch["then"]
+
+    assert set(branches) == set(v.PAYLOAD_RULES) == set(c._IMPLEMENTED_PAYLOADS)
+
+    for payload_type, rules in v.PAYLOAD_RULES.items():
+        assert branches[payload_type]["properties"]["questionType"]["const"] == rules["question_type"]
+        _, allowed_kinds = c._IMPLEMENTED_PAYLOADS[payload_type]
+        assert allowed_kinds == (rules["context_kind"],)
 
 
 # --- D. the frozen wire surface --------------------------------------------
@@ -194,7 +288,7 @@ def test_frozen_top_level_property_names_and_casing():
     packet = _load(_FIXTURE_DIR / "success_standard.json")
     assert set(packet) == {
         "schemaVersion", "payloadType", "domain", "questionType", "status",
-        "resultId", "queryId", "queryVersion", "traceId",
+        "resultId", "queryId", "queryVersion", "traceId", "recommendedPresentation",
         "context", "quality", "provenance", "payload",
     }
     for key in packet:
@@ -209,8 +303,32 @@ def test_frozen_nested_property_names_and_casing():
     assert set(packet["payload"]) == {"metrics"}
     metric = packet["payload"]["metrics"][0]
     assert set(metric) == {"metricId", "label", "unit", "value", "sourceRowCount", "comparison"}
-    assert set(metric["comparison"]) == {"value", "absoluteVariance", "sourceVariance"}
+    assert set(metric["comparison"]) == {
+        "state", "value", "absoluteVariance", "variancePct", "variancePctReason", "sourceVariance",
+    }
     for container in (packet["context"], packet["quality"], packet["provenance"], metric, metric["comparison"]):
+        for key in container:
+            assert "_" not in key, f"nested key {key!r} is not camelCase"
+
+
+def test_frozen_trend_and_breakdown_property_names_and_casing():
+    """The other two payload families' frozen surfaces. Their envelopes are
+    identical to a metric_set's - only context, payloadType and payload differ,
+    which is the point of a common envelope."""
+    trend = _load(_FIXTURE_DIR / "trend_standard.json")
+    assert set(trend) == set(_load(_FIXTURE_DIR / "success_standard.json"))
+    assert set(trend["context"]) == {"kind", "startDate", "endDate", "grain", "comparator"}
+    assert set(trend["payload"]) == {"metricId", "label", "unit", "points"}
+    assert set(trend["payload"]["points"][0]) == {"date", "value"}
+
+    breakdown = _load(_FIXTURE_DIR / "breakdown_standard.json")
+    assert set(breakdown["payload"]) == {
+        "metricId", "label", "unit", "dimension", "reconciledTotal", "rows",
+    }
+    assert set(breakdown["payload"]["rows"][0]) == {"categoryId", "label", "value", "share", "rank"}
+
+    for container in (trend["context"], trend["payload"], trend["payload"]["points"][0],
+                      breakdown["payload"], breakdown["payload"]["rows"][0]):
         for key in container:
             assert "_" not in key, f"nested key {key!r} is not camelCase"
 
@@ -220,7 +338,7 @@ def test_frozen_token_values_are_snake_case_identifiers_not_camel_cased():
     trusted digest and the semantic registry, and are deliberately not
     re-cased."""
     packet = _load(_FIXTURE_DIR / "success_standard.json")
-    assert packet["schemaVersion"] == "1.0"
+    assert packet["schemaVersion"] == "2.0"
     assert packet["payloadType"] == "metric_set"
     assert packet["domain"] == "hotel_performance"
     assert packet["questionType"] == "performance"
@@ -260,6 +378,7 @@ def test_comparator_requested_unavailable_is_frozen_as_a_present_comparison_hold
     assert packet["context"]["comparator"] != "none"
     comparison = packet["payload"]["metrics"][0]["comparison"]
     assert comparison is not None
+    assert comparison["state"] == "unavailable"
     assert comparison["value"] is None
 
 
@@ -268,6 +387,84 @@ def test_comparison_members_are_frozen_as_independently_nullable():
     assert comparison["value"] == 264061.0
     assert comparison["absoluteVariance"] is None
     assert comparison["sourceVariance"] is None
+    # A present relative variance alongside an absent absolute one: the members
+    # really are independent, not an all-or-nothing group.
+    assert comparison["variancePct"] == -0.5522322645183118
+
+
+def test_the_five_comparison_states_are_frozen_as_structurally_distinct():
+    """Zero, null, not-requested, requested-but-unavailable and
+    requested-but-unsupported must stay five different shapes on the wire."""
+    not_requested = _load(_FIXTURE_DIR / "comparator_not_requested.json")["payload"]["metrics"][0]
+    assert not_requested["comparison"] is None
+
+    unavailable = _load(_FIXTURE_DIR / "comparator_requested_unavailable.json")["payload"]["metrics"][0]
+    assert unavailable["comparison"]["state"] == "unavailable"
+    assert unavailable["comparison"]["value"] is None
+
+    unsupported = _load(_FIXTURE_DIR / "comparator_unsupported.json")["payload"]["metrics"]
+    # Support is a property of the (timeframe, comparator) PAIR, so it applies
+    # uniformly to every metric in the view - never per row.
+    assert all(m["comparison"]["state"] == "unsupported" for m in unsupported)
+    assert all(m["comparison"]["value"] is None for m in unsupported)
+
+    available = _load(_FIXTURE_DIR / "success_standard.json")["payload"]["metrics"][0]["comparison"]
+    assert available["state"] == "available" and available["value"] == 264061.0
+
+
+def test_a_missing_source_row_is_frozen_as_unavailable_not_unsupported():
+    """REGRESSION, frozen on the wire. `sourceRowCount == 0` is a data gap, and
+    a data gap must never be published as a claim that the semantic layer does
+    not support the comparator."""
+    metric = _load(_FIXTURE_DIR / "missing_value.json")["payload"]["metrics"][0]
+    assert metric["sourceRowCount"] == 0
+    assert metric["value"] is None
+    assert metric["comparison"]["state"] == "unavailable"
+
+
+def test_the_unsupported_fixture_is_a_structurally_unsupported_pair_not_a_missing_row():
+    """`unsupported` must be justified by the capability's (timeframe,
+    comparator) support rule. The fixture uses day+budget - a pair with no
+    measure at all - and both its metrics have source rows, so nothing about
+    this packet could have been inferred from row absence."""
+    from dmr.dax_query_builder import revenue_digest_comparator_is_supported
+
+    packet = _load(_FIXTURE_DIR / "comparator_unsupported.json")
+    assert packet["context"]["timeframe"] == "day"
+    assert packet["context"]["comparator"] == "budget"
+    assert not revenue_digest_comparator_is_supported("day", "budget")
+    assert all(m["sourceRowCount"] > 0 for m in packet["payload"]["metrics"])
+
+
+def test_a_zero_comparator_base_is_frozen_as_a_null_percentage_with_a_reason():
+    """The denominator-zero contract, frozen on the wire: a real governed zero
+    base, no division, an explicit reason, and the absolute variance preserved.
+    Never 0, never infinity, never omitted."""
+    comparison = _load(_FIXTURE_DIR / "comparator_zero_base.json")["payload"]["metrics"][0]["comparison"]
+    assert comparison["state"] == "available"
+    assert comparison["value"] == 0.0
+    assert comparison["variancePct"] is None
+    assert comparison["variancePctReason"] == "comparator_zero_base"
+    assert comparison["absoluteVariance"] == 1500.0
+
+
+def test_a_series_gap_and_a_governed_zero_are_frozen_as_different_points():
+    points = _load(_FIXTURE_DIR / "trend_with_gap.json")["payload"]["points"]
+    assert [p["value"] for p in points] == [1500.0, None, 0.0]
+    assert [p["date"] for p in points] == ["2026-08-14", "2026-08-15", "2026-08-16"]
+
+
+def test_a_breakdown_freezes_its_reconciled_total_so_no_consumer_divides():
+    payload = _load(_FIXTURE_DIR / "breakdown_standard.json")["payload"]
+    assert payload["reconciledTotal"] == 91101.0
+    assert all(row["share"] is not None for row in payload["rows"])
+
+    unapproved = _load(_FIXTURE_DIR / "breakdown_share_not_approved.json")["payload"]
+    # A null share is a legitimate governed answer - and the total is null too,
+    # so there is nothing to divide by even if a consumer tried.
+    assert unapproved["reconciledTotal"] is None
+    assert all(row["share"] is None for row in unapproved["rows"])
+    assert all(row["value"] is not None for row in unapproved["rows"])
 
 
 def test_floating_point_values_are_frozen_without_rounding():
@@ -279,11 +476,32 @@ def test_floating_point_values_are_frozen_without_rounding():
     assert metrics["revpar"]["comparison"]["absoluteVariance"] == -78.30000000000001
 
 
-def test_no_relative_percentage_variance_key_is_frozen_into_the_contract():
-    for path in sorted(_FIXTURE_DIR.glob("*.json")):
-        flat = path.read_text(encoding="utf-8")
-        for forbidden in ("variancePct", "variancePercent", "percentageVariance", "relativeVariance"):
-            assert forbidden not in flat, f"{path.name} contains {forbidden}"
+def test_the_two_variances_are_frozen_as_separate_governed_quantities():
+    """v1 froze the ABSENCE of a relative percentage variance. v2 freezes its
+    PRESENCE as a governed value, distinct from the absolute one.
+
+    `occupancy_pct` shows why both are needed: 0.985 against 0.80 is +18.5
+    percentage POINTS absolutely and +23.1% relatively, and neither number is
+    inferable from the other. A consumer that computes one from the other is
+    doing analysis.
+    """
+    metrics = {
+        m["metricId"]: m
+        for m in _load(_FIXTURE_DIR / "floating_point_fidelity.json")["payload"]["metrics"]
+    }
+    occupancy = metrics["occupancy_pct"]["comparison"]
+    assert occupancy["absoluteVariance"] == 0.18499999999999994
+    assert occupancy["variancePct"] == 0.23124999999999993
+    assert occupancy["absoluteVariance"] != occupancy["variancePct"]
+
+
+def test_the_relative_variance_is_frozen_as_a_fraction_not_a_scaled_percentage():
+    """Scale is part of the contract. This repository's `percentage` unit is a
+    0-1 fraction (see mcp/apps/revenue/src/format.ts), and `variancePct`
+    follows it: a ~-55% change is -0.55, not -55."""
+    comparison = _load(_FIXTURE_DIR / "success_standard.json")["payload"]["metrics"][0]["comparison"]
+    assert -1.0 < comparison["variancePct"] < 0.0
+    assert comparison["variancePct"] == -0.5522322645183118
 
 
 def test_no_governed_status_or_presentation_or_actions_key_is_frozen_in():
@@ -403,7 +621,9 @@ def test_metric_and_comparison_objects_carry_no_free_text_field_today():
     """
     metric = _load(_FIXTURE_DIR / "success_standard.json")["payload"]["metrics"][0]
     assert set(metric) == {"metricId", "label", "unit", "value", "sourceRowCount", "comparison"}
-    assert set(metric["comparison"]) == {"value", "absoluteVariance", "sourceVariance"}
+    assert set(metric["comparison"]) == {
+        "state", "value", "absoluteVariance", "variancePct", "variancePctReason", "sourceVariance",
+    }
 
 
 def test_json_round_trip_is_stable():
@@ -459,3 +679,174 @@ def test_existing_revenue_digest_wire_output_is_still_snake_case():
         "metric_id", "label", "unit", "value", "comparison_value",
         "computed_variance_value", "source_variance_value", "source_row_count",
     }
+
+
+# --- E. non-finite numbers cannot cross the wire boundary -------------------
+
+
+def test_the_canonical_wire_serializer_refuses_a_non_finite_number():
+    """The wire boundary itself is strict, not merely the semantic validator.
+
+    `json.dumps` defaults to `allow_nan=True` and emits the non-standard `NaN` /
+    `Infinity` literals - a file Python reads back happily and
+    `System.Text.Json` cannot parse at all. That is the worst failure mode
+    available, because it is invisible on the producing side, so the canonical
+    serializer passes `allow_nan=False`.
+    """
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        packet = _load(_FIXTURE_DIR / "success_standard.json")
+        packet["payload"]["metrics"][0]["value"] = bad
+        with pytest.raises(ValueError):
+            regen.serialize(packet)
+
+
+def test_every_valid_fixture_on_disk_is_strict_json():
+    """No governed wire artifact in this repository contains a non-standard
+    numeric literal. Parsed with `parse_constant` raising, which is how a strict
+    JSON reader behaves."""
+
+    def reject(constant):
+        raise AssertionError(f"non-standard JSON literal {constant!r} found")
+
+    for name in _VALID_NAMES:
+        raw = (_FIXTURE_DIR / f"{name}.json").read_text(encoding="utf-8")
+        json.loads(raw, parse_constant=reject)
+
+
+def test_the_only_non_strict_artifact_is_the_declared_negative_fixture():
+    """One negative fixture must be non-strict, because being unserializable as
+    strict JSON is the entire point of it. It is written through a separately
+    named function so the strict path has no bypass parameter, and it is named
+    here so the exception cannot quietly grow."""
+    assert regen._NON_STRICT_FIXTURES == {"invalid_non_finite_number"}
+
+    non_strict = []
+    for name in _INVALID_NAMES:
+        raw = (_INVALID_DIR / f"{name}.json").read_text(encoding="utf-8")
+        try:
+            json.loads(raw, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c)))
+        except ValueError:
+            non_strict.append(name)
+    assert non_strict == ["invalid_non_finite_number"]
+
+
+def test_the_envelope_to_json_boundary_is_strict_too():
+    """`to_json()` is the other wire boundary, and it is strict for the same
+    reason. Construction already rejects non-finite values, so this exercises
+    the belt-and-braces layer behind that."""
+    from governed_result.contract import (
+        BusinessDateContext,
+        GovernedMetric,
+        GovernedQuality,
+        GovernedResultEnvelope,
+        MetricSet,
+        ProvenanceSummary,
+    )
+
+    metric = GovernedMetric(
+        metric_id="total_revenue", label="Total Revenue", unit="currency",
+        value=1.0, source_row_count=1,
+    )
+    envelope = GovernedResultEnvelope(
+        payload_type="metric_set", domain="hotel_performance", question_type="performance",
+        status="success", result_id="res_0123456789abcdef", query_id="q", query_version="1",
+        trace_id="t",
+        context=BusinessDateContext(
+            business_date="2026-08-16", timeframe="day", view="headline", comparator="none"
+        ),
+        quality=GovernedQuality(is_partial=False),
+        provenance=ProvenanceSummary(semantic_model_ref="dmr-v3"),
+        recommended_presentation="performance",
+        payload=MetricSet(metrics=(metric,)),
+    )
+    assert json.loads(envelope.to_json())["payload"]["metrics"][0]["value"] == 1.0
+
+    object.__setattr__(metric, "value", float("inf"))
+    with pytest.raises(ValueError):
+        envelope.to_json()
+
+
+# --- F. deterministic deserialization for a language-neutral consumer -------
+
+
+def test_payload_type_alone_determines_the_payload_shape():
+    """What a C# `JsonConverter` needs: read ONE top-level string, dispatch to
+    one concrete type, never probe payload fields to guess.
+
+    Asserted across every valid fixture - each payloadType maps to exactly one
+    payload key set, so `payloadType` is a total function onto payload shape.
+    """
+    shapes: dict[str, set[frozenset]] = {}
+    for name in _VALID_NAMES:
+        packet = _load(_FIXTURE_DIR / f"{name}.json")
+        shapes.setdefault(packet["payloadType"], set()).add(frozenset(packet["payload"]))
+
+    for payload_type, observed in shapes.items():
+        assert len(observed) == 1, (
+            f"payloadType {payload_type!r} maps to {len(observed)} different payload shapes - "
+            "a consumer would have to inspect payload fields to disambiguate"
+        )
+    assert set(shapes) == {"metric_set", "time_series", "breakdown"}
+
+
+def test_the_discriminator_precedes_the_payload_in_serialized_order():
+    """A streaming reader (Utf8JsonReader, a SAX-style parser) must be able to
+    learn the type before it reaches the polymorphic member, without buffering
+    the whole document."""
+    for name in _VALID_NAMES:
+        keys = list(_load(_FIXTURE_DIR / f"{name}.json"))
+        assert keys.index("payloadType") < keys.index("payload")
+        assert keys.index("schemaVersion") < keys.index("payloadType")
+
+
+def test_context_has_its_own_discriminator_independent_of_the_payload_one():
+    """`context` is polymorphic too, and carries `kind` as its own leading
+    discriminator - a consumer never infers the context type from the payload
+    type, even though they happen to correlate today."""
+    for name in _VALID_NAMES:
+        context = _load(_FIXTURE_DIR / f"{name}.json")["context"]
+        assert list(context)[0] == "kind"
+        assert context["kind"] in ("business_date", "date_range")
+
+
+def test_question_type_is_a_separate_field_that_is_currently_pinned_to_payload_type():
+    """DOCUMENTED LIMITATION, asserted so it stays a conscious decision.
+
+    `questionType` (the analytical question family) and `payloadType` (the
+    result shape) are separate fields, and conceptually they are different
+    things - the taxonomy's families A and D1 both answer as `performance`, so
+    question family is already coarser than capability.
+
+    But the schema's per-payloadType branches currently pin them 1:1, so
+    `questionType` carries no independent information today. A `breakdown`
+    payload answering a `variance_drivers` question would be rejected.
+
+    This is deliberately left pinned for v2: RELAXING a constraint later is
+    backward-compatible for existing consumers, whereas tightening one is not.
+    Freezing the stricter form keeps the option open at no cost. If a capability
+    ever needs the pairing loosened, this test is where the decision is
+    recorded.
+    """
+    schema = _schema()
+    pinned = {}
+    for branch in schema["allOf"]:
+        condition = branch["if"]["properties"].get("payloadType", {})
+        if "const" not in condition or "context" in branch["if"]["properties"]:
+            continue
+        pinned[condition["const"]] = branch["then"]["properties"]["questionType"]["const"]
+
+    assert pinned == {
+        "metric_set": "performance",
+        "time_series": "trend",
+        "breakdown": "breakdown",
+    }
+
+    # recommendedPresentation is deliberately NOT pinned the same way - it is a
+    # plain enum, so a capability may choose a different presentation for the
+    # same question type without a schema break.
+    assert "enum" in schema["properties"]["recommendedPresentation"]
+    for branch in schema["allOf"]:
+        then = branch.get("then", {}).get("properties", {})
+        assert "recommendedPresentation" not in then, (
+            "recommendedPresentation must stay unpinned - see GOVERNED_RESULT_ARCHITECTURE.md 6.4"
+        )

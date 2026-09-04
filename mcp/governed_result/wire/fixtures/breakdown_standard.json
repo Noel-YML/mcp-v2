@@ -1,0 +1,56 @@
+{
+  "schemaVersion": "2.0",
+  "payloadType": "breakdown",
+  "domain": "hotel_performance",
+  "questionType": "breakdown",
+  "status": "success",
+  "resultId": "res_0123456789abcdef",
+  "queryId": "revenue_performance_digest_v1",
+  "queryVersion": "1",
+  "traceId": "0000trace0000demo",
+  "recommendedPresentation": "breakdown",
+  "context": {
+    "kind": "business_date",
+    "businessDate": "2026-08-16",
+    "timeframe": "mtd",
+    "view": null,
+    "comparator": "none"
+  },
+  "quality": {
+    "isPartial": false,
+    "warnings": []
+  },
+  "provenance": {
+    "semanticModelRef": "dmr-v3"
+  },
+  "payload": {
+    "metricId": "room_revenue",
+    "label": "Room Revenue",
+    "unit": "currency",
+    "dimension": "market_segment",
+    "reconciledTotal": 91101.0,
+    "rows": [
+      {
+        "categoryId": "corporate",
+        "label": "Corporate",
+        "value": 44210.0,
+        "share": 0.4853,
+        "rank": 1
+      },
+      {
+        "categoryId": "leisure",
+        "label": "Leisure",
+        "value": 32891.0,
+        "share": 0.361,
+        "rank": 2
+      },
+      {
+        "categoryId": "group",
+        "label": "Group",
+        "value": 14000.0,
+        "share": 0.1537,
+        "rank": 3
+      }
+    ]
+  }
+}

@@ -4,6 +4,7 @@
   "domain": "hotel_performance",
   "questionType": "performance",
   "status": "success",
+  "resultId": "res_0123456789abcdef",
   "queryId": "revenue_performance_digest_v1",
   "queryVersion": "1",
   "traceId": "0000trace0000demo",
@@ -34,7 +35,7 @@
           "state": "available",
           "value": 264061.0,
           "absoluteVariance": -145815.0,
-          "variancePct": -0.5522322645183118,
+          "variancePct": null,
           "variancePctReason": null,
           "sourceVariance": -145815.0
         }
@@ -55,6 +56,5 @@
         }
       }
     ]
-  },
-  "result_id": "res_0123456789abcdef"
+  }
 }

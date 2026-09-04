@@ -35,7 +35,7 @@ attaching it to `get_performance_digest` would change nothing about that tool's
 trusted output while making every call pay for validating a contract no
 consumer reads. The requirement it exists to satisfy belongs downstream:
 
-  * UI binding (N11) MUST validate a governed-result-v2 packet before
+  * UI binding (N11) MUST validate a governed-result packet before
     consuming or rendering it. An invalid packet is a defect to surface, never
     something to render partially.
   * A future post-projection assertion inside
@@ -44,6 +44,7 @@ consumer reads. The requirement it exists to satisfy belongs downstream:
     published contract. Proposed, not implemented.
 """
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 
@@ -61,31 +62,57 @@ ENVELOPE_KEYS = (
     "queryId",
     "queryVersion",
     "traceId",
+    "recommendedPresentation",
     "context",
     "quality",
     "provenance",
     "payload",
 )
-CONTEXT_KEYS = ("kind", "businessDate", "timeframe", "view", "comparator")
+BUSINESS_DATE_CONTEXT_KEYS = ("kind", "businessDate", "timeframe", "view", "comparator")
+DATE_RANGE_CONTEXT_KEYS = ("kind", "startDate", "endDate", "grain", "comparator")
 QUALITY_KEYS = ("isPartial", "warnings")
 PROVENANCE_KEYS = ("semanticModelRef",)
-PAYLOAD_KEYS = ("metrics",)
+METRIC_SET_KEYS = ("metrics",)
 METRIC_KEYS = ("metricId", "label", "unit", "value", "sourceRowCount", "comparison")
-COMPARISON_KEYS = ("value", "absoluteVariance", "sourceVariance")
+COMPARISON_KEYS = (
+    "state",
+    "value",
+    "absoluteVariance",
+    "variancePct",
+    "variancePctReason",
+    "sourceVariance",
+)
+TIME_SERIES_KEYS = ("metricId", "label", "unit", "points")
+SERIES_POINT_KEYS = ("date", "value")
+BREAKDOWN_KEYS = ("metricId", "label", "unit", "dimension", "reconciledTotal", "rows")
+BREAKDOWN_ROW_KEYS = ("categoryId", "label", "value", "share", "rank")
 
 # Token domains. Only implemented values: a frozen wire contract must not
 # accept a token no producer can emit.
-EXPECTED_SCHEMA_VERSION = "1.0"
-EXPECTED_PAYLOAD_TYPE = "metric_set"
+EXPECTED_SCHEMA_VERSION = "2.0"
+PAYLOAD_TYPES = ("metric_set", "time_series", "breakdown")
 EXPECTED_DOMAIN = "hotel_performance"
-EXPECTED_QUESTION_TYPE = "performance"
+QUESTION_TYPES = ("performance", "trend", "breakdown")
 EXPECTED_STATUS = "success"
-EXPECTED_CONTEXT_KIND = "business_date"
+PRESENTATIONS = ("performance", "trend", "breakdown")
+CONTEXT_KINDS = ("business_date", "date_range")
+COMPARISON_STATES = ("available", "unavailable", "unsupported")
+VARIANCE_PCT_REASONS = ("comparator_zero_base", "insufficient_data")
 TIMEFRAMES = ("day", "mtd", "ytd")
 VIEWS = ("headline", "rooms", "fnb_revenue", "other")
 COMPARATORS = ("none", "last_year", "budget", "forecast")
 UNITS = ("currency", "count", "percentage", "rate", "ratio")
+GRAINS = ("day",)
 COMPARATOR_NOT_REQUESTED = "none"
+
+# Which payload each discriminator requires, and which context kind that
+# payload's temporal model uses. Declared once, mirroring the schema's
+# per-payloadType branches and contract.py's `_IMPLEMENTED_PAYLOADS`.
+PAYLOAD_RULES = {
+    "metric_set": {"question_type": "performance", "context_kind": "business_date"},
+    "time_series": {"question_type": "trend", "context_kind": "date_range"},
+    "breakdown": {"question_type": "breakdown", "context_kind": "business_date"},
+}
 
 _RESULT_ID_PATTERN = re.compile(r"^res_[0-9a-f]{16}$")
 _METRIC_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -103,9 +130,20 @@ class GovernedResultValidationError(ValueError):
 
 
 def _is_number(value) -> bool:
-    """A JSON number, excluding bool. `bool` is an `int` subclass in Python, so
-    without this a `True` would pass as a numeric value."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """A JSON number, excluding bool and excluding NaN/Infinity.
+
+    `bool` is an `int` subclass in Python, so without the bool check a `True`
+    would pass as a numeric value.
+
+    NaN and Infinity are excluded because they are not representable in JSON.
+    Python's `json.loads` accepts the non-standard `NaN`/`Infinity` literals by
+    default, so a packet carrying one parses here but would fail in a strict
+    parser - and `System.Text.Json` rejects it outright. Catching it at
+    validation is what keeps that from becoming a runtime failure in a C# or
+    TypeScript consumer."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def _is_nullable_number(value) -> bool:
@@ -163,10 +201,11 @@ def validate_governed_result_wire(packet) -> list[str]:
         return violations
 
     _check_token(packet, "schemaVersion", EXPECTED_SCHEMA_VERSION, "$", violations)
-    _check_token(packet, "payloadType", EXPECTED_PAYLOAD_TYPE, "$", violations)
+    _check_token(packet, "payloadType", PAYLOAD_TYPES, "$", violations)
     _check_token(packet, "domain", EXPECTED_DOMAIN, "$", violations)
-    _check_token(packet, "questionType", EXPECTED_QUESTION_TYPE, "$", violations)
+    _check_token(packet, "questionType", QUESTION_TYPES, "$", violations)
     _check_token(packet, "status", EXPECTED_STATUS, "$", violations)
+    _check_token(packet, "recommendedPresentation", PRESENTATIONS, "$", violations)
 
     for key in ("queryId", "queryVersion", "traceId"):
         _check_non_empty_string(packet, key, "$", violations)
@@ -177,26 +216,71 @@ def validate_governed_result_wire(packet) -> list[str]:
             f"$.resultId: expected an opaque identity matching res_<16 hex>, got {result_id!r}"
         )
 
-    comparator = _validate_context(packet.get("context"), violations)
+    payload_type = packet.get("payloadType")
+    rules = PAYLOAD_RULES.get(payload_type)
+
+    comparator, context_kind = _validate_context(packet.get("context"), violations)
     _validate_quality(packet.get("quality"), violations)
     _validate_provenance(packet.get("provenance"), violations)
-    _validate_payload(packet.get("payload"), comparator, violations)
+
+    if rules is not None:
+        # The discriminator must actually describe the packet, or switching on
+        # it is worse than not having it.
+        if packet.get("questionType") != rules["question_type"]:
+            violations.append(
+                f"$.questionType: payloadType {payload_type!r} answers a "
+                f"{rules['question_type']!r} question, got {packet.get('questionType')!r}"
+            )
+        if context_kind is not None and context_kind != rules["context_kind"]:
+            violations.append(
+                f"$.context.kind: payloadType {payload_type!r} requires a "
+                f"{rules['context_kind']!r} context, got {context_kind!r} - a payload's temporal "
+                "model is part of its shape"
+            )
+        _validate_payload(payload_type, packet.get("payload"), comparator, violations)
 
     return violations
 
 
-def _validate_context(context, violations) -> str | None:
-    """Returns the comparator selection, needed for the cross-field invariant,
-    or None when the context is unusable."""
-    if context is None:
-        return None
-    if not _check_keys(context, CONTEXT_KEYS, "$.context", violations):
-        return None
+def _validate_context(context, violations) -> tuple[str | None, str | None]:
+    """Returns `(comparator, kind)`. The comparator drives the cross-field
+    comparison invariant; the kind is checked against the payload's temporal
+    model by the caller. Either is None when the context is unusable."""
+    if not isinstance(context, Mapping):
+        violations.append(f"$.context: expected an object, got {type(context).__name__}")
+        return None, None
 
-    _check_token(context, "kind", EXPECTED_CONTEXT_KIND, "$.context", violations)
+    kind = context.get("kind")
+    if kind not in CONTEXT_KINDS:
+        violations.append(
+            f"$.context.kind: {kind!r} is not one of {list(CONTEXT_KINDS)} - kind is the "
+            "discriminator that keeps temporal models typed rather than merged into one generic "
+            "period object"
+        )
+        return None, None
+
+    if kind == "business_date":
+        _validate_business_date_context(context, violations)
+    else:
+        _validate_date_range_context(context, violations)
+
+    comparator = context.get("comparator")
+    return (comparator if isinstance(comparator, str) else None), kind
+
+
+def _validate_business_date_context(context, violations) -> None:
+    if not _check_keys(context, BUSINESS_DATE_CONTEXT_KEYS, "$.context", violations):
+        return
+
     _check_token(context, "timeframe", TIMEFRAMES, "$.context", violations)
-    _check_token(context, "view", VIEWS, "$.context", violations)
     _check_token(context, "comparator", COMPARATORS, "$.context", violations)
+
+    # `view` is nullable: it names a governed metric BUNDLE, which a breakdown
+    # does not have. Its non-nullness for a metric_set is enforced in
+    # `_validate_payload`, where the payload type is known.
+    view = context.get("view")
+    if view is not None and view not in VIEWS:
+        violations.append(f"$.context.view: {view!r} is not one of {list(VIEWS)} (or null)")
 
     business_date = context.get("businessDate")
     if not isinstance(business_date, str) or not _ISO_DATE_PATTERN.fullmatch(business_date):
@@ -204,8 +288,31 @@ def _validate_context(context, violations) -> str | None:
             f"$.context.businessDate: expected an ISO 8601 calendar date (YYYY-MM-DD), got {business_date!r}"
         )
 
-    comparator = context.get("comparator")
-    return comparator if isinstance(comparator, str) else None
+
+def _validate_date_range_context(context, violations) -> None:
+    if not _check_keys(context, DATE_RANGE_CONTEXT_KEYS, "$.context", violations):
+        return
+
+    _check_token(context, "grain", GRAINS, "$.context", violations)
+    _check_token(context, "comparator", COMPARATORS, "$.context", violations)
+
+    dates = {}
+    for key in ("startDate", "endDate"):
+        value = context.get(key)
+        if not isinstance(value, str) or not _ISO_DATE_PATTERN.fullmatch(value):
+            violations.append(
+                f"$.context.{key}: expected an ISO 8601 calendar date (YYYY-MM-DD), got {value!r}"
+            )
+        else:
+            dates[key] = value
+
+    # An ordering relationship between two sibling values - not expressible in
+    # JSON Schema 2020-12, which is one of the reasons this module exists.
+    if len(dates) == 2 and dates["endDate"] < dates["startDate"]:
+        violations.append(
+            f"$.context.endDate: {dates['endDate']!r} is before startDate {dates['startDate']!r} - "
+            "an inverted window is not a resolvable period"
+        )
 
 
 def _validate_quality(quality, violations) -> None:
@@ -235,10 +342,20 @@ def _validate_provenance(provenance, violations) -> None:
     _check_non_empty_string(provenance, "semanticModelRef", "$.provenance", violations)
 
 
-def _validate_payload(payload, comparator, violations) -> None:
-    if payload is None:
+def _validate_payload(payload_type, payload, comparator, violations) -> None:
+    if not isinstance(payload, Mapping):
+        violations.append(f"$.payload: expected an object, got {type(payload).__name__}")
         return
-    if not _check_keys(payload, PAYLOAD_KEYS, "$.payload", violations):
+    if payload_type == "metric_set":
+        _validate_metric_set(payload, comparator, violations)
+    elif payload_type == "time_series":
+        _validate_time_series(payload, violations)
+    else:
+        _validate_breakdown(payload, violations)
+
+
+def _validate_metric_set(payload, comparator, violations) -> None:
+    if not _check_keys(payload, METRIC_SET_KEYS, "$.payload", violations):
         return
 
     metrics = payload.get("metrics")
@@ -266,6 +383,108 @@ def _validate_payload(payload, comparator, violations) -> None:
                     )
                 else:
                     seen[metric_id] = index
+
+
+def _validate_time_series(payload, violations) -> None:
+    if not _check_keys(payload, TIME_SERIES_KEYS, "$.payload", violations):
+        return
+
+    _validate_metric_identity(payload, "$.payload", violations)
+
+    points = payload.get("points")
+    if not isinstance(points, list):
+        violations.append(f"$.payload.points: expected an array, got {points!r}")
+        return
+    if not points:
+        violations.append("$.payload.points: must contain at least one point")
+
+    dates: list[str] = []
+    for index, point in enumerate(points):
+        where = f"$.payload.points[{index}]"
+        if not _check_keys(point, SERIES_POINT_KEYS, where, violations):
+            continue
+        date = point.get("date")
+        if not isinstance(date, str) or not _ISO_DATE_PATTERN.fullmatch(date):
+            violations.append(
+                f"{where}.date: expected an ISO 8601 calendar date (YYYY-MM-DD), got {date!r}"
+            )
+        else:
+            dates.append(date)
+        # Zero-safe: a governed 0.0 is a real point, a null is a genuine gap.
+        if "value" in point and not _is_nullable_number(point["value"]):
+            violations.append(f"{where}.value: expected a number or null, got {point['value']!r}")
+
+    # Ordering and uniqueness across array items - neither is expressible in
+    # JSON Schema 2020-12.
+    if dates != sorted(dates):
+        violations.append(
+            "$.payload.points: must be ordered ascending by date - the ordering is GOVERNED, and a "
+            "consumer renders the order given rather than re-sorting it into a different meaning"
+        )
+    if len(set(dates)) != len(dates):
+        violations.append("$.payload.points: contains duplicate dates")
+
+
+def _validate_breakdown(payload, violations) -> None:
+    if not _check_keys(payload, BREAKDOWN_KEYS, "$.payload", violations):
+        return
+
+    _validate_metric_identity(payload, "$.payload", violations)
+
+    dimension = payload.get("dimension")
+    if not isinstance(dimension, str) or not _METRIC_ID_PATTERN.fullmatch(dimension):
+        violations.append(
+            f"$.payload.dimension: expected an approved public snake_case dimension identifier "
+            f"(never a mart column name), got {dimension!r}"
+        )
+    if "reconciledTotal" in payload and not _is_nullable_number(payload["reconciledTotal"]):
+        violations.append(
+            f"$.payload.reconciledTotal: expected a number or null, got {payload['reconciledTotal']!r}"
+        )
+
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        violations.append(f"$.payload.rows: expected an array, got {rows!r}")
+        return
+    if not rows:
+        violations.append("$.payload.rows: must contain at least one row")
+
+    seen: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        where = f"$.payload.rows[{index}]"
+        if not _check_keys(row, BREAKDOWN_ROW_KEYS, where, violations):
+            continue
+        category_id = row.get("categoryId")
+        if not isinstance(category_id, str) or not _METRIC_ID_PATTERN.fullmatch(category_id):
+            violations.append(
+                f"{where}.categoryId: expected a public snake_case category identifier, got {category_id!r}"
+            )
+        elif category_id in seen:
+            violations.append(
+                f"{where}.categoryId: {category_id!r} duplicates rows[{seen[category_id]}] - "
+                "consumers bind by categoryId, so it must be unique"
+            )
+        else:
+            seen[category_id] = index
+
+        _check_non_empty_string(row, "label", where, violations)
+        for key in ("value", "share"):
+            if key in row and not _is_nullable_number(row[key]):
+                violations.append(f"{where}.{key}: expected a number or null, got {row[key]!r}")
+        rank = row.get("rank")
+        if rank is not None and (not isinstance(rank, int) or isinstance(rank, bool) or rank < 1):
+            violations.append(f"{where}.rank: expected a 1-based integer or null, got {rank!r}")
+
+
+def _validate_metric_identity(payload, where, violations) -> None:
+    """The metricId/label/unit triple that time_series and breakdown share."""
+    metric_id = payload.get("metricId")
+    if not isinstance(metric_id, str) or not _METRIC_ID_PATTERN.fullmatch(metric_id):
+        violations.append(
+            f"{where}.metricId: expected a public snake_case metric identifier, got {metric_id!r}"
+        )
+    _check_non_empty_string(payload, "label", where, violations)
+    _check_token(payload, "unit", UNITS, where, violations)
 
 
 def _validate_metric(metric, index, comparator, violations) -> None:
@@ -320,13 +539,68 @@ def _validate_comparison(comparison, where, comparator, violations) -> None:
     if not _check_keys(comparison, COMPARISON_KEYS, f"{where}.comparison", violations):
         return
 
-    # All three members are INDEPENDENTLY nullable. A present comparator value
+    state = comparison.get("state")
+    if state not in COMPARISON_STATES:
+        violations.append(
+            f"{where}.comparison.state: {state!r} is not one of {list(COMPARISON_STATES)}"
+        )
+        return
+
+    # All numeric members are INDEPENDENTLY nullable. A present comparator value
     # with an uncomputed variance is a real state, so this must never require
     # them to be present or absent together.
-    for key in COMPARISON_KEYS:
+    for key in ("value", "absoluteVariance", "variancePct", "sourceVariance"):
         if key in comparison and not _is_nullable_number(comparison[key]):
             violations.append(
                 f"{where}.comparison.{key}: expected a number or null, got {comparison[key]!r}"
+            )
+
+    reason = comparison.get("variancePctReason")
+    if reason is not None and reason not in VARIANCE_PCT_REASONS:
+        violations.append(
+            f"{where}.comparison.variancePctReason: {reason!r} is not one of "
+            f"{list(VARIANCE_PCT_REASONS)} (or null)"
+        )
+
+    value = comparison.get("value")
+    variance_pct = comparison.get("variancePct")
+
+    # State and value can never disagree - without this the five comparison
+    # states stop being distinguishable.
+    if state == "available" and value is None:
+        violations.append(
+            f'{where}.comparison: state is "available" but value is null - an available comparison '
+            'has a comparator value; use "unavailable" (source value missing) or "unsupported" '
+            "(comparator not supported for this metric)"
+        )
+    if state != "available" and value is not None:
+        violations.append(
+            f"{where}.comparison: state is {state!r} but a comparator value is present - only an "
+            '"available" comparison carries one'
+        )
+
+    if state == "available":
+        # A missing relative variance is never unexplained.
+        if variance_pct is None and reason is None:
+            violations.append(
+                f"{where}.comparison.variancePctReason: variancePct is null on an available "
+                "comparison without a reason - a missing percentage must say why "
+                f"({' or '.join(VARIANCE_PCT_REASONS)})"
+            )
+        if variance_pct is not None and reason is not None:
+            violations.append(
+                f"{where}.comparison.variancePctReason: must be null when variancePct is present - "
+                "a second explanation would be free to contradict the first"
+            )
+    else:
+        if variance_pct is not None:
+            violations.append(
+                f"{where}.comparison.variancePct: must be null when state is {state!r}"
+            )
+        if reason is not None:
+            violations.append(
+                f"{where}.comparison.variancePctReason: must be null when state is {state!r} - "
+                "the state already explains the absence"
             )
 
 

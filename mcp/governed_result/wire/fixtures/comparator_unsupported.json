@@ -4,6 +4,7 @@
   "domain": "hotel_performance",
   "questionType": "performance",
   "status": "success",
+  "resultId": "res_0123456789abcdef",
   "queryId": "revenue_performance_digest_v1",
   "queryVersion": "1",
   "traceId": "0000trace0000demo",
@@ -11,9 +12,9 @@
   "context": {
     "kind": "business_date",
     "businessDate": "2026-08-16",
-    "timeframe": "mtd",
+    "timeframe": "day",
     "view": "headline",
-    "comparator": "last_year"
+    "comparator": "budget"
   },
   "quality": {
     "isPartial": false,
@@ -31,30 +32,29 @@
         "value": 118246.0,
         "sourceRowCount": 1,
         "comparison": {
-          "state": "available",
-          "value": 264061.0,
-          "absoluteVariance": -145815.0,
-          "variancePct": -0.5522322645183118,
+          "state": "unsupported",
+          "value": null,
+          "absoluteVariance": null,
+          "variancePct": null,
           "variancePctReason": null,
-          "sourceVariance": -145815.0
+          "sourceVariance": null
         }
       },
       {
-        "metricId": "room_revenue",
-        "label": "Room Revenue",
-        "unit": "currency",
-        "value": 91101.0,
+        "metricId": "occupancy_pct",
+        "label": "Occupancy %",
+        "unit": "percentage",
+        "value": 0.985,
         "sourceRowCount": 1,
         "comparison": {
-          "state": "available",
-          "value": 180000.0,
-          "absoluteVariance": -88899.0,
-          "variancePct": -0.49388333333333334,
+          "state": "unsupported",
+          "value": null,
+          "absoluteVariance": null,
+          "variancePct": null,
           "variancePctReason": null,
-          "sourceVariance": -88899.0
+          "sourceVariance": null
         }
       }
     ]
-  },
-  "result_id": "res_0123456789abcdef"
+  }
 }

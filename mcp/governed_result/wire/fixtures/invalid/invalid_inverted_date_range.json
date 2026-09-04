@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "2.0",
+  "payloadType": "time_series",
+  "domain": "hotel_performance",
+  "questionType": "trend",
+  "status": "success",
+  "resultId": "res_0123456789abcdef",
+  "queryId": "revenue_performance_digest_v1",
+  "queryVersion": "1",
+  "traceId": "0000trace0000demo",
+  "recommendedPresentation": "trend",
+  "context": {
+    "kind": "date_range",
+    "startDate": "2026-08-16",
+    "endDate": "2026-08-14",
+    "grain": "day",
+    "comparator": "none"
+  },
+  "quality": {
+    "isPartial": false,
+    "warnings": []
+  },
+  "provenance": {
+    "semanticModelRef": "dmr-v3"
+  },
+  "payload": {
+    "metricId": "total_revenue",
+    "label": "Total Revenue",
+    "unit": "currency",
+    "points": [
+      {
+        "date": "2026-08-14",
+        "value": 104233.0
+      },
+      {
+        "date": "2026-08-15",
+        "value": 98115.5
+      },
+      {
+        "date": "2026-08-16",
+        "value": 118246.0
+      }
+    ]
+  }
+}

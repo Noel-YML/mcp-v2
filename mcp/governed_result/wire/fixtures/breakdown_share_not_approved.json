@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "2.0",
+  "payloadType": "breakdown",
+  "domain": "hotel_performance",
+  "questionType": "breakdown",
+  "status": "success",
+  "resultId": "res_0123456789abcdef",
+  "queryId": "revenue_performance_digest_v1",
+  "queryVersion": "1",
+  "traceId": "0000trace0000demo",
+  "recommendedPresentation": "breakdown",
+  "context": {
+    "kind": "business_date",
+    "businessDate": "2026-08-16",
+    "timeframe": "mtd",
+    "view": null,
+    "comparator": "none"
+  },
+  "quality": {
+    "isPartial": false,
+    "warnings": []
+  },
+  "provenance": {
+    "semanticModelRef": "dmr-v3"
+  },
+  "payload": {
+    "metricId": "occupancy_pct",
+    "label": "Occupancy %",
+    "unit": "percentage",
+    "dimension": "market_segment",
+    "reconciledTotal": null,
+    "rows": [
+      {
+        "categoryId": "corporate",
+        "label": "Corporate",
+        "value": 0.512,
+        "share": null,
+        "rank": null
+      },
+      {
+        "categoryId": "leisure",
+        "label": "Leisure",
+        "value": 0.401,
+        "share": null,
+        "rank": null
+      }
+    ]
+  }
+}

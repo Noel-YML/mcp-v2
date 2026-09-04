@@ -105,6 +105,9 @@ and its own typed payload. None may be forced into Template 1.
 | Performance capability (A + D₁) | **CURRENT** — trusted slice | Ships as-is; not redesigned |
 | Absolute variance | **CURRENT** (`computed_variance_value`, `source_variance_value`) | Comparison State renders absolute variance |
 | **Relative percentage variance** | **NOT BUILT** — output extension E‑1 / C2 | **Template 1 v1 shows absolute variance only.** The percentage row does not render, and neither UI nor agent may derive it |
+> **Gate 3 status update.** E‑1 has now landed **in the governed result envelope** (`comparison.variancePct`, packet `schemaVersion` `"2.0"`), but NOT in `get_performance_digest`'s live wire contract, and nothing consumes the envelope. **AC‑6 is therefore unchanged**: the percentage still must not appear in Template 1 v1. It moves to "renders" only when a capability emits the governed envelope (N08+) and UI binding consumes it (N11).
+
+
 | **Governed status** (Healthy / At Risk) | **NOT BUILT** — no governed producer exists | The status component **must not render** in v1. No frontend threshold framework, ever |
 | **Avg Spend / Guest**, **Revenue POR** | **NOT AVAILABLE** — no semantic-registry key of any kind (upstream U‑1, U‑2) | Those two KPI cards are **not renderable**; the composition is unaffected |
 | Digest follow-up actions | **NOT BUILT** — digest publishes none; proposed ids exist in neither registry | Follow-up chips are conditional and may be absent; typed action contract is later work (N14 / Gate 6) |
@@ -178,8 +181,8 @@ state.**
 |---|---|
 | **N03** | The bounded capability and parameter contract Template 1 renders — already frozen in `CAPABILITY_SURFACE_AND_PARAMETER_CONTRACT.md` |
 | **C01** | The component families and value-state behaviour Template 1 composes |
-| **N05** | The envelope + `MetricSet` payload Template 1 consumes (**not built**) |
-| **E‑1 / C2** | Relative percentage variance — gates AC‑6 moving from "must not appear" to "renders" |
+| **N05** | The envelope + `MetricSet` payload Template 1 consumes (**built at Gate 3**; not yet emitted by any tool) |
+| **E‑1 / C2** | Relative percentage variance — **now in the governed envelope**, but AC‑6 still gates on a tool emitting it (N08+) and UI binding consuming it (N11) |
 | **U‑1, U‑2** | Semantic mappings for Avg Spend / Guest and Revenue POR — upstream, separate workstream |
 
 ---

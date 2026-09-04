@@ -4,6 +4,7 @@
   "domain": "hotel_performance",
   "questionType": "performance",
   "status": "success",
+  "resultId": "res_0123456789abcdef",
   "queryId": "revenue_performance_digest_v1",
   "queryVersion": "1",
   "traceId": "0000trace0000demo",
@@ -25,33 +26,18 @@
   "payload": {
     "metrics": [
       {
-        "metricId": "total_revenue",
-        "label": "Total Revenue",
+        "metricId": "total_other_misc",
+        "label": "Total Other & Misc. Revenue",
         "unit": "currency",
-        "value": 118246.0,
+        "value": 1500.0,
         "sourceRowCount": 1,
         "comparison": {
           "state": "available",
-          "value": 264061.0,
-          "absoluteVariance": -145815.0,
-          "variancePct": -0.5522322645183118,
-          "variancePctReason": null,
-          "sourceVariance": -145815.0
-        }
-      },
-      {
-        "metricId": "room_revenue",
-        "label": "Room Revenue",
-        "unit": "currency",
-        "value": 91101.0,
-        "sourceRowCount": 1,
-        "comparison": {
-          "state": "available",
-          "value": 180000.0,
-          "absoluteVariance": -88899.0,
-          "variancePct": -0.49388333333333334,
-          "variancePctReason": null,
-          "sourceVariance": -88899.0
+          "value": 0.0,
+          "absoluteVariance": 1500.0,
+          "variancePct": null,
+          "variancePctReason": "comparator_zero_base",
+          "sourceVariance": 1500.0
         }
       }
     ]

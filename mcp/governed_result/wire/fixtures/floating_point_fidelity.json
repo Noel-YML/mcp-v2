@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "1.0",
+  "schemaVersion": "2.0",
   "payloadType": "metric_set",
   "domain": "hotel_performance",
   "questionType": "performance",
@@ -8,6 +8,7 @@
   "queryId": "revenue_performance_digest_v1",
   "queryVersion": "1",
   "traceId": "0000trace0000demo",
+  "recommendedPresentation": "performance",
   "context": {
     "kind": "business_date",
     "businessDate": "2026-08-16",
@@ -31,8 +32,11 @@
         "value": 0.985,
         "sourceRowCount": 1,
         "comparison": {
+          "state": "available",
           "value": 0.8,
           "absoluteVariance": 0.18499999999999994,
+          "variancePct": 0.23124999999999993,
+          "variancePctReason": null,
           "sourceVariance": 0.185
         }
       },
@@ -43,8 +47,11 @@
         "value": 401.7,
         "sourceRowCount": 1,
         "comparison": {
+          "state": "available",
           "value": 480.0,
           "absoluteVariance": -78.30000000000001,
+          "variancePct": -0.16312500000000002,
+          "variancePctReason": null,
           "sourceVariance": -78.3
         }
       }

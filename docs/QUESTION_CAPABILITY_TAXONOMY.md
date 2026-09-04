@@ -90,6 +90,9 @@ Variance today: `RevenueDigestMetricResult` carries `computed_variance_value` **
 `mtd`/`ytd` comparators — never for `day + last_year`, where the variance is computed and has nothing
 to reconcile against. **All variance is absolute; no percentage variance field exists in any
 contract.**
+> **Gate 3 status update (N05/N07, packet `schemaVersion` `"2.0"`).** A governed relative percentage variance now EXISTS — `comparison.variancePct`, with `variancePctReason`, owned by `revenue_digest_execution.compute_variance_pct`. It exists **only in the governed result envelope**. `get_performance_digest`'s live wire contract (`RevenueDigestResult`) is unchanged and still carries no percentage field, and **nothing consumes the envelope yet**. So statements below that a percentage variance is unavailable remain accurate *for what renders today*; the prohibition on the UI or the agent deriving one is **unchanged and permanent**. See `docs/GOVERNED_RESULT_ARCHITECTURE.md` §6.4 and `docs/N06_CALCULATION_OWNERSHIP_AND_PROVENANCE.md` §12.1.
+
+
 
 ### 2.2 Legacy DMR reports
 
