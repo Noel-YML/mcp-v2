@@ -26,18 +26,18 @@
   "payload": {
     "metrics": [
       {
-        "metricId": "guests",
-        "label": "Guests",
-        "unit": "count",
-        "value": null,
-        "sourceRowCount": 0,
+        "metricId": "total_other_misc",
+        "label": "Total Other & Misc. Revenue",
+        "unit": "currency",
+        "value": 1500.0,
+        "sourceRowCount": 1,
         "comparison": {
-          "state": "unsupported",
-          "value": null,
-          "absoluteVariance": null,
+          "state": "available",
+          "value": 0.0,
+          "absoluteVariance": 1500.0,
           "variancePct": null,
-          "variancePctReason": null,
-          "sourceVariance": null
+          "variancePctReason": "comparator_zero_base",
+          "sourceVariance": 1500.0
         }
       }
     ]

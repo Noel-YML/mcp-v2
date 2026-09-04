@@ -25,6 +25,7 @@ from dmr.revenue_performance_digest_reference import REVENUE_METRIC_MAPPINGS, VI
 from fabric_client.result import FabricQueryResult
 from governed_result.contract import MetricSet
 from governed_result.projection import CAPABILITY_DESCRIPTORS, from_revenue_digest_result
+from revenue_digest_execution import compute_variance_pct
 from results.repository import InMemoryResultRepository
 from scope.scope_context import ScopeContext
 
@@ -177,20 +178,110 @@ def test_projection_does_not_recompute_a_deliberately_inconsistent_variance():
     assert envelope.payload.metrics[0].comparison.absolute_variance == 999.0
 
 
-def test_projection_manufactures_no_percentage_share_or_rank():
-    serialized = json.dumps(
-        from_revenue_digest_result(
-            _digest_result(
-                metrics=(_metric_result(value=100.0, comparison_value=80.0, computed_variance_value=20.0),),
-                comparator="last_year",
-            )
-        ).to_dict()
+def test_projection_manufactures_no_analytical_quantity_the_digest_lacks():
+    """The projection may re-express governed values; it may not invent new
+    analytical quantities.
+
+    Asserted on the KEY SETS of the analytical objects rather than by searching
+    the serialized JSON for words. A substring search is the wrong instrument:
+    `total_revenue` is a legitimate metric id and `ratio` is a legitimate unit
+    token, so a word ban would fail on correct output while still missing a
+    field named something unexpected. Pinning the key sets catches every added
+    field, whatever it is called.
+
+    `variancePct` is deliberately INSIDE the allowed set now - packet v2 carries
+    it as a governed value. What guards it is delegation to the governed owner,
+    asserted by the test below, not absence.
+    """
+    envelope = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=80.0, computed_variance_value=20.0),),
+            comparator="last_year",
+        )
     )
-    for forbidden in ("variance_pct", "percentage", "percent", "share", "rank", "contribution", "ratio"):
-        assert forbidden not in serialized.lower()
-    # The relative variance a naive adapter would have produced (20/80 = 0.25)
-    # must appear nowhere.
-    assert "0.25" not in serialized
+    metric = envelope.to_dict()["payload"]["metrics"][0]
+    assert set(metric) == {"metricId", "label", "unit", "value", "sourceRowCount", "comparison"}
+    assert set(metric["comparison"]) == {
+        "state",
+        "value",
+        "absoluteVariance",
+        "variancePct",
+        "variancePctReason",
+        "sourceVariance",
+    }
+
+
+def test_variance_pct_is_delegated_to_the_governed_owner_not_computed_here():
+    """The projection must not restate the relative-change formula.
+
+    Asserted by equality against `revenue_digest_execution.compute_variance_pct`
+    itself, so if someone inlines a division here that disagrees with the
+    governed owner - a different denominator, a *100 rescale, a rounding step -
+    this fails.
+    """
+    envelope = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=80.0, computed_variance_value=20.0),),
+            comparator="last_year",
+        )
+    )
+    expected_pct, expected_reason = compute_variance_pct(100.0, 80.0)
+    comparison = envelope.payload.metrics[0].comparison
+    assert comparison.variance_pct == expected_pct
+    assert comparison.variance_pct_reason is expected_reason
+
+
+def test_a_zero_comparator_yields_a_null_percentage_with_a_reason_not_a_zero():
+    """A zero comparator is a real governed value, so the answer is neither
+    "0%" nor an error nor infinity - no division happens at all, and the
+    absolute variance is preserved."""
+    envelope = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=0.0, computed_variance_value=100.0),),
+            comparator="last_year",
+        )
+    )
+    comparison = envelope.payload.metrics[0].comparison
+    assert comparison.state == "available"
+    assert comparison.value == 0.0
+    assert comparison.variance_pct is None
+    assert comparison.variance_pct_reason == "comparator_zero_base"
+    assert comparison.absolute_variance == 100.0
+
+
+def test_a_requested_comparator_with_no_source_row_is_unsupported_not_unavailable():
+    """The two requested-but-absent outcomes are distinguished: a metric with
+    no physical row at all did not participate in the comparator, which is a
+    different fact from a present row that carries no comparison value."""
+    no_row = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=None, comparison_value=None, source_row_count=0),),
+            comparator="last_year",
+        )
+    ).payload.metrics[0].comparison
+    assert no_row.state == "unsupported"
+
+    row_without_comparison = from_revenue_digest_result(
+        _digest_result(
+            metrics=(_metric_result(value=100.0, comparison_value=None, source_row_count=1),),
+            comparator="last_year",
+        )
+    ).payload.metrics[0].comparison
+    assert row_without_comparison.state == "unavailable"
+    assert row_without_comparison.value is None
+    assert row_without_comparison.variance_pct is None
+
+
+def test_recommended_presentation_is_declared_per_capability_not_derived():
+    """It comes from the capability descriptor, so it cannot vary with a
+    result's contents - and it is a bare token, never markup or a template."""
+    envelope = from_revenue_digest_result(_digest_result())
+    assert envelope.recommended_presentation == "performance"
+    assert (
+        CAPABILITY_DESCRIPTORS[QueryId.REVENUE_PERFORMANCE_DIGEST_V1.value].recommended_presentation
+        == "performance"
+    )
+    assert "<" not in envelope.to_dict()["recommendedPresentation"]
 
 
 def test_quality_is_copied_verbatim_including_prose_warnings():

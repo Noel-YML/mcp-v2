@@ -4,13 +4,14 @@
   "domain": "hotel_performance",
   "questionType": "performance",
   "status": "success",
+  "resultId": "res_0123456789abcdef",
   "queryId": "revenue_performance_digest_v1",
   "queryVersion": "1",
   "traceId": "0000trace0000demo",
   "recommendedPresentation": "performance",
   "context": {
     "kind": "business_date",
-    "businessDate": "2026-08-16",
+    "businessDate": "16/08/2026",
     "timeframe": "mtd",
     "view": "headline",
     "comparator": "last_year"
@@ -55,6 +56,5 @@
         }
       }
     ]
-  },
-  "result_id": "res_0123456789abcdef"
+  }
 }

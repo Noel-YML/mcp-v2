@@ -23,23 +23,8 @@
   "provenance": {
     "semanticModelRef": "dmr-v3"
   },
-  "payload": {
-    "metrics": [
-      {
-        "metricId": "guests",
-        "label": "Guests",
-        "unit": "count",
-        "value": null,
-        "sourceRowCount": 0,
-        "comparison": {
-          "state": "unsupported",
-          "value": null,
-          "absoluteVariance": null,
-          "variancePct": null,
-          "variancePctReason": null,
-          "sourceVariance": null
-        }
-      }
-    ]
-  }
+  "payload": [
+    "total_revenue",
+    118246.0
+  ]
 }

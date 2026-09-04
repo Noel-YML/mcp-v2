@@ -26,18 +26,33 @@
   "payload": {
     "metrics": [
       {
-        "metricId": "guests",
-        "label": "Guests",
-        "unit": "count",
-        "value": null,
-        "sourceRowCount": 0,
+        "metricId": "total_revenue",
+        "label": "Total Revenue",
+        "unit": "currency",
+        "value": 118246.0,
+        "sourceRowCount": 1,
         "comparison": {
-          "state": "unsupported",
-          "value": null,
-          "absoluteVariance": null,
+          "state": "available",
+          "value": 264061.0,
+          "absoluteVariance": -145815.0,
           "variancePct": null,
           "variancePctReason": null,
-          "sourceVariance": null
+          "sourceVariance": -145815.0
+        }
+      },
+      {
+        "metricId": "room_revenue",
+        "label": "Room Revenue",
+        "unit": "currency",
+        "value": 91101.0,
+        "sourceRowCount": 1,
+        "comparison": {
+          "state": "available",
+          "value": 180000.0,
+          "absoluteVariance": -88899.0,
+          "variancePct": -0.49388333333333334,
+          "variancePctReason": null,
+          "sourceVariance": -88899.0
         }
       }
     ]

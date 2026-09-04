@@ -4,6 +4,7 @@
   "domain": "hotel_performance",
   "questionType": "performance",
   "status": "success",
+  "resultId": "res_0123456789abcdef",
   "queryId": "revenue_performance_digest_v1",
   "queryVersion": "1",
   "traceId": "0000trace0000demo",
@@ -16,8 +17,8 @@
     "comparator": "last_year"
   },
   "quality": {
-    "isPartial": false,
-    "warnings": []
+    "isPartial": "true",
+    "warnings": null
   },
   "provenance": {
     "semanticModelRef": "dmr-v3"
@@ -55,6 +56,5 @@
         }
       }
     ]
-  },
-  "result_id": "res_0123456789abcdef"
+  }
 }

@@ -14,7 +14,7 @@
     "businessDate": "2026-08-16",
     "timeframe": "mtd",
     "view": "headline",
-    "comparator": "last_year"
+    "comparator": "forecast"
   },
   "quality": {
     "isPartial": false,
@@ -26,10 +26,25 @@
   "payload": {
     "metrics": [
       {
-        "metricId": "guests",
-        "label": "Guests",
-        "unit": "count",
-        "value": null,
+        "metricId": "total_revenue",
+        "label": "Total Revenue",
+        "unit": "currency",
+        "value": 118246.0,
+        "sourceRowCount": 1,
+        "comparison": {
+          "state": "unavailable",
+          "value": null,
+          "absoluteVariance": null,
+          "variancePct": null,
+          "variancePctReason": null,
+          "sourceVariance": null
+        }
+      },
+      {
+        "metricId": "occupancy_pct",
+        "label": "Occupancy %",
+        "unit": "percentage",
+        "value": 0.985,
         "sourceRowCount": 0,
         "comparison": {
           "state": "unsupported",
